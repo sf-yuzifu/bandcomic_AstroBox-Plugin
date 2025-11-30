@@ -1,10 +1,10 @@
 {
-  "name": "omusic-helper",
+  "name": "bandcomic-helper",
   "private": true,
   "version": "1.0.0",
   "scripts": {
     "build": "rspack build",
-    "zip": "cd dist && zip -r ../OMusic-Helper.abp . && cd ..",
+    "zip": "cd dist && zip -r ../bandcomic-Helper.abp . && cd ..",
     "package": "npm run build && npm run zip"
   },
   "devDependencies": {
