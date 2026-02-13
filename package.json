@@ -1,7 +1,7 @@
 {
   "name": "bandcomic-helper",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.8",
   "scripts": {
     "build": "rspack build",
     "zip": "cd dist && zip -r ../bandcomic-Helper.abp . && cd ..",
@@ -14,6 +14,6 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "astrobox-plugin-sdk": "^1.1.4"
+    "astrobox-plugin-sdk": "^1.1.6"
   }
 }

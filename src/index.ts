@@ -2,38 +2,160 @@ import AstroBox, { PluginUINode } from "astrobox-plugin-sdk";
 
 // --- 1. 定义常量和类型 ---
 
-const WATCH_APP_PKG_NAME = "moe.yzf.comic"; // **注意**: 包名已根据您的反馈修正
+const WATCH_APP_PKG_NAME = "moe.yzf.comic";
 const CONFIG_KEY_COOKIE = "savedCookie";
+const CONFIG_KEY_DOMAIN = "sourceDomain";
+const CONFIG_KEY_SOURCE_NAME = "sourceName";
 
 interface PluginConfig {
   [CONFIG_KEY_COOKIE]?: string;
+  [CONFIG_KEY_DOMAIN]?: string;
+  [CONFIG_KEY_SOURCE_NAME]?: string;
 }
 
 let currentCookieInput: string = "";
+let currentDomainInput: string = "";
+let fetchedSourceName: string | null = null;
+let ui: PluginUINode[] = [];
+
+const sleep = (delay: number) => new Promise((resolve) => setTimeout(resolve, delay));
 
 // --- 2. 业务逻辑函数 ---
 
-/**
- * **核心修改**: 智能提取 MUSIC_U
- * 既能处理完整 cookie 字符串，也能处理用户直接粘贴的 MUSIC_U 值
- */
-function extractCookie(fullCookie: string): string | null {
-  if (!fullCookie || typeof fullCookie !== "string") {
+async function fetchSourceName(domain: string): Promise<string | null> {
+  try {
+    const normalizedDomain = domain.replace(/\/$/, "");
+    const configUrl = `${normalizedDomain}/config`;
+
+    console.log(`请求配置 URL: ${configUrl}`);
+    
+    const res = await AstroBox.network.fetch(configUrl,{
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      raw: false,
+    });
+
+    if (res.status !== 200) {
+      console.error(`获取配置失败，状态码: ${res.status}`);
+      return null;
+    }
+
+    const configData = JSON.parse(res.body);
+    const sourceNames = Object.keys(configData);
+
+    console.log(`配置中的 sourceNames: ${sourceNames}`);
+    
+    if (sourceNames.length === 0) {
+      console.error("配置中没有找到 sourceName");
+      return null;
+    }
+
+    const sourceName = sourceNames[0];
+    console.log(`成功获取 sourceName: ${sourceName}`);
+    return sourceName;
+  } catch (error) {
+    console.error("获取漫画源配置失败:", error);
     return null;
   }
-
-  return fullCookie; // 如果两种情况都不匹配，则返回 null
 }
 
-/**
- * **核心修改**: 更新状态时，必须包含所有需要保持可见的节点
- */
-function updateStatus(
+async function showStatusMessage(
   status: "default" | "processing" | "success" | "error",
   message?: string
 ) {
-  // 准备所有需要保持可见的节点
-  const commonNodes: PluginUINode[] = [
+  const statusNodeId = "status_message";
+  
+  let htmlValue = "";
+  switch (status) {
+    case "processing":
+      htmlValue = `<span style="display:inline-block;width:100%;text-align:center;color:#1890ff;">${message || "处理中..."}</span>`;
+      break;
+    case "success":
+      htmlValue = `<span style="display:inline-block;width:100%;text-align:center;font-weight:bold;color:#52c41a;">${message || "同步成功！"}</span>`;
+      break;
+    case "error":
+      htmlValue = `<span style="display:inline-block;width:100%;text-align:center;font-weight:bold;color:#ff4d4f;">错误：${message || "未知错误"}</span>`;
+      break;
+    default:
+      htmlValue = currentCookieInput
+        ? `<span style="display:inline-block;width:100%;text-align:center;color:#666;">已加载上次保存的 Cookie，可直接同步。</span>`
+        : `<span style="display:inline-block;width:100%;text-align:center;color:#666;">请输入漫画源域名和 Cookie。</span>`;
+  }
+
+  ui[6] = {
+    node_id: statusNodeId,
+    visibility: true,
+    disabled: false,
+    content: {
+      type: "HtmlDocument",
+      value: htmlValue,
+    },
+  };
+  
+  AstroBox.ui.updatePluginSettingsUI(ui);
+
+  if (status === "success" || status === "error") {
+    await sleep(3000);
+    ui[6].visibility = false;
+    AstroBox.ui.updatePluginSettingsUI(ui);
+  }
+}
+
+function updateUI() {
+  ui = [
+    {
+      node_id: "domain_label",
+      visibility: true,
+      disabled: false,
+      content: {
+        type: "HtmlDocument",
+        value: `
+          <span style="margin-left: 13%;">漫画源域名<span style="color:#666;font-size:12px;">（例如：https://youapi.domain）</span></span>
+        `,
+      },
+    },
+    {
+      node_id: "domain_input",
+      visibility: true,
+      disabled: false,
+      content: {
+        type: "Input",
+        value: { text: currentDomainInput, callback_fun_id: domainChangeFunId },
+      },
+    },
+    {
+      node_id: "source_name_label",
+      visibility: true,
+      disabled: false,
+      content: {
+        type: "HtmlDocument",
+        value: `
+          <span style="margin-left: 13%;">漫画源名称<span style="color:#666;font-size:12px;">（自动获取）</span></span>
+        `,
+      },
+    },
+    {
+      node_id: "source_name_input",
+      visibility: true,
+      disabled: true,
+      content: {
+        type: "Input",
+        value: { text: fetchedSourceName || "", callback_fun_id: "" },
+      },
+    },
+    {
+      node_id: "cookie_label",
+      visibility: true,
+      disabled: false,
+      content: {
+        type: "HtmlDocument",
+        value: `
+          <span style="margin-left: 13%;">Cookie<span style="color:#666;font-size:12px;">（从浏览器开发者工具获取）</span></span>
+        `,
+      },
+    },
     {
       node_id: "cookie_input",
       visibility: true,
@@ -41,6 +163,15 @@ function updateStatus(
       content: {
         type: "Input",
         value: { text: currentCookieInput, callback_fun_id: inputChangeFunId },
+      },
+    },
+    {
+      node_id: "status_message",
+      visibility: false,
+      disabled: false,
+      content: {
+        type: "HtmlDocument",
+        value: "",
       },
     },
     {
@@ -58,41 +189,7 @@ function updateStatus(
     },
   ];
 
-  // 准备所有状态文本节点，并根据当前状态设置其可见性
-  const statusNodes: PluginUINode[] = [
-    {
-      node_id: "status_text_default",
-      visibility: status === "default",
-      disabled: false,
-      content: {
-        type: "Text",
-        value: currentCookieInput
-          ? "已加载上次保存的 Cookie，可直接同步。"
-          : "请从浏览器开发者工具获取 Cookie 并粘贴。",
-      },
-    },
-    {
-      node_id: "status_text_processing",
-      visibility: status === "processing",
-      disabled: false,
-      content: { type: "Text", value: message || "处理中..." },
-    },
-    {
-      node_id: "status_text_success",
-      visibility: status === "success",
-      disabled: false,
-      content: { type: "Text", value: "同步成功！" },
-    },
-    {
-      node_id: "status_text_error",
-      visibility: status === "error",
-      disabled: false,
-      content: { type: "Text", value: `错误：${message || "未知错误"}` },
-    },
-  ];
-
-  // 将通用节点和状态节点合并，一次性更新所有UI
-  AstroBox.ui.updatePluginSettingsUI([...commonNodes, ...statusNodes]);
+  AstroBox.ui.updatePluginSettingsUI(ui);
 }
 
 function onCookieInputChange(inputValue: string) {
@@ -111,37 +208,141 @@ function onCookieInputChange(inputValue: string) {
   }
 }
 
-async function handleSync() {
-  const cookieInput = currentCookieInput;
-
-  updateStatus("processing", "正在提取凭证...");
-
-  if (!cookieInput) {
-    updateStatus("error", "输入框内容为空。");
-    return;
-  }
-
-  const Cookie = extractCookie(cookieInput);
-
-  if (!Cookie) {
-    updateStatus("error", "凭证格式无效，请检查输入。");
-    return;
-  }
-
-  updateStatus("processing", "凭证提取成功，正在发送到手表...");
+async function onDomainInputChange(inputValue: string) {
+  console.log("漫画源域名变化:", inputValue);
+  currentDomainInput = inputValue;
+  fetchedSourceName = null;
 
   try {
+    const cfg = AstroBox.config.readConfig() as PluginConfig;
+    AstroBox.config.writeConfig({
+      ...cfg,
+      [CONFIG_KEY_DOMAIN]: inputValue,
+    });
+    console.log("漫画源域名已实时保存到配置。");
+  } catch (error) {
+    console.error("实时保存漫画源域名到配置失败:", error);
+  }
+
+  if (inputValue && inputValue.includes(".")) {
+    await showStatusMessage("processing", "正在获取漫画源配置...");
+    const sourceName = await fetchSourceName(inputValue);
+    if (sourceName) {
+      fetchedSourceName = sourceName;
+      try {
+        const cfg = AstroBox.config.readConfig() as PluginConfig;
+        AstroBox.config.writeConfig({
+          ...cfg,
+          [CONFIG_KEY_SOURCE_NAME]: sourceName,
+        });
+        console.log("漫画源名称已保存到配置。");
+      } catch (error) {
+        console.error("保存漫画源名称到配置失败:", error);
+      }
+      ui[3].visibility = false;
+      AstroBox.ui.updatePluginSettingsUI(ui);
+      await sleep(100);
+      ui[3] = {
+        node_id: "source_name_input",
+        visibility: true,
+        disabled: true,
+        content: {
+          type: "Input",
+          value: { text: fetchedSourceName, callback_fun_id: "" },
+        },
+      };
+      AstroBox.ui.updatePluginSettingsUI(ui);
+      await showStatusMessage("success", `获取成功：${sourceName}`);
+    } else {
+      fetchedSourceName = null;
+      try {
+        const cfg = AstroBox.config.readConfig() as PluginConfig;
+        AstroBox.config.writeConfig({
+          ...cfg,
+          [CONFIG_KEY_SOURCE_NAME]: "",
+        });
+      } catch (error) {
+        console.error("清空漫画源名称配置失败:", error);
+      }
+      ui[3].visibility = false;
+      AstroBox.ui.updatePluginSettingsUI(ui);
+      await sleep(100);
+      ui[3] = {
+        node_id: "source_name_input",
+        visibility: true,
+        disabled: true,
+        content: {
+          type: "Input",
+          value: { text: "", callback_fun_id: "" },
+        },
+      };
+      AstroBox.ui.updatePluginSettingsUI(ui);
+      await showStatusMessage("error", "无法获取漫画源配置，请检查域名是否正确。");
+    }
+  }
+}
+
+async function handleSync() {
+  const cookieInput = currentCookieInput;
+  const domainInput = currentDomainInput;
+
+  await showStatusMessage("processing", "正在验证输入...");
+
+  if (!cookieInput) {
+    await showStatusMessage("error", "Cookie 不能为空。");
+    return;
+  }
+
+  if (!domainInput) {
+    await showStatusMessage("error", "漫画源域名不能为空。");
+    return;
+  }
+
+  await showStatusMessage("processing", "正在获取漫画源配置...");
+
+  let sourceName = fetchedSourceName;
+  if (!sourceName) {
+    sourceName = await fetchSourceName(domainInput);
+    if (!sourceName) {
+      await showStatusMessage("error", "无法获取漫画源配置，请检查域名是否正确。");
+      return;
+    }
+    fetchedSourceName = sourceName;
+  }
+
+  await showStatusMessage("processing", "正在检查快应用...");
+
+  try {
+    const appList = await AstroBox.thirdpartyapp.getThirdPartyAppList();
+    const app = appList.find((app) => app.package_name == WATCH_APP_PKG_NAME);
+    
+    if (!app) {
+      await showStatusMessage("error", "请先安装腕上漫画快应用！");
+      return;
+    }
+    
+    if (app.version_code < 153) {
+      await showStatusMessage("error", "请先安装腕上漫画快应用的新版本！");
+      return;
+    }
+
+    await AstroBox.thirdpartyapp.launchQA(app, "/pages/index");
+    await sleep(2000);
+
+    await showStatusMessage("processing", "正在发送到手表...");
+
+    const cookieData = JSON.stringify({
+      [sourceName]: cookieInput
+    });
+    
     await AstroBox.interconnect.sendQAICMessage(
       WATCH_APP_PKG_NAME,
-      Cookie
+      cookieData
     );
-    updateStatus("success");
-
-    setTimeout(() => {
-      updateStatus("default");
-    }, 3000);
+    await showStatusMessage("success", "同步成功！");
   } catch (error) {
-    updateStatus("error", "发送失败，请检查手表连接和应用是否打开。");
+    console.error(error);
+    await showStatusMessage("error", "发送失败，请检查手表连接和应用是否打开。");
   }
 }
 
@@ -149,6 +350,7 @@ async function handleSync() {
 
 const syncFunId = AstroBox.native.regNativeFun(handleSync);
 const inputChangeFunId = AstroBox.native.regNativeFun(onCookieInputChange);
+const domainChangeFunId = AstroBox.native.regNativeFun(onDomainInputChange);
 
 // --- 4. 插件生命周期 ---
 
@@ -161,11 +363,18 @@ AstroBox.lifecycle.onLoad(() => {
       currentCookieInput = cfg[CONFIG_KEY_COOKIE]!;
       console.log("成功从配置中加载已保存的 Cookie。");
     }
+    if (cfg && cfg[CONFIG_KEY_DOMAIN]) {
+      currentDomainInput = cfg[CONFIG_KEY_DOMAIN]!;
+      console.log("成功从配置中加载已保存的漫画源域名。");
+    }
+    if (cfg && cfg[CONFIG_KEY_SOURCE_NAME]) {
+      fetchedSourceName = cfg[CONFIG_KEY_SOURCE_NAME]!;
+      console.log("成功从配置中加载已保存的漫画源名称。");
+    }
   } catch (error) {
     console.error("读取插件配置失败:", error);
   }
 
-  // 初始渲染时，直接调用 updateStatus 来构建完整的 UI
-  updateStatus("default");
+  updateUI();
   console.log("UI 已初始渲染。");
 });
