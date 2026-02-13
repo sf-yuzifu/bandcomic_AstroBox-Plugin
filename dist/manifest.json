@@ -2,7 +2,7 @@
   "name": "腕上漫画同步器",
   "version": "1.8",
   "author": "小鱼yuzifu",
-  "description": "腕上漫画Cookie导入工具，为腕上漫画同步自定义漫画源Cookie",
+  "description": "为腕上漫画同步自定义漫画源Cookie的工具",
   "website": "https://github.com/sf-yuzifu/bandcomic_AstroBox-Plugin",
   "icon": "icon.png",
   "entry": "main.js",
