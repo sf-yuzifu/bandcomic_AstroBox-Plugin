@@ -1,5 +1,5 @@
 [package]
-name = "daymatter_astrobox_v2_plugin"
+name = "bandcomic_astrobox_v2_plugin"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,5 +13,4 @@ tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 waki = "0.5.1"
 serde_json = "1.0"
-serde = "1.0"
-chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }

@@ -1,5 +1,4 @@
 use wit_bindgen::FutureReader;
-use serde_json::Value;
 
 use crate::exports::astrobox::psys_plugin::{
     event::{self, EventType},
@@ -8,6 +7,7 @@ use crate::exports::astrobox::psys_plugin::{
 
 pub mod logger;
 pub mod ui;
+pub mod network;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -15,22 +15,15 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-fn extract_payload_text(payload: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<Value>(payload) {
-        if let Some(text) = json.get("payloadText").and_then(|v| v.as_str()) {
-            return text.to_string();
-        }
-        if let Some(payload_value) = json.get("payload") {
-            if let Some(text) = payload_value.as_str() {
-                return text.to_string();
-            }
-            return payload_value.to_string();
-        }
-    }
-    payload.to_string()
-}
-
 struct MyPlugin;
+
+impl lifecycle::Guest for MyPlugin {
+    fn on_load() {
+        logger::init();
+        tracing::info!("bandcomic Helper 插件已加载...");
+        tracing::info!("UI 已初始渲染");
+    }
+}
 
 impl event::Guest for MyPlugin {
     #[allow(async_fn_in_trait)]
@@ -38,7 +31,9 @@ impl event::Guest for MyPlugin {
         let (writer, reader) = wit_future::new::<String>(|| "".to_string());
 
         match event_type {
-            EventType::PluginMessage => {}
+            EventType::PluginMessage => {
+                tracing::info!("收到插件消息: {}", event_payload);
+            }
             EventType::InterconnectMessage => {
                 ui::handle_interconnect_message(&event_payload);
             }
@@ -47,14 +42,12 @@ impl event::Guest for MyPlugin {
             EventType::DeeplinkAction => {}
             EventType::TransportPacket => {}
             EventType::Timer => {
-                let payload = extract_payload_text(&event_payload);
-                if payload == "hide_message" {
-                    ui::hide_message();
+                // 处理定时器事件
+                if event_payload == ui::state::HIDE_STATUS_EVENT {
+                    ui::hide_status();
                 }
             }
         };
-
-        tracing::info!("event_type: {:?}, event_payload: {}", event_type, event_payload);
 
         wit_bindgen::spawn(async move {
             let _ = writer.write("".to_string()).await;
@@ -91,25 +84,17 @@ impl event::Guest for MyPlugin {
         reader
     }
 
-    fn on_card_render(card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
+    fn on_card_render(_card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
         let (writer, reader) = wit_future::new::<()>(|| ());
 
-        // 这里可以实现卡片渲染逻辑
-        tracing::info!("Card render requested for: {}", card_id);
+        // 腕上漫画插件不需要卡片渲染
+        tracing::info!("卡片渲染请求被忽略");
 
         wit_bindgen::spawn(async move {
             let _ = writer.write(()).await;
         });
 
         reader
-    }
-}
-
-impl lifecycle::Guest for MyPlugin {
-    #[allow(async_fn_in_trait)]
-    fn on_load() -> () {
-        logger::init();
-        tracing::info!("Hello AstroBox V2 Plugin!");
     }
 }
 
