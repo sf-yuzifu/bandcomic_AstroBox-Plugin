@@ -1,4 +1,5 @@
 use std::sync::{OnceLock, RwLock};
+use serde_json::Value;
 
 pub const WATCH_APP_PKG_NAME: &str = "moe.yzf.comic";
 pub const CONFIG_KEY_COOKIE: &str = "savedCookie";
@@ -34,6 +35,7 @@ pub struct UiState {
     pub root_element_id: Option<String>,  // 保存根元素ID，用于重新渲染
     pub config: PluginConfig,
     pub fetched_source_name: Option<String>,
+    pub fetched_source_config: Option<Value>,
     pub current_status: StatusState,
     pub status_timer_id: Option<u64>,
     pub pending_domain_fetch: Option<String>, // 用于防抖
@@ -47,6 +49,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             root_element_id: None,
             config: PluginConfig::default(),
             fetched_source_name: None,
+            fetched_source_config: None,
             current_status: StatusState::Default,
             status_timer_id: None,
             pending_domain_fetch: None,
