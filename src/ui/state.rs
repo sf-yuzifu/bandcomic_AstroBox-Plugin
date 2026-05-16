@@ -1,4 +1,5 @@
 use std::sync::{OnceLock, RwLock};
+use std::collections::HashMap;
 use serde_json::Value;
 
 pub const WATCH_APP_PKG_NAME: &str = "moe.yzf.comic";
@@ -31,14 +32,42 @@ pub enum StatusState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabPage {
+    Sync,
+    Data,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicInfo {
+    pub name: String,
+    pub page_count: usize,
+    pub chapters: usize,
+    pub cover_base64: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub name: String,
+    pub api_url: String,
+}
+
 pub struct UiState {
-    pub root_element_id: Option<String>,  // 保存根元素ID，用于重新渲染
+    pub root_element_id: Option<String>,
     pub config: PluginConfig,
     pub fetched_source_name: Option<String>,
     pub fetched_source_config: Option<Value>,
     pub current_status: StatusState,
     pub status_timer_id: Option<u64>,
-    pub pending_domain_fetch: Option<String>, // 用于防抖
+    pub pending_domain_fetch: Option<String>,
+    pub current_tab: TabPage,
+    pub app_comic_count: Option<usize>,
+    pub app_source_count: Option<usize>,
+    pub app_comics: Vec<ComicInfo>,
+    pub app_sources: Vec<SourceInfo>,
+    pub app_data_status: StatusState,
+    pub app_data_timer_id: Option<u64>,
+    pub cover_chunk_buffers: HashMap<String, (usize, Vec<String>)>,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -53,18 +82,29 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             current_status: StatusState::Default,
             status_timer_id: None,
             pending_domain_fetch: None,
+            current_tab: TabPage::Sync,
+            app_comic_count: None,
+            app_source_count: None,
+            app_comics: Vec::new(),
+            app_sources: Vec::new(),
+            app_data_status: StatusState::Default,
+            app_data_timer_id: None,
+            cover_chunk_buffers: HashMap::new(),
         })
     })
 }
 
-// 事件 ID 常量
 pub const DOMAIN_INPUT_CHANGE_EVENT: &str = "domain_input_change";
 pub const DOMAIN_INPUT_BLUR_EVENT: &str = "domain_input_blur";
 pub const COOKIE_INPUT_EVENT: &str = "cookie_input";
 pub const SYNC_BUTTON_EVENT: &str = "sync_button";
 pub const HIDE_STATUS_EVENT: &str = "hide_status";
 
-// UI 节点 ID 常量
+pub const TAB_SYNC_EVENT: &str = "tab_sync";
+pub const TAB_DATA_EVENT: &str = "tab_data";
+pub const FETCH_APP_DATA_EVENT: &str = "fetch_app_data";
+pub const HIDE_APP_DATA_STATUS_EVENT: &str = "hide_app_data_status";
+
 pub const NODE_DOMAIN_LABEL: &str = "domain_label";
 pub const NODE_DOMAIN_INPUT: &str = "domain_input";
 pub const NODE_SOURCE_NAME_LABEL: &str = "source_name_label";

@@ -1,7 +1,8 @@
 use wit_bindgen::FutureReader;
 
 use crate::exports::astrobox::psys_plugin::{
-    event::{self, EventType},
+    event,
+    event_v3,
     lifecycle,
 };
 
@@ -11,7 +12,7 @@ pub mod network;
 
 wit_bindgen::generate!({
     path: "wit",
-    world: "psys-world",
+    world: "psys-world-v3",
     generate_all,
 });
 
@@ -27,26 +28,18 @@ impl lifecycle::Guest for MyPlugin {
 
 impl event::Guest for MyPlugin {
     #[allow(async_fn_in_trait)]
-    fn on_event(event_type: EventType, event_payload: _rt::String) -> FutureReader<String> {
+    fn on_event(event_type: event::EventType, event_payload: _rt::String) -> FutureReader<String> {
         let (writer, reader) = wit_future::new::<String>(|| "".to_string());
 
         match event_type {
-            EventType::PluginMessage => {
-                tracing::info!("收到插件消息: {}", event_payload);
-            }
-            EventType::InterconnectMessage => {
-                ui::handle_interconnect_message(&event_payload);
-            }
-            EventType::DeviceAction => {}
-            EventType::ProviderAction => {}
-            EventType::DeeplinkAction => {}
-            EventType::TransportPacket => {}
-            EventType::Timer => {
-                // 处理定时器事件
+            event::EventType::Timer => {
                 if event_payload == ui::state::HIDE_STATUS_EVENT {
                     ui::hide_status();
+                } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
+                    ui::hide_app_data_status();
                 }
             }
+            _ => {}
         };
 
         wit_bindgen::spawn(async move {
@@ -57,8 +50,72 @@ impl event::Guest for MyPlugin {
     }
 
     fn on_ui_event(
+        _event_id: _rt::String,
+        _event_type: crate::astrobox::psys_host::ui::Event,
+        _event_payload: _rt::String,
+    ) -> wit_bindgen::rt::async_support::FutureReader<_rt::String> {
+        let (writer, reader) = wit_future::new::<String>(|| "".to_string());
+
+        wit_bindgen::spawn(async move {
+            let _ = writer.write("".to_string()).await;
+        });
+
+        reader
+    }
+
+    fn on_ui_render(_element_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
+        let (writer, reader) = wit_future::new::<()>(|| ());
+
+        wit_bindgen::spawn(async move {
+            let _ = writer.write(()).await;
+        });
+
+        reader
+    }
+
+    fn on_card_render(_card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
+        let (writer, reader) = wit_future::new::<()>(|| ());
+
+        wit_bindgen::spawn(async move {
+            let _ = writer.write(()).await;
+        });
+
+        reader
+    }
+}
+
+impl event_v3::Guest for MyPlugin {
+    #[allow(async_fn_in_trait)]
+    fn on_event(event_type: event_v3::EventType, event_payload: _rt::String) -> FutureReader<String> {
+        let (writer, reader) = wit_future::new::<String>(|| "".to_string());
+
+        match event_type {
+            event_v3::EventType::PluginMessage => {
+                tracing::info!("收到插件消息: {}", event_payload);
+            }
+            event_v3::EventType::InterconnectMessage => {
+                ui::handle_interconnect_message(&event_payload);
+            }
+            event_v3::EventType::Timer => {
+                if event_payload == ui::state::HIDE_STATUS_EVENT {
+                    ui::hide_status();
+                } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
+                    ui::hide_app_data_status();
+                }
+            }
+            _ => {}
+        };
+
+        wit_bindgen::spawn(async move {
+            let _ = writer.write("".to_string()).await;
+        });
+
+        reader
+    }
+
+    fn on_ui_event_v3(
         event_id: _rt::String,
-        event_type: event::Event,
+        event_type: event_v3::Event,
         event_payload: _rt::String,
     ) -> wit_bindgen::rt::async_support::FutureReader<_rt::String> {
         let (writer, reader) = wit_future::new::<String>(|| "".to_string());
@@ -87,7 +144,6 @@ impl event::Guest for MyPlugin {
     fn on_card_render(_card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
         let (writer, reader) = wit_future::new::<()>(|| ());
 
-        // 腕上漫画插件不需要卡片渲染
         tracing::info!("卡片渲染请求被忽略");
 
         wit_bindgen::spawn(async move {
