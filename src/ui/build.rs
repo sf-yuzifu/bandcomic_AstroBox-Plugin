@@ -287,6 +287,78 @@ fn build_comic_card(comic: &ComicInfo, index: usize) -> ui::Element {
         .child(cover)
 }
 
+fn build_source_card(source: &SourceInfo, display_url: &str, index: usize) -> ui::Element {
+    let icon = ui::Element::new(ui::ElementType::Svg, Some(&icon_link_svg()))
+        .width(22)
+        .height(22)
+        .text_color("#FFFFFF");
+
+    let icon_wrap = ui::Element::new(ui::ElementType::Div, None)
+        .width(22)
+        .height(22)
+        .flex()
+        .align_center()
+        .justify_center()
+        .child(icon);
+
+    let title_el = ui::Element::new(ui::ElementType::P, Some(&source.name)).size(15);
+    let desc_el = ui::Element::new(ui::ElementType::P, Some(display_url))
+        .size(13)
+        .text_color("#888888");
+
+    let text_col = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .width_full()
+        .child(title_el)
+        .child(desc_el);
+
+    let left_row = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(10)
+        .margin_right(48)
+        .flex()
+        .child(icon_wrap)
+        .child(text_col);
+
+    let delete_event_id = format!("{}{}", DELETE_SOURCE_PREFIX, index);
+    let delete_btn = ui::Element::new(ui::ElementType::Button, None)
+        .without_default_styles()
+        .on(ui::Event::Click, &delete_event_id)
+        .absolute()
+        .right(12)
+        .width(36)
+        .height(36)
+        .radius(18)
+        .bg("#3D1515")
+        .flex()
+        .align_center()
+        .justify_center()
+        .child(
+            ui::Element::new(ui::ElementType::Svg, Some(&icon_trash_svg()))
+                .width(18)
+                .height(18)
+                .text_color("#FF5252")
+        );
+
+    ui::Element::new(ui::ElementType::Div, None)
+        .relative()
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .width_full()
+        .bg("#1E1E1F")
+        .radius(18)
+        .padding_left(12)
+        .padding_right(12)
+        .padding_top(10)
+        .padding_bottom(10)
+        .child(left_row)
+        .child(delete_btn)
+}
+
 fn build_sync_ui(state: &UiState) -> ui::Element {
     let source_title = build_section_title("漫画源配置");
 
@@ -448,20 +520,14 @@ fn build_data_ui(state: &UiState) -> ui::Element {
         root = root.child(source_title);
 
         let _total = state.app_sources.len().min(20);
-        for (_i, source) in state.app_sources.iter().take(20).enumerate() {
+        for (i, source) in state.app_sources.iter().take(20).enumerate() {
             let display_url = if source.api_url.len() > 32 {
                 format!("{}...", &source.api_url[..32])
             } else {
                 source.api_url.clone()
             };
 
-            let row = build_settings_card(
-                icon_link_svg(),
-                &source.name,
-                Some(&display_url),
-                None,
-                None,
-            );
+            let row = build_source_card(source, &display_url, i);
             root = root.child(row);
         }
 

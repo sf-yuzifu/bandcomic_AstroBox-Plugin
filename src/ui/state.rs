@@ -115,3 +115,4 @@ pub const NODE_STATUS_MESSAGE: &str = "status_message";
 pub const NODE_SYNC_BUTTON: &str = "sync_button";
 
 pub const DELETE_COMIC_PREFIX: &str = "delete_comic_";
+pub const DELETE_SOURCE_PREFIX: &str = "delete_source_";

@@ -70,6 +70,11 @@ pub fn ui_event_processor(
                     tracing::info!("删除漫画按钮被点击: index={}", index);
                     wit_bindgen::block_on(handle_delete_comic(index));
                 }
+            } else if let Some(index_str) = event_id.strip_prefix(DELETE_SOURCE_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    tracing::info!("删除漫画源按钮被点击: index={}", index);
+                    wit_bindgen::block_on(handle_delete_source(index));
+                }
             }
         }
     }
@@ -465,6 +470,136 @@ async fn handle_delete_comic(index: usize) {
         }
         Err(e) => {
             tracing::error!("发送删除命令失败: {:?}", e);
+            show_app_data_status(StatusState::Error("发送删除命令失败。".to_string())).await;
+        }
+    }
+}
+
+async fn handle_delete_source(index: usize) {
+    let source_name = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_sources.get(index).map(|s| s.name.clone())
+    };
+
+    let source_name = match source_name {
+        Some(name) if !name.is_empty() => name,
+        _ => {
+            show_app_data_status(StatusState::Error("找不到该漫画源信息。".to_string())).await;
+            return;
+        }
+    };
+
+    let dialog_info = dialog::DialogInfo {
+        title: format!("确认删除漫画源「{}」", source_name),
+        content: "删除后需重新同步才能恢复，确定要删除吗？".to_string(),
+        buttons: vec![
+            dialog::DialogButton {
+                id: "cancel".to_string(),
+                primary: false,
+                content: "取消".to_string(),
+            },
+            dialog::DialogButton {
+                id: "confirm".to_string(),
+                primary: true,
+                content: "确认删除".to_string(),
+            },
+        ],
+    };
+
+    let dialog_result = dialog::show_dialog(
+        dialog::DialogType::Alert,
+        dialog::DialogStyle::Website,
+        &dialog_info,
+    ).await;
+
+    if dialog_result.clicked_btn_id != "confirm" {
+        tracing::info!("用户取消删除漫画源: {}", source_name);
+        return;
+    }
+
+    show_app_data_status(StatusState::Processing(format!("正在删除漫画源: {}...", source_name))).await;
+
+    let devices = device::get_connected_device_list().await;
+
+    if devices.is_empty() {
+        show_app_data_status(StatusState::Error("没有已连接的设备。".to_string())).await;
+        return;
+    }
+
+    let device_addr = &devices[0].addr;
+
+    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
+        Ok(apps) => apps,
+        Err(_) => {
+            show_app_data_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
+            return;
+        }
+    };
+
+    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
+        Some(a) => a,
+        None => {
+            show_app_data_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
+            return;
+        }
+    };
+
+    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
+        tracing::error!("启动快应用失败: {:?}", e);
+        show_app_data_status(StatusState::Error("启动快应用失败。".to_string())).await;
+        return;
+    }
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
+
+    let delete_msg = json!({
+        "type": "delete_source",
+        "name": source_name
+    });
+
+    let delete_str = match serde_json::to_string(&delete_msg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("序列化删除消息失败: {}", e);
+            show_app_data_status(StatusState::Error("序列化失败。".to_string())).await;
+            return;
+        }
+    };
+
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+        Ok(_) => {
+            tracing::info!("删除漫画源命令已发送: {}", source_name);
+
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if index < state.app_sources.len() {
+                    state.app_sources.remove(index);
+                    state.app_source_count = Some(state.app_sources.len());
+                }
+            }
+
+            show_app_data_status(StatusState::Success(format!("已删除漫画源: {}", source_name))).await;
+
+            let root_id: Option<String>;
+            {
+                let state = ui_state()
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                root_id = state.root_element_id.clone();
+            }
+            if let Some(root_id) = root_id {
+                let ui = build_main_ui();
+                psys_host::ui_v3::render(&root_id, ui);
+            }
+        }
+        Err(e) => {
+            tracing::error!("发送删除漫画源命令失败: {:?}", e);
             show_app_data_status(StatusState::Error("发送删除命令失败。".to_string())).await;
         }
     }
