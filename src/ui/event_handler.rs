@@ -251,7 +251,7 @@ async fn handle_sync() {
         }
     };
 
-    if app.version_code < 153 {
+    if app.version_code < 181 {
         show_status(StatusState::Error("请先安装腕上漫画快应用的新版本！".to_string())).await;
         return;
     }
