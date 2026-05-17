@@ -113,3 +113,5 @@ pub const NODE_COOKIE_LABEL: &str = "cookie_label";
 pub const NODE_COOKIE_INPUT: &str = "cookie_input";
 pub const NODE_STATUS_MESSAGE: &str = "status_message";
 pub const NODE_SYNC_BUTTON: &str = "sync_button";
+
+pub const DELETE_COMIC_PREFIX: &str = "delete_comic_";

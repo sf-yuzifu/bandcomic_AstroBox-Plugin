@@ -64,7 +64,14 @@ pub fn ui_event_processor(
             tracing::info!("获取快应用数据按钮被点击");
             wit_bindgen::block_on(handle_fetch_app_data());
         }
-        _ => {}
+        _ => {
+            if let Some(index_str) = event_id.strip_prefix(DELETE_COMIC_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    tracing::info!("删除漫画按钮被点击: index={}", index);
+                    wit_bindgen::block_on(handle_delete_comic(index));
+                }
+            }
+        }
     }
 }
 
@@ -329,6 +336,108 @@ async fn handle_sync() {
         Err(e) => {
             tracing::error!("发送漫画源配置失败: {:?}", e);
             show_status(StatusState::Error("漫画源配置发送失败。".to_string())).await;
+        }
+    }
+}
+
+async fn handle_delete_comic(index: usize) {
+    let comic_name = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_comics.get(index).map(|c| c.name.clone())
+    };
+
+    let comic_name = match comic_name {
+        Some(name) if !name.is_empty() => name,
+        _ => {
+            show_app_data_status(StatusState::Error("找不到该漫画信息。".to_string())).await;
+            return;
+        }
+    };
+
+    show_app_data_status(StatusState::Processing(format!("正在删除: {}...", comic_name))).await;
+
+    let devices = device::get_connected_device_list().await;
+
+    if devices.is_empty() {
+        show_app_data_status(StatusState::Error("没有已连接的设备。".to_string())).await;
+        return;
+    }
+
+    let device_addr = &devices[0].addr;
+
+    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
+        Ok(apps) => apps,
+        Err(_) => {
+            show_app_data_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
+            return;
+        }
+    };
+
+    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
+        Some(a) => a,
+        None => {
+            show_app_data_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
+            return;
+        }
+    };
+
+    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
+        tracing::error!("启动快应用失败: {:?}", e);
+        show_app_data_status(StatusState::Error("启动快应用失败。".to_string())).await;
+        return;
+    }
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
+
+    let delete_msg = json!({
+        "type": "delete_comic",
+        "name": comic_name
+    });
+
+    let delete_str = match serde_json::to_string(&delete_msg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("序列化删除消息失败: {}", e);
+            show_app_data_status(StatusState::Error("序列化失败。".to_string())).await;
+            return;
+        }
+    };
+
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+        Ok(_) => {
+            tracing::info!("删除命令已发送: {}", comic_name);
+
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if index < state.app_comics.len() {
+                    state.app_comics.remove(index);
+                    state.app_comic_count = Some(state.app_comics.len());
+                }
+            }
+
+            show_app_data_status(StatusState::Success(format!("已删除: {}", comic_name))).await;
+
+            let root_id: Option<String>;
+            {
+                let state = ui_state()
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                root_id = state.root_element_id.clone();
+            }
+            if let Some(root_id) = root_id {
+                let ui = build_main_ui();
+                psys_host::ui_v3::render(&root_id, ui);
+            }
+        }
+        Err(e) => {
+            tracing::error!("发送删除命令失败: {:?}", e);
+            show_app_data_status(StatusState::Error("发送删除命令失败。".to_string())).await;
         }
     }
 }

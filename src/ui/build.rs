@@ -198,16 +198,20 @@ fn build_icon_text_button_full(label: &str, icon_svg: String, event_id: &str) ->
         .child(text)
 }
 
-fn build_comic_card(comic: &ComicInfo) -> ui::Element {
+fn build_comic_card(comic: &ComicInfo, index: usize) -> ui::Element {
     let has_cover = !comic.cover_base64.is_empty();
 
     let cover = if has_cover {
         ui::Element::new(ui::ElementType::Image, Some(&comic.cover_base64))
+            .absolute()
+            .left(10)
             .width(60)
             .height(88)
             .radius(8)
     } else {
         ui::Element::new(ui::ElementType::Div, None)
+            .absolute()
+            .left(10)
             .width(60)
             .height(88)
             .radius(8)
@@ -241,11 +245,34 @@ fn build_comic_card(comic: &ComicInfo) -> ui::Element {
     let text_col = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Column)
+        .margin_left(80)
+        .margin_right(48)
         .flex()
         .child(name)
         .child(meta);
 
+    let delete_event_id = format!("{}{}", DELETE_COMIC_PREFIX, index);
+    let delete_btn = ui::Element::new(ui::ElementType::Button, None)
+        .without_default_styles()
+        .on(ui::Event::Click, &delete_event_id)
+        .absolute()
+        .right(10)
+        .width(36)
+        .height(36)
+        .radius(18)
+        .bg("#3D1515")
+        .flex()
+        .align_center()
+        .justify_center()
+        .child(
+            ui::Element::new(ui::ElementType::Svg, Some(&icon_trash_svg()))
+                .width(18)
+                .height(18)
+                .text_color("#FF5252")
+        );
+
     ui::Element::new(ui::ElementType::Div, None)
+        .relative()
         .flex()
         .flex_direction(ui::FlexDirection::Row)
         .align_center()
@@ -253,9 +280,11 @@ fn build_comic_card(comic: &ComicInfo) -> ui::Element {
         .radius(18)
         .padding(10)
         .gap(12)
+        .min_height(108)
         .width_full()
-        .child(cover)
         .child(text_col)
+        .child(delete_btn)
+        .child(cover)
 }
 
 fn build_sync_ui(state: &UiState) -> ui::Element {
@@ -398,8 +427,8 @@ fn build_data_ui(state: &UiState) -> ui::Element {
         root = root.child(comic_title);
 
         let _total = state.app_comics.len().min(20);
-        for (_i, comic) in state.app_comics.iter().take(20).enumerate() {
-            root = root.child(build_comic_card(comic));
+        for (i, comic) in state.app_comics.iter().take(20).enumerate() {
+            root = root.child(build_comic_card(comic, i));
         }
 
         if state.app_comics.len() > 20 {
@@ -481,4 +510,8 @@ fn icon_book_svg() -> String {
 
 fn icon_link_svg() -> String {
     r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>"#.to_string()
+}
+
+fn icon_trash_svg() -> String {
+    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>"#.to_string()
 }
