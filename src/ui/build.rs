@@ -581,3 +581,101 @@ fn icon_link_svg() -> String {
 fn icon_trash_svg() -> String {
     r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>"#.to_string()
 }
+
+fn icon_logo_png_base64() -> String {
+    "data:image/png;base64,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".to_string()
+}
+
+fn build_comic_data_card_ui() -> ui::Element {
+    let state = ui_state()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let comic_count = state.app_comic_count.map(|c| c.to_string()).unwrap_or_else(|| "--".to_string());
+    let source_count = state.app_source_count.map(|c| c.to_string()).unwrap_or_else(|| "--".to_string());
+
+    let title_text = ui::Element::new(ui::ElementType::P, Some("腕上漫画数据"))
+        .size(14)
+        .absolute()
+        .top(12)
+        .left(12)
+        .text_color("rgba(255, 255, 255, 0.5)");
+
+    let icon = ui::Element::new(ui::ElementType::Image, Some(&icon_logo_png_base64()))
+        .width(34)
+        .radius(999)
+        .height(34);
+
+    let icon_btn = ui::Element::new(ui::ElementType::Div, None)
+        .width(34)
+        .height(34)
+        .radius(999)
+        .absolute()
+        .top(12)
+        .right(12)
+        .bg("rgba(71, 71, 75, 0.3)")
+        .flex()
+        .align_center()
+        .justify_center()
+        .child(icon);
+
+    let title_text_wrap = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .child(title_text);
+
+    let title_row = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .justify_center()
+        .align_center()
+        .width_full()
+        .child(title_text_wrap)
+        .child(icon_btn);
+
+    let stat_col = |number: &str, label: &str| -> ui::Element {
+        let num = ui::Element::new(ui::ElementType::Span, Some(number))
+            .size(35)
+            .text_color("#FFFFFF");
+        let lbl = ui::Element::new(ui::ElementType::Span, Some(label))
+            .size(14)
+            .text_color("rgba(255, 255, 255, 0.5)");
+        ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Column)
+            .justify_center()
+            .width_half()
+            .align_center()
+            .flex()
+            .child(num)
+            .child(lbl)
+    };
+
+    let comic_stat = stat_col(&comic_count, "漫画数量");
+    let source_stat = stat_col(&source_count, "漫画源数量");
+
+    let stats_row = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .justify_center()
+        .align_center()
+        .width_full()
+        .absolute()
+        .left(0)
+        .bottom(12)
+        .child(comic_stat)
+        .child(source_stat);
+
+    ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .align_start()
+        .width_full()
+        .child(title_row)
+        .child(stats_row)
+}
+
+pub fn render_comic_data_card(card_id: &str) {
+    tracing::info!("render_comic_data_card: card_id={}", card_id);
+    let ui_tree = build_comic_data_card_ui();
+    psys_host::ui_v3::render(card_id, ui_tree);
+}

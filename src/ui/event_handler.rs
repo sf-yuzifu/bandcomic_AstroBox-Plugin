@@ -1,10 +1,11 @@
 use super::state::*;
+use super::{COMIC_DATA_CARD_ID};
 use crate::astrobox::psys_host::{self, device, dialog, interconnect, register, thirdpartyapp, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::build::build_main_ui;
+use super::build::{self, build_main_ui};
 use super::message::{hide_status, show_status};
 
 pub fn ui_event_processor(
@@ -467,6 +468,8 @@ async fn handle_delete_comic(index: usize) {
                 let ui = build_main_ui();
                 psys_host::ui_v3::render(&root_id, ui);
             }
+
+            build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Err(e) => {
             tracing::error!("发送删除命令失败: {:?}", e);
@@ -597,6 +600,8 @@ async fn handle_delete_source(index: usize) {
                 let ui = build_main_ui();
                 psys_host::ui_v3::render(&root_id, ui);
             }
+
+            build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Err(e) => {
             tracing::error!("发送删除漫画源命令失败: {:?}", e);
@@ -775,6 +780,8 @@ pub fn handle_interconnect_message(payload: &str) {
                 let ui = build_main_ui();
                 psys_host::ui_v3::render(&root_id, ui);
             }
+
+            build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Some("cover_data_chunk") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -823,6 +830,7 @@ pub fn handle_interconnect_message(payload: &str) {
                     let ui = build_main_ui();
                     psys_host::ui_v3::render(&root_id, ui);
                 }
+                build::render_comic_data_card(COMIC_DATA_CARD_ID);
             }
         }
         _ => {

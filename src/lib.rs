@@ -23,6 +23,17 @@ impl lifecycle::Guest for MyPlugin {
         logger::init();
         tracing::info!("bandcomic Helper 插件已加载...");
         tracing::info!("UI 已初始渲染");
+
+        wit_bindgen::block_on(async move {
+            let _ = crate::astrobox::psys_host::register::register_card(
+                crate::astrobox::psys_host::register::CardType::Element,
+                ui::COMIC_DATA_CARD_ID,
+                ui::COMIC_DATA_CARD_NAME,
+            )
+            .await;
+
+            tracing::info!("漫画数据卡片已注册");
+        });
     }
 }
 
@@ -73,8 +84,11 @@ impl event::Guest for MyPlugin {
         reader
     }
 
-    fn on_card_render(_card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
+    fn on_card_render(card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
         let (writer, reader) = wit_future::new::<()>(|| ());
+
+        tracing::info!("on_card_render(legacy) called: {}", card_id);
+        ui::render_card(&card_id);
 
         wit_bindgen::spawn(async move {
             let _ = writer.write(()).await;
@@ -141,10 +155,11 @@ impl event_v3::Guest for MyPlugin {
         reader
     }
 
-    fn on_card_render(_card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
+    fn on_card_render(card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
         let (writer, reader) = wit_future::new::<()>(|| ());
 
-        tracing::info!("卡片渲染请求被忽略");
+        tracing::info!("on_card_render called: {}", card_id);
+        ui::render_card(&card_id);
 
         wit_bindgen::spawn(async move {
             let _ = writer.write(()).await;
