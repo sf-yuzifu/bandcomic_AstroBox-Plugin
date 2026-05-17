@@ -1,5 +1,5 @@
 use super::state::*;
-use crate::astrobox::psys_host::{self, device, interconnect, register, thirdpartyapp, timer};
+use crate::astrobox::psys_host::{self, device, dialog, interconnect, register, thirdpartyapp, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -355,6 +355,34 @@ async fn handle_delete_comic(index: usize) {
             return;
         }
     };
+
+    let dialog_info = dialog::DialogInfo {
+        title: format!("确认删除《{}》", comic_name),
+        content: "此操作将删除该漫画的所有本地文件，不可恢复。".to_string(),
+        buttons: vec![
+            dialog::DialogButton {
+                id: "cancel".to_string(),
+                primary: false,
+                content: "取消".to_string(),
+            },
+            dialog::DialogButton {
+                id: "confirm".to_string(),
+                primary: true,
+                content: "确认删除".to_string(),
+            },
+        ],
+    };
+
+    let dialog_result = dialog::show_dialog(
+        dialog::DialogType::Alert,
+        dialog::DialogStyle::Website,
+        &dialog_info,
+    ).await;
+
+    if dialog_result.clicked_btn_id != "confirm" {
+        tracing::info!("用户取消删除: {}", comic_name);
+        return;
+    }
 
     show_app_data_status(StatusState::Processing(format!("正在删除: {}...", comic_name))).await;
 
