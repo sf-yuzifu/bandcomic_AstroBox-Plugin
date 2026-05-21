@@ -55,18 +55,133 @@ pub fn ui_event_processor(
         HIDE_APP_DATA_STATUS_EVENT => {
             hide_app_data_status();
         }
+        HIDE_UPLOAD_STATUS_EVENT => {
+            hide_upload_status();
+        }
+        UPLOAD_NAME_INPUT_EVENT => {
+            if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
+                if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.upload_comic_name_input = text.to_string();
+                }
+            }
+        }
+        UPLOAD_MODE_SINGLE_EVENT => {
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.upload_mode = UploadMode::Single;
+            }
+            switch_tab(TabPage::Upload);
+        }
+        UPLOAD_MODE_MULTI_EVENT => {
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.upload_mode = UploadMode::Multi;
+            }
+            switch_tab(TabPage::Upload);
+        }
+        UPLOAD_PICK_FILES_EVENT => {
+            tracing::info!("选择文件按钮被点击");
+            wit_bindgen::block_on(handle_pick_files());
+        }
+        UPLOAD_START_EVENT => {
+            tracing::info!("上传按钮被点击");
+            wit_bindgen::block_on(handle_upload_start());
+        }
+        UPLOAD_CLEAR_EVENT => {
+            tracing::info!("清空列表按钮被点击");
+            handle_upload_clear();
+        }
+        UPLOAD_ADD_CHAPTER_EVENT => {
+            tracing::info!("添加章节按钮被点击");
+            handle_add_chapter();
+        }
+        UPLOAD_PICK_COVER_EVENT => {
+            tracing::info!("封面选择按钮被点击");
+            wit_bindgen::block_on(handle_upload_pick_cover());
+        }
+        UPLOAD_PICK_MULTI_COVER_EVENT => {
+            tracing::info!("多章节封面选择按钮被点击");
+            wit_bindgen::block_on(handle_multi_cover());
+        }
         TAB_SYNC_EVENT => {
             switch_tab(TabPage::Sync);
         }
         TAB_DATA_EVENT => {
             switch_tab(TabPage::Data);
         }
+        TAB_UPLOAD_EVENT => {
+            switch_tab(TabPage::Upload);
+        }
         FETCH_APP_DATA_EVENT => {
             tracing::info!("获取快应用数据按钮被点击");
             wit_bindgen::block_on(handle_fetch_app_data());
         }
         _ => {
-            if let Some(index_str) = event_id.strip_prefix(DELETE_COMIC_PREFIX) {
+            if let Some(index_str) = event_id.strip_prefix(UPLOAD_MOVE_UP_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    handle_upload_move(index, -1);
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(UPLOAD_MOVE_DOWN_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    handle_upload_move(index, 1);
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(UPLOAD_DELETE_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    handle_upload_delete(index);
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_PICK_FILES_PREFIX) {
+                if let Ok(chapter_index) = index_str.parse::<usize>() {
+                    tracing::info!("章节{}选择文件", chapter_index);
+                    wit_bindgen::block_on(handle_chapter_pick_files(chapter_index));
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_UPLOAD_PREFIX) {
+                if let Ok(chapter_index) = index_str.parse::<usize>() {
+                    tracing::info!("章节{}上传", chapter_index);
+                    wit_bindgen::block_on(handle_chapter_upload(chapter_index));
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_CLEAR_PREFIX) {
+                if let Ok(chapter_index) = index_str.parse::<usize>() {
+                    handle_chapter_clear(chapter_index);
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_DELETE_PREFIX) {
+                if let Ok(chapter_index) = index_str.parse::<usize>() {
+                    handle_chapter_delete_chapter(chapter_index);
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_MOVE_UP_PREFIX) {
+                // format: chapter_move_up_{chapter_index}_{file_index}
+                if let Some((ci_str, fi_str)) = index_str.split_once('_') {
+                    if let (Ok(ci), Ok(fi)) = (ci_str.parse::<usize>(), fi_str.parse::<usize>()) {
+                        handle_chapter_move_file(ci, fi, -1);
+                    }
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_MOVE_DOWN_PREFIX) {
+                if let Some((ci_str, fi_str)) = index_str.split_once('_') {
+                    if let (Ok(ci), Ok(fi)) = (ci_str.parse::<usize>(), fi_str.parse::<usize>()) {
+                        handle_chapter_move_file(ci, fi, 1);
+                    }
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_DEL_FILE_PREFIX) {
+                if let Some((ci_str, fi_str)) = index_str.split_once('_') {
+                    if let (Ok(ci), Ok(fi)) = (ci_str.parse::<usize>(), fi_str.parse::<usize>()) {
+                        handle_chapter_del_file(ci, fi);
+                    }
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_NAME_INPUT_PREFIX) {
+                if let Ok(chapter_index) = index_str.parse::<usize>() {
+                    if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
+                        if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
+                            handle_chapter_name_input(chapter_index, text.to_string());
+                        }
+                    }
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(DELETE_COMIC_PREFIX) {
                 if let Ok(index) = index_str.parse::<usize>() {
                     tracing::info!("删除漫画按钮被点击: index={}", index);
                     wit_bindgen::block_on(handle_delete_comic(index));
@@ -93,6 +208,1120 @@ fn switch_tab(tab: TabPage) {
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
         psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+pub fn hide_upload_status() {
+    let root_id: Option<String>;
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_status = StatusState::Default;
+        state.upload_status_timer_id = None;
+        root_id = state.root_element_id.clone();
+    }
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+async fn show_upload_status(status: StatusState) {
+    let root_id: Option<String>;
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(timer_id) = state.upload_status_timer_id {
+            let _ = timer::clear_timer(timer_id).await;
+        }
+
+        state.upload_status = status.clone();
+
+        if matches!(&status, StatusState::Success(_) | StatusState::Error(_)) {
+            let timer_id = timer::set_timeout(5000, HIDE_UPLOAD_STATUS_EVENT).await;
+            state.upload_status_timer_id = Some(timer_id);
+        }
+
+        root_id = state.root_element_id.clone();
+    }
+
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+fn rerender_upload_ui() {
+    let root_id = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.root_element_id.clone()
+    };
+
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+async fn handle_pick_files() {
+    let extensions = vec![
+        "jpg".to_string(),
+        "jpeg".to_string(),
+        "png".to_string(),
+        "webp".to_string(),
+        "bmp".to_string(),
+        "gif".to_string(),
+    ];
+
+    let filter = psys_host::dialog::FilterConfig {
+        multiple: true,
+        extensions,
+        default_directory: String::new(),
+        default_file_name: String::new(),
+    };
+
+    let pick_config = psys_host::dialog::PickConfig {
+        read: true,
+        copy_to: None,
+    };
+
+    let result = psys_host::dialog::pick_file(&pick_config, &filter).await;
+
+    if result.data.is_empty() {
+        tracing::info!("用户取消了文件选择");
+        return;
+    }
+
+    let name_input = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_comic_name_input.clone()
+    };
+
+    let comic_name = if name_input.trim().is_empty() {
+        let name_without_ext = result.name.rsplit('.').nth(1).unwrap_or(&result.name);
+        name_without_ext.to_string()
+    } else {
+        name_input.trim().to_string()
+    };
+
+    let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
+    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+
+    let compressed_len = compressed.len();
+
+    let file = UploadFile {
+        name: result.name.clone(),
+        data: compressed,
+        size: compressed_len,
+        original_size: result.data.len(),
+        thumbnail,
+    };
+
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        match state.upload_mode {
+            UploadMode::Single => {
+                if state.upload_comic_name_input.trim().is_empty() {
+                    state.upload_comic_name_input = comic_name.clone();
+                }
+                // first file becomes cover, rest go to pages
+                let mut found = false;
+                let file_name = file.name.clone();
+                for item in state.upload_items.iter_mut() {
+                    if item.comic_name == comic_name {
+                        item.files.push(file.clone());
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    let display_name = if state.upload_comic_name_input.trim().is_empty() {
+                        file_name
+                    } else {
+                        state.upload_comic_name_input.trim().to_string()
+                    };
+                    let mut item = UploadItem {
+                        comic_name: display_name,
+                        cover: None,
+                        files: vec![file],
+                    };
+                    // first file becomes cover
+                    if !item.files.is_empty() {
+                        item.cover = Some(item.files.remove(0));
+                    }
+                    state.upload_items.push(item);
+                }
+            }
+            UploadMode::Multi => {
+                // multi-mode now uses chapter-based picking via chapter_pick_files events
+                // if somehow pick_files is triggered in multi mode, add to the last chapter or create one
+                if state.upload_chapters.is_empty() {
+                    state.upload_chapters.push(ChapterItem::default());
+                }
+                let last = state.upload_chapters.last_mut().unwrap();
+                let already_exists = last.files.iter().any(|f| f.name == file.name);
+                if !already_exists {
+                    last.files.push(file);
+                }
+            }
+        }
+    }
+
+    rerender_upload_ui();
+}
+
+fn handle_upload_move(index: usize, direction: i32) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let new_index = (index as i32 + direction) as usize;
+        if new_index >= state.upload_items.len() {
+            return;
+        }
+
+        state.upload_items.swap(index, new_index);
+    }
+
+    rerender_upload_ui();
+}
+
+fn handle_upload_delete(index: usize) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if index >= state.upload_items.len() {
+            return;
+        }
+
+        state.upload_items.remove(index);
+    }
+
+    rerender_upload_ui();
+}
+
+fn handle_upload_clear() {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_items.clear();
+        state.upload_chapters.clear();
+        state.multi_cover = None;
+        state.upload_progress = 0.0;
+        state.upload_current_file = String::new();
+        state.upload_status = StatusState::Default;
+    }
+
+    rerender_upload_ui();
+}
+
+fn handle_add_chapter() {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_chapters.push(ChapterItem::default());
+    }
+    rerender_upload_ui();
+}
+
+fn handle_chapter_name_input(chapter_index: usize, value: String) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chapter_index < state.upload_chapters.len() {
+            state.upload_chapters[chapter_index].name = value;
+        }
+    }
+}
+
+async fn handle_chapter_pick_files(chapter_index: usize) {
+    let extensions = vec![
+        "jpg".to_string(),
+        "jpeg".to_string(),
+        "png".to_string(),
+        "webp".to_string(),
+        "bmp".to_string(),
+        "gif".to_string(),
+    ];
+
+    let filter = psys_host::dialog::FilterConfig {
+        multiple: true,
+        extensions,
+        default_directory: String::new(),
+        default_file_name: String::new(),
+    };
+
+    let pick_config = psys_host::dialog::PickConfig {
+        read: true,
+        copy_to: None,
+    };
+
+    let result = psys_host::dialog::pick_file(&pick_config, &filter).await;
+
+    if result.data.is_empty() {
+        tracing::info!("用户取消了章节文件选择");
+        return;
+    }
+
+    let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
+    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+
+    let compressed_len = compressed.len();
+
+    let file = UploadFile {
+        name: result.name.clone(),
+        data: compressed,
+        size: compressed_len,
+        original_size: result.data.len(),
+        thumbnail,
+    };
+
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if chapter_index < state.upload_chapters.len() {
+            let chapter = &mut state.upload_chapters[chapter_index];
+            let already_exists = chapter.files.iter().any(|f| f.name == file.name);
+            if !already_exists {
+                chapter.files.push(file);
+            }
+        }
+    }
+
+    rerender_upload_ui();
+}
+
+fn handle_chapter_clear(chapter_index: usize) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chapter_index < state.upload_chapters.len() {
+            state.upload_chapters[chapter_index].files.clear();
+        }
+    }
+    rerender_upload_ui();
+}
+
+fn handle_chapter_delete_chapter(chapter_index: usize) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chapter_index < state.upload_chapters.len() {
+            state.upload_chapters.remove(chapter_index);
+        }
+    }
+    rerender_upload_ui();
+}
+
+fn handle_chapter_move_file(chapter_index: usize, file_index: usize, direction: i32) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if chapter_index >= state.upload_chapters.len() {
+            return;
+        }
+
+        let chapter = &mut state.upload_chapters[chapter_index];
+        let new_index = (file_index as i32 + direction) as usize;
+        if new_index >= chapter.files.len() {
+            return;
+        }
+
+        chapter.files.swap(file_index, new_index);
+    }
+    rerender_upload_ui();
+}
+
+fn handle_chapter_del_file(chapter_index: usize, file_index: usize) {
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if chapter_index >= state.upload_chapters.len() {
+            return;
+        }
+
+        let chapter = &mut state.upload_chapters[chapter_index];
+        if file_index >= chapter.files.len() {
+            return;
+        }
+        chapter.files.remove(file_index);
+    }
+    rerender_upload_ui();
+}
+
+async fn handle_upload_pick_cover() {
+    let extensions = vec![
+        "jpg".to_string(),
+        "jpeg".to_string(),
+        "png".to_string(),
+        "webp".to_string(),
+        "bmp".to_string(),
+        "gif".to_string(),
+    ];
+
+    let filter = psys_host::dialog::FilterConfig {
+        multiple: false,
+        extensions,
+        default_directory: String::new(),
+        default_file_name: String::new(),
+    };
+
+    let pick_config = psys_host::dialog::PickConfig {
+        read: true,
+        copy_to: None,
+    };
+
+    let result = psys_host::dialog::pick_file(&pick_config, &filter).await;
+
+    if result.data.is_empty() {
+        tracing::info!("用户取消了封面选择");
+        return;
+    }
+
+    let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
+    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+
+    let compressed_len = compressed.len();
+
+    let cover_file = UploadFile {
+        name: result.name.clone(),
+        data: compressed,
+        size: compressed_len,
+        original_size: result.data.len(),
+        thumbnail,
+    };
+
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(first) = state.upload_items.first_mut() {
+            first.cover = Some(cover_file);
+        }
+    }
+    rerender_upload_ui();
+}
+
+async fn handle_multi_cover() {
+    let extensions = vec![
+        "jpg".to_string(),
+        "jpeg".to_string(),
+        "png".to_string(),
+        "webp".to_string(),
+        "bmp".to_string(),
+        "gif".to_string(),
+    ];
+
+    let filter = psys_host::dialog::FilterConfig {
+        multiple: false,
+        extensions,
+        default_directory: String::new(),
+        default_file_name: String::new(),
+    };
+
+    let pick_config = psys_host::dialog::PickConfig {
+        read: true,
+        copy_to: None,
+    };
+
+    let result = psys_host::dialog::pick_file(&pick_config, &filter).await;
+
+    if result.data.is_empty() {
+        tracing::info!("用户取消了封面选择");
+        return;
+    }
+
+    let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
+    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+
+    let compressed_len = compressed.len();
+
+    let cover_file = UploadFile {
+        name: result.name.clone(),
+        data: compressed,
+        size: compressed_len,
+        original_size: result.data.len(),
+        thumbnail,
+    };
+
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        state.multi_cover = Some(cover_file);
+    }
+    rerender_upload_ui();
+}
+
+async fn handle_chapter_upload(chapter_index: usize) {
+    // Reuse the same connection flow
+    let comic_name;
+    let chapter_data;
+
+    {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chapter_index >= state.upload_chapters.len() {
+            return;
+        }
+        let chapter = &state.upload_chapters[chapter_index];
+        if chapter.files.is_empty() {
+            drop(state);
+            show_upload_status(StatusState::Error("该章节没有图片。".to_string())).await;
+            return;
+        }
+        let main_name = if state.upload_comic_name_input.trim().is_empty() {
+            "本地漫画".to_string()
+        } else {
+            state.upload_comic_name_input.trim().to_string()
+        };
+        let ch_name = if chapter.name.trim().is_empty() {
+            format!("第{}章", chapter_index + 1)
+        } else {
+            chapter.name.clone()
+        };
+        comic_name = format!("{} - {}", main_name, ch_name);
+        chapter_data = (ch_name, chapter.files.clone());
+    }
+
+    // Check device connection
+    show_upload_status(StatusState::Processing("正在检查设备连接...".to_string())).await;
+    let devices = device::get_connected_device_list().await;
+    if devices.is_empty() {
+        show_upload_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
+        return;
+    }
+    let device_addr = devices[0].addr.clone();
+
+    let app_list = match thirdpartyapp::get_thirdparty_app_list(&device_addr).await {
+        Ok(apps) => apps,
+        Err(_) => {
+            show_upload_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
+            return;
+        }
+    };
+    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
+        Some(a) => a,
+        None => {
+            show_upload_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
+            return;
+        }
+    };
+    if let Err(e) = thirdpartyapp::launch_qa(&device_addr, app, "/pages/index").await {
+        tracing::error!("启动快应用失败: {:?}", e);
+        show_upload_status(StatusState::Error("启动快应用失败。".to_string())).await;
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
+    for attempt in 1..=3 {
+        match register::register_interconnect_recv(&device_addr, WATCH_APP_PKG_NAME).await {
+            Ok(_) => {
+                tracing::info!("互联注册成功 (第{}次尝试)", attempt);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("互联注册尝试 {}/3 失败: {:?}", attempt, e);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(1500));
+                } else {
+                    show_upload_status(StatusState::Error(
+                        "无法连接快应用，请确保手表快应用已打开后重试。".to_string()
+                    )).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    reset_upload_progress();
+
+    let (_ch_name, files) = chapter_data;
+    let total = files.len();
+    let page_count = files.len();
+
+    let mut all_files: Vec<(String, String)> = Vec::new();
+    let mut file_names: Vec<String> = Vec::new();
+
+    // Process pages
+    let mut page_num: u32 = 0;
+    for (fi, file) in files.iter().enumerate() {
+        page_num += 1;
+        let name = format!("{}", page_num);
+
+        show_upload_status(StatusState::Processing(format!(
+            "正在处理 {}/{}",
+            fi + 1,
+            total
+        ))).await;
+
+        // data is already compressed to TARGET_WIDTH
+        let b64 = base64_encode(&file.data);
+        file_names.push(name.clone());
+        all_files.push((name, b64));
+    }
+
+    let header: Value = json!({
+        "type": "import_comic_header",
+        "name": comic_name,
+        "mode": "single",
+        "files": file_names,
+        "page_count": page_count,
+        "is_serial": true,
+    });
+
+    let header_str = match serde_json::to_string(&header) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("序列化头部消息失败: {}", e);
+            show_upload_status(StatusState::Error("数据序列化失败。".to_string())).await;
+            return;
+        }
+    };
+
+    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
+
+    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str).await {
+        Ok(_) => tracing::info!("章节头部消息发送成功"),
+        Err(e) => {
+            tracing::error!("发送头部消息失败: {:?}", e);
+            show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
+            return;
+        }
+    }
+
+    let mut chunked_files: Vec<(String, Vec<String>)> = Vec::with_capacity(all_files.len());
+    for (file_key, b64_data) in all_files {
+        let chunks: Vec<String> = b64_data
+            .as_bytes()
+            .chunks(CHUNK_SIZE)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        chunked_files.push((file_key, chunks));
+    }
+
+    let total_files = chunked_files.len();
+    let first_file_key = chunked_files[0].0.clone();
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_session = Some(UploadSession {
+            device_addr: device_addr.clone(),
+            comic_name: comic_name.clone(),
+            all_files: chunked_files,
+            current_file: 0,
+            current_chunk: 0,
+            total_files,
+        });
+        state.upload_current_file = first_file_key;
+    }
+
+    send_next_chunk().await;
+}
+
+fn reset_upload_progress() {
+    let mut state = ui_state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.upload_progress = 0.0;
+    state.upload_current_file = String::new();
+}
+
+async fn handle_upload_start() {
+    reset_upload_progress();
+
+    let upload_mode;
+    let (is_single, items, chapters, multi_cover);
+
+    {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        upload_mode = state.upload_mode.clone();
+        is_single = upload_mode == UploadMode::Single;
+        items = state.upload_items.clone();
+        chapters = state.upload_chapters.clone();
+        multi_cover = state.multi_cover.clone();
+    } // release read lock
+
+    if is_single && items.is_empty() {
+        show_upload_status(StatusState::Error("请先选择漫画文件。".to_string())).await;
+        return;
+    }
+    if !is_single && chapters.is_empty() {
+        show_upload_status(StatusState::Error("请先添加章节。".to_string())).await;
+        return;
+    }
+    if !is_single {
+        let has_any_files = chapters.iter().any(|c| !c.files.is_empty());
+        if !has_any_files {
+            show_upload_status(StatusState::Error("所有章节都没有图片，请先添加图片。".to_string())).await;
+            return;
+        }
+    }
+
+    show_upload_status(StatusState::Processing("正在检查设备连接...".to_string())).await;
+
+    let devices = device::get_connected_device_list().await;
+
+    if devices.is_empty() {
+        show_upload_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
+        return;
+    }
+
+    let device_addr = &devices[0].addr;
+
+    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
+        Ok(apps) => apps,
+        Err(_) => {
+            show_upload_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
+            return;
+        }
+    };
+
+    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
+        Some(a) => a,
+        None => {
+            show_upload_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
+            return;
+        }
+    };
+
+    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
+        tracing::error!("启动快应用失败: {:?}", e);
+        show_upload_status(StatusState::Error("启动快应用失败。".to_string())).await;
+        return;
+    }
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
+
+    for attempt in 1..=3 {
+        match register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await {
+            Ok(_) => {
+                tracing::info!("互联注册成功 (第{}次尝试)", attempt);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("互联注册尝试 {}/3 失败: {:?}", attempt, e);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(1500));
+                } else {
+                    show_upload_status(StatusState::Error(
+                        "无法连接快应用，请确保手表快应用已打开后重试。".to_string()
+                    )).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    let upload_mode = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_mode.clone()
+    };
+
+    let comic_name = {
+        let state = ui_state()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let raw = state.upload_comic_name_input.trim().to_string();
+        if raw.is_empty() {
+            items.first().map(|i| i.comic_name.clone()).unwrap_or_default()
+        } else {
+            raw
+        }
+    };
+
+    let is_single = upload_mode == UploadMode::Single;
+
+    let mut all_files: Vec<(String, String)> = Vec::new();
+    let header: Value;
+
+    if is_single {
+        let mut file_names: Vec<String> = Vec::new();
+
+        for item in items.iter() {
+            // Process cover first
+            if let Some(ref cover_file) = item.cover {
+                show_upload_status(StatusState::Processing(format!(
+                    "正在处理 封面 ({}/{})",
+                    all_files.len() + 1,
+                    "-"
+                ))).await;
+
+                // data is already compressed to TARGET_WIDTH
+                let b64 = base64_encode(&cover_file.data);
+                file_names.push("cover".to_string());
+                all_files.push(("cover".to_string(), b64));
+            }
+
+            // Process pages
+            let mut page_num: u32 = 0;
+            for file in item.files.iter() {
+                page_num += 1;
+                let name = format!("{}", page_num);
+
+                show_upload_status(StatusState::Processing(format!(
+                    "正在处理 ({}/{})",
+                    all_files.len() + 1,
+                    "-"
+                ))).await;
+
+                // data is already compressed to TARGET_WIDTH
+                let b64 = base64_encode(&file.data);
+                file_names.push(name.clone());
+                all_files.push((name, b64));
+            }
+        }
+
+        header = json!({
+            "type": "import_comic_header",
+            "name": comic_name,
+            "mode": "single",
+            "files": file_names,
+        });
+    } else {
+        let mut chap_list: Vec<Value> = Vec::new();
+
+        // Process shared book-level cover first
+        if let Some(ref cover_file) = multi_cover {
+            show_upload_status(StatusState::Processing("正在处理 封面".to_string())).await;
+
+            let b64 = base64_encode(&cover_file.data);
+            all_files.push(("cover".to_string(), b64));
+        }
+
+        for (ci, chapter) in chapters.iter().enumerate() {
+            if chapter.files.is_empty() { continue; }
+            let mut chap_names: Vec<String> = Vec::new();
+            let mut page_num: u32 = 0;
+
+            // Format: "章节序号　章节名称" (full-width space)
+            let chapter_folder = if chapter.name.trim().is_empty() {
+                format!("{}　第{}章", ci + 1, ci + 1)
+            } else {
+                format!("{}　{}", ci + 1, chapter.name.trim())
+            };
+
+            // Process pages
+            for (fi, file) in chapter.files.iter().enumerate() {
+                page_num += 1;
+                let name = format!("{}", page_num);
+                let file_key = format!("{}/{}", chapter_folder, name);
+
+                show_upload_status(StatusState::Processing(format!(
+                    "正在处理 章节{} ({}/{})",
+                    ci + 1,
+                    fi + 1,
+                    chapter.files.len()
+                ))).await;
+
+                // data is already compressed to TARGET_WIDTH
+                let b64 = base64_encode(&file.data);
+                chap_names.push(name.clone());
+                all_files.push((file_key, b64));
+            }
+
+            let ch_name_val = if chapter.name.trim().is_empty() {
+                format!("第{}章", ci + 1)
+            } else {
+                chapter.name.clone()
+            };
+            chap_list.push(json!({
+                "name": ch_name_val,
+                "files": chap_names,
+            }));
+        }
+
+        header = json!({
+            "type": "import_comic_header",
+            "name": comic_name,
+            "mode": "multi",
+            "chapters": chap_list,
+        });
+    }
+
+    let header_str = match serde_json::to_string(&header) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("序列化头部消息失败: {}", e);
+            show_upload_status(StatusState::Error("数据序列化失败。".to_string())).await;
+            return;
+        }
+    };
+
+    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
+
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &header_str).await {
+        Ok(_) => tracing::info!("头部消息发送成功"),
+        Err(e) => {
+            tracing::error!("发送头部消息失败: {:?}", e);
+            show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
+            return;
+        }
+    }
+
+    let total = all_files.len();
+
+    let mut chunked_files: Vec<(String, Vec<String>)> = Vec::with_capacity(total);
+    for (file_key, b64_data) in all_files {
+        let chunks: Vec<String> = b64_data
+            .as_bytes()
+            .chunks(CHUNK_SIZE)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        let interim_show = format!("正在发送 1/{} ({}片)", total, chunks.len());
+        show_upload_status(StatusState::Processing(interim_show)).await;
+        {
+            let mut state = ui_state()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.upload_current_file = file_key.clone();
+        }
+        chunked_files.push((file_key, chunks));
+    }
+
+    let first_file_key = chunked_files[0].0.clone();
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_session = Some(UploadSession {
+            device_addr: device_addr.clone(),
+            comic_name: comic_name.clone(),
+            all_files: chunked_files,
+            current_file: 0,
+            current_chunk: 0,
+            total_files: total,
+        });
+        state.upload_current_file = first_file_key;
+    }
+
+    send_next_chunk().await;
+}
+
+async fn send_next_chunk() {
+    // 取出 session 所有权来避免借用冲突
+    let session = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_session.take()
+    };
+
+    let mut session = match session {
+        Some(s) => s,
+        None => return,
+    };
+
+    // 找到下一个要发送的分片
+    loop {
+        if session.current_file >= session.all_files.len() {
+            // 全部发送完毕
+            let device_addr = session.device_addr.clone();
+            let comic_name = session.comic_name.clone();
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.upload_progress = 1.0;
+                state.upload_current_file.clear();
+                state.upload_session = None;
+            }
+
+            let done_msg = json!({
+                "type": "import_comic_done",
+                "name": comic_name,
+            });
+            let done_str = match serde_json::to_string(&done_msg) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("序列化完成消息失败: {}", e);
+                    show_upload_status(StatusState::Error("序列化失败。".to_string())).await;
+                    return;
+                }
+            };
+            if let Err(e) = interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &done_str).await {
+                tracing::error!("发送完成消息失败: {:?}", e);
+            }
+            show_upload_status(StatusState::Success("上传完成！".to_string())).await;
+            return;
+        }
+
+        let chunks_len = session.all_files[session.current_file].1.len();
+
+        if session.current_chunk >= chunks_len {
+            // 当前文件发送完毕，跳到下一个文件
+            session.current_file += 1;
+            session.current_chunk = 0;
+            if session.current_file < session.all_files.len() {
+                let next_key = session.all_files[session.current_file].0.clone();
+                {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.upload_progress = session.current_file as f32 / session.total_files as f32;
+                    state.upload_current_file = next_key;
+                }
+            }
+            continue;
+        }
+
+        let file_key = session.all_files[session.current_file].0.clone();
+        let chunk = session.all_files[session.current_file].1[session.current_chunk].clone();
+        let idx = session.current_chunk;
+        session.current_chunk += 1;
+
+        let msg = json!({
+            "type": "import_comic_chunk",
+            "name": session.comic_name,
+            "file": file_key,
+            "index": idx,
+            "total": chunks_len,
+            "data": chunk,
+        });
+
+        let device_addr = session.device_addr.clone();
+
+        // 存回 session
+        {
+            let mut state = ui_state()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.upload_session = Some(session);
+        }
+
+        let chunk_str = match serde_json::to_string(&msg) {
+            Ok(s) => s,
+            Err(_) => {
+                reset_upload_progress();
+                show_upload_status(StatusState::Error("序列化失败。".to_string())).await;
+                return;
+            }
+        };
+
+        match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str).await {
+            Ok(_) => {
+                let status_text = {
+                    let state = ui_state()
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(s) = &state.upload_session {
+                        format!("正在发送 {}/{}", s.current_file + 1, s.total_files)
+                    } else {
+                        String::new()
+                    }
+                };
+                if !status_text.is_empty() {
+                    show_upload_status(StatusState::Processing(status_text)).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!("发送分片失败: {:?}", e);
+                reset_upload_progress();
+                show_upload_status(StatusState::Error("发送中断，请重试。".to_string())).await;
+            }
+        }
+
+        return;
+    }
+}
+
+const TARGET_WIDTH: u32 = 480;
+const THUMBNAIL_WIDTH: u32 = 100;
+const CHUNK_SIZE: usize = 5500;
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    let len = data.len();
+
+    for i in (0..len).step_by(3) {
+        let b1 = data[i];
+        let b2 = if i + 1 < len { data[i + 1] } else { 0 };
+        let b3 = if i + 2 < len { data[i + 2] } else { 0 };
+
+        result.push(CHARS[(b1 >> 2) as usize] as char);
+        result.push(CHARS[((b1 & 3) << 4 | b2 >> 4) as usize] as char);
+        result.push(if i + 1 < len {
+            CHARS[((b2 & 15) << 2 | b3 >> 6) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if i + 2 < len {
+            CHARS[(b3 & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+
+    result
+}
+
+fn resize_to_width(data: &[u8], target_width: u32) -> Vec<u8> {
+    let img = match image::load_from_memory(data) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::warn!("图片解码失败，使用原始数据: {}", e);
+            return data.to_vec();
+        }
+    };
+
+    let (w, h) = (img.width(), img.height());
+    if w <= target_width {
+        tracing::debug!("图片宽度 {} <= {}，无需缩放", w, target_width);
+        return data.to_vec();
+    }
+
+    let new_h = (h as f64 * target_width as f64 / w as f64).round() as u32;
+    let new_h = new_h.max(1);
+
+    tracing::info!("缩放图片: {}x{} -> {}x{}", w, h, target_width, new_h);
+
+    let resized = img.resize_exact(target_width, new_h, image::imageops::FilterType::Lanczos3);
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    match resized.write_to(&mut buf, image::ImageFormat::Jpeg) {
+        Ok(_) => {
+            let result = buf.into_inner();
+            tracing::info!("缩放完成: {} bytes -> {} bytes", data.len(), result.len());
+            result
+        }
+        Err(e) => {
+            tracing::warn!("JPEG 编码失败，使用原始数据: {}", e);
+            data.to_vec()
+        }
     }
 }
 
@@ -831,6 +2060,23 @@ pub fn handle_interconnect_message(payload: &str) {
                     psys_host::ui_v3::render(&root_id, ui);
                 }
                 build::render_comic_data_card(COMIC_DATA_CARD_ID);
+            }
+        }
+        Some("import_chunk_ack") => {
+            let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let file = parsed.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let has_session = {
+                let state = ui_state()
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.upload_session.is_some()
+            };
+
+            if has_session {
+                tracing::info!("收到 chunk ACK: name={}, file={}, index={}", name, file, index);
+                wit_bindgen::block_on(send_next_chunk());
             }
         }
         _ => {

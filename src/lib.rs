@@ -48,6 +48,8 @@ impl event::Guest for MyPlugin {
                     ui::hide_status();
                 } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
                     ui::hide_app_data_status();
+                } else if event_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
+                    ui::event_handler::hide_upload_status();
                 }
             }
             _ => {}
@@ -115,6 +117,8 @@ impl event_v3::Guest for MyPlugin {
                     ui::hide_status();
                 } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
                     ui::hide_app_data_status();
+                } else if event_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
+                    ui::event_handler::hide_upload_status();
                 }
             }
             _ => {}

@@ -10,6 +10,7 @@ pub use build::render_comic_data_card;
 pub use event_handler::ui_event_processor;
 pub use event_handler::handle_interconnect_message;
 pub use event_handler::hide_app_data_status;
+pub use event_handler::hide_upload_status;
 pub use message::hide_status;
 
 pub const COMIC_DATA_CARD_ID: &str = "band-comic-data";
