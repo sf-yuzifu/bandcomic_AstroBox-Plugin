@@ -1312,14 +1312,14 @@ fn resize_to_width(data: &[u8], target_width: u32) -> Vec<u8> {
     let resized = img.resize_exact(target_width, new_h, image::imageops::FilterType::Lanczos3);
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    match resized.write_to(&mut buf, image::ImageFormat::Jpeg) {
+    match resized.write_to(&mut buf, image::ImageFormat::Png) {
         Ok(_) => {
             let result = buf.into_inner();
             tracing::info!("缩放完成: {} bytes -> {} bytes", data.len(), result.len());
             result
         }
         Err(e) => {
-            tracing::warn!("JPEG 编码失败，使用原始数据: {}", e);
+            tracing::warn!("PNG 编码失败，使用原始数据: {}", e);
             data.to_vec()
         }
     }
