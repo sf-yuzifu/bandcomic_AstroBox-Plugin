@@ -14,6 +14,66 @@ pub struct PluginConfig {
     pub source_name: String,
 }
 
+/// 快应用通过握手（hs_pong）下发的 APP_SETTING。
+/// 缺省值与快应用 app.ux 中 global.APP_SETTING 的默认值保持一致。
+#[derive(Debug, Clone)]
+pub struct WatchSettings {
+    pub search_page_size: u32,
+    pub image_quality: u32,
+    pub image_size: u32,
+    pub show_cover_in_search: bool,
+    pub keep_default_zoom: bool,
+    pub image_use_png: bool,
+    pub image_pre_transcode: bool,
+}
+
+impl Default for WatchSettings {
+    fn default() -> Self {
+        WatchSettings {
+            search_page_size: 10,
+            image_quality: 50,
+            image_size: 600,
+            show_cover_in_search: false,
+            keep_default_zoom: false,
+            image_use_png: false,
+            image_pre_transcode: false,
+        }
+    }
+}
+
+impl WatchSettings {
+    /// 快应用侧设置项的值可能是字符串或数字/布尔，做兼容解析
+    pub fn from_json(v: &Value) -> Self {
+        let d = WatchSettings::default();
+        let get_u32 = |key: &str, def: u32| -> u32 {
+            v.get(key)
+                .and_then(|x| {
+                    x.as_u64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .map(|n| n as u32)
+                .unwrap_or(def)
+        };
+        let get_bool = |key: &str, def: bool| -> bool {
+            v.get(key)
+                .and_then(|x| {
+                    x.as_bool()
+                        .or_else(|| x.as_str().map(|s| s == "true" || s == "1"))
+                })
+                .unwrap_or(def)
+        };
+        WatchSettings {
+            search_page_size: get_u32("searchPageSize", d.search_page_size),
+            image_quality: get_u32("imageQuality", d.image_quality),
+            image_size: get_u32("imageSize", d.image_size),
+            show_cover_in_search: get_bool("showCoverInSearch", d.show_cover_in_search),
+            keep_default_zoom: get_bool("keepDefaultZoom", d.keep_default_zoom),
+            image_use_png: get_bool("imageUsePng", d.image_use_png),
+            image_pre_transcode: get_bool("imagePreTranscode", d.image_pre_transcode),
+        }
+    }
+}
+
 impl Default for PluginConfig {
     fn default() -> Self {
         PluginConfig {
@@ -42,7 +102,7 @@ pub enum TabPage {
 #[derive(Debug, Clone)]
 pub struct UploadFile {
     pub name: String,
-    pub data: Vec<u8>,        // compressed image data (resized to TARGET_WIDTH)
+    pub data: Vec<u8>,        // master image data (resized to MASTER_WIDTH)，发送前按快应用设置再处理
     pub size: usize,          // compressed size
     pub original_size: usize, // original file size before compression
     pub thumbnail: Vec<u8>,   // tiny thumbnail for UI preview
@@ -84,9 +144,19 @@ pub struct UploadSession {
     pub current_file: usize,
     pub current_chunk: usize,
     pub total_files: usize,
+    /// 已发送、正在等待 ACK 的分片位置 (file_idx, chunk_idx)；None 表示当前无在途分片
+    pub awaiting: Option<(usize, usize)>,
+    /// 当前分片的重传次数，超过上限则中止上传
+    pub retry_count: u32,
+    /// 头部消息原文（用于 ACK 超时重发）
+    pub header_str: String,
+    /// 快应用是否已确认收到头部（import_header_ack）
+    pub header_acked: bool,
+    /// 头部重发次数，超过上限退回旧版兼容模式（直接发分片）
+    pub header_retry: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ComicInfo {
     pub name: String,
     pub page_count: usize,
@@ -94,7 +164,7 @@ pub struct ComicInfo {
     pub cover_base64: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SourceInfo {
     pub name: String,
     pub api_url: String,
@@ -126,6 +196,17 @@ pub struct UiState {
     pub upload_status: StatusState,
     pub upload_status_timer_id: Option<u64>,
     pub upload_session: Option<UploadSession>,
+    /// 最近一次收到的握手应答 (session, 快应用设置)
+    pub hs_pong: Option<(String, WatchSettings)>,
+    /// 当前会话生效的快应用设置；None 表示对端是旧版快应用（未握手）
+    pub watch_settings: Option<WatchSettings>,
+    /// 上传分片 ACK 超时定时器 id
+    pub upload_ack_timer_id: Option<u64>,
+    /// 上传头部 ACK 超时定时器 id
+    pub upload_header_timer_id: Option<u64>,
+    /// 已拼完但漫画信息尚未到达（消息乱序）的封面，按漫画名暂存
+    /// 值: (封面数据, 插入时间戳秒)，超过 30 秒未补挂的会被清理
+    pub pending_covers: HashMap<String, (String, u64)>,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -158,6 +239,11 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             upload_status: StatusState::Default,
             upload_status_timer_id: None,
             upload_session: None,
+            hs_pong: None,
+            watch_settings: None,
+            upload_ack_timer_id: None,
+            upload_header_timer_id: None,
+            pending_covers: HashMap::new(),
         })
     })
 }
@@ -197,6 +283,10 @@ pub const UPLOAD_MOVE_DOWN_PREFIX: &str = "upload_move_down_";
 pub const UPLOAD_DELETE_PREFIX: &str = "upload_delete_";
 pub const UPLOAD_PICK_COVER_EVENT: &str = "upload_pick_cover";
 pub const HIDE_UPLOAD_STATUS_EVENT: &str = "hide_upload_status";
+/// 上传分片 ACK 超时重传定时器事件
+pub const UPLOAD_ACK_TIMEOUT_EVENT: &str = "upload_ack_timeout";
+/// 上传头部 ACK 超时重发定时器事件
+pub const UPLOAD_HEADER_TIMEOUT_EVENT: &str = "upload_header_timeout";
 
 // 多章节模式
 pub const UPLOAD_ADD_CHAPTER_EVENT: &str = "upload_add_chapter";

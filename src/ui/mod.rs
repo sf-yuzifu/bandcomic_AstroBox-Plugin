@@ -2,6 +2,7 @@ pub mod state;
 pub mod message;
 pub mod build;
 pub mod event_handler;
+pub mod handshake;
 
 use tracing;
 

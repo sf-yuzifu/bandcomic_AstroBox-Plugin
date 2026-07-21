@@ -1,9 +1,10 @@
 use super::state::*;
+use super::handshake;
 use super::{COMIC_DATA_CARD_ID};
-use crate::astrobox::psys_host::{self, device, dialog, interconnect, register, thirdpartyapp, timer};
+use image::ImageEncoder;
+use crate::astrobox::psys_host::{self, device, dialog, interconnect, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 use super::build::{self, build_main_ui};
 use super::message::{hide_status, show_status};
@@ -312,7 +313,7 @@ async fn handle_pick_files() {
     };
 
     let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
-    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+    let compressed = resize_to_width(&result.data, MASTER_WIDTH);
 
     let compressed_len = compressed.len();
 
@@ -480,7 +481,7 @@ async fn handle_chapter_pick_files(chapter_index: usize) {
     }
 
     let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
-    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+    let compressed = resize_to_width(&result.data, MASTER_WIDTH);
 
     let compressed_len = compressed.len();
 
@@ -603,7 +604,7 @@ async fn handle_upload_pick_cover() {
     }
 
     let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
-    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+    let compressed = resize_to_width(&result.data, MASTER_WIDTH);
 
     let compressed_len = compressed.len();
 
@@ -656,7 +657,7 @@ async fn handle_multi_cover() {
     }
 
     let thumbnail = resize_to_width(&result.data, THUMBNAIL_WIDTH);
-    let compressed = resize_to_width(&result.data, TARGET_WIDTH);
+    let compressed = resize_to_width(&result.data, MASTER_WIDTH);
 
     let compressed_len = compressed.len();
 
@@ -710,8 +711,7 @@ async fn handle_chapter_upload(chapter_index: usize) {
         chapter_data = (ch_name, chapter.files.clone());
     }
 
-    // Check device connection
-    show_upload_status(StatusState::Processing("正在检查设备连接...".to_string())).await;
+    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
     let devices = device::get_connected_device_list().await;
     if devices.is_empty() {
         show_upload_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
@@ -719,48 +719,13 @@ async fn handle_chapter_upload(chapter_index: usize) {
     }
     let device_addr = devices[0].addr.clone();
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(&device_addr).await {
-        Ok(apps) => apps,
-        Err(_) => {
-            show_upload_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_upload_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-    if let Err(e) = thirdpartyapp::launch_qa(&device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_upload_status(StatusState::Error("启动快应用失败。".to_string())).await;
+    if let Err(msg) = connect_and_handshake(0).await {
+        show_upload_status(StatusState::Error(msg)).await;
         return;
-    }
-    std::thread::sleep(Duration::from_secs(2));
-    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
-    for attempt in 1..=3 {
-        match register::register_interconnect_recv(&device_addr, WATCH_APP_PKG_NAME).await {
-            Ok(_) => {
-                tracing::info!("互联注册成功 (第{}次尝试)", attempt);
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("互联注册尝试 {}/3 失败: {:?}", attempt, e);
-                if attempt < 3 {
-                    std::thread::sleep(Duration::from_millis(1500));
-                } else {
-                    show_upload_status(StatusState::Error(
-                        "无法连接快应用，请确保手表快应用已打开后重试。".to_string()
-                    )).await;
-                    return;
-                }
-            }
-        }
     }
 
     reset_upload_progress();
+    let watch_settings = current_watch_settings();
 
     let (_ch_name, files) = chapter_data;
     let total = files.len();
@@ -773,7 +738,12 @@ async fn handle_chapter_upload(chapter_index: usize) {
     let mut page_num: u32 = 0;
     for (fi, file) in files.iter().enumerate() {
         page_num += 1;
-        let name = format!("{}", page_num);
+        // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
+        let name = if watch_settings.image_pre_transcode {
+            format!("{}.bin", page_num)
+        } else {
+            format!("{}", page_num)
+        };
 
         show_upload_status(StatusState::Processing(format!(
             "正在处理 {}/{}",
@@ -781,8 +751,8 @@ async fn handle_chapter_upload(chapter_index: usize) {
             total
         ))).await;
 
-        // data is already compressed to TARGET_WIDTH
-        let b64 = base64_encode(&file.data);
+        // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
+        let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
         file_names.push(name.clone());
         all_files.push((name, b64));
     }
@@ -804,17 +774,6 @@ async fn handle_chapter_upload(chapter_index: usize) {
             return;
         }
     };
-
-    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
-
-    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str).await {
-        Ok(_) => tracing::info!("章节头部消息发送成功"),
-        Err(e) => {
-            tracing::error!("发送头部消息失败: {:?}", e);
-            show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
-            return;
-        }
-    }
 
     let mut chunked_files: Vec<(String, Vec<String>)> = Vec::with_capacity(all_files.len());
     for (file_key, b64_data) in all_files {
@@ -839,11 +798,19 @@ async fn handle_chapter_upload(chapter_index: usize) {
             current_file: 0,
             current_chunk: 0,
             total_files,
+            awaiting: None,
+            retry_count: 0,
+            header_str: header_str.clone(),
+            header_acked: false,
+            header_retry: 0,
         });
         state.upload_current_file = first_file_key;
     }
 
-    send_next_chunk().await;
+    // 先发头部并等快应用确认（import_header_ack）后再发分片，
+    // 防止安卓端乱序导致分片先于头部到达被丢弃
+    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
+    send_import_header(&device_addr, &header_str).await;
 }
 
 fn reset_upload_progress() {
@@ -887,7 +854,7 @@ async fn handle_upload_start() {
         }
     }
 
-    show_upload_status(StatusState::Processing("正在检查设备连接...".to_string())).await;
+    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
 
     let devices = device::get_connected_device_list().await;
 
@@ -898,51 +865,12 @@ async fn handle_upload_start() {
 
     let device_addr = &devices[0].addr;
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
-        Ok(apps) => apps,
-        Err(_) => {
-            show_upload_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_upload_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-
-    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_upload_status(StatusState::Error("启动快应用失败。".to_string())).await;
+    if let Err(msg) = connect_and_handshake(0).await {
+        show_upload_status(StatusState::Error(msg)).await;
         return;
     }
 
-    std::thread::sleep(Duration::from_secs(2));
-
-    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
-
-    for attempt in 1..=3 {
-        match register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await {
-            Ok(_) => {
-                tracing::info!("互联注册成功 (第{}次尝试)", attempt);
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("互联注册尝试 {}/3 失败: {:?}", attempt, e);
-                if attempt < 3 {
-                    std::thread::sleep(Duration::from_millis(1500));
-                } else {
-                    show_upload_status(StatusState::Error(
-                        "无法连接快应用，请确保手表快应用已打开后重试。".to_string()
-                    )).await;
-                    return;
-                }
-            }
-        }
-    }
+    let watch_settings = current_watch_settings();
 
     let upload_mode = {
         let state = ui_state()
@@ -980,8 +908,8 @@ async fn handle_upload_start() {
                     "-"
                 ))).await;
 
-                // data is already compressed to TARGET_WIDTH
-                let b64 = base64_encode(&cover_file.data);
+                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（封面不转码）
+                let b64 = base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
                 file_names.push("cover".to_string());
                 all_files.push(("cover".to_string(), b64));
             }
@@ -990,7 +918,12 @@ async fn handle_upload_start() {
             let mut page_num: u32 = 0;
             for file in item.files.iter() {
                 page_num += 1;
-                let name = format!("{}", page_num);
+                // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
+                let name = if watch_settings.image_pre_transcode {
+                    format!("{}.bin", page_num)
+                } else {
+                    format!("{}", page_num)
+                };
 
                 show_upload_status(StatusState::Processing(format!(
                     "正在处理 ({}/{})",
@@ -998,8 +931,8 @@ async fn handle_upload_start() {
                     "-"
                 ))).await;
 
-                // data is already compressed to TARGET_WIDTH
-                let b64 = base64_encode(&file.data);
+                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
+                let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
                 file_names.push(name.clone());
                 all_files.push((name, b64));
             }
@@ -1018,7 +951,7 @@ async fn handle_upload_start() {
         if let Some(ref cover_file) = multi_cover {
             show_upload_status(StatusState::Processing("正在处理 封面".to_string())).await;
 
-            let b64 = base64_encode(&cover_file.data);
+            let b64 = base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
             all_files.push(("cover".to_string(), b64));
         }
 
@@ -1037,7 +970,12 @@ async fn handle_upload_start() {
             // Process pages
             for (fi, file) in chapter.files.iter().enumerate() {
                 page_num += 1;
-                let name = format!("{}", page_num);
+                // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
+                let name = if watch_settings.image_pre_transcode {
+                    format!("{}.bin", page_num)
+                } else {
+                    format!("{}", page_num)
+                };
                 let file_key = format!("{}/{}", chapter_folder, name);
 
                 show_upload_status(StatusState::Processing(format!(
@@ -1047,8 +985,8 @@ async fn handle_upload_start() {
                     chapter.files.len()
                 ))).await;
 
-                // data is already compressed to TARGET_WIDTH
-                let b64 = base64_encode(&file.data);
+                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
+                let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
                 chap_names.push(name.clone());
                 all_files.push((file_key, b64));
             }
@@ -1081,17 +1019,6 @@ async fn handle_upload_start() {
         }
     };
 
-    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
-
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &header_str).await {
-        Ok(_) => tracing::info!("头部消息发送成功"),
-        Err(e) => {
-            tracing::error!("发送头部消息失败: {:?}", e);
-            show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
-            return;
-        }
-    }
-
     let total = all_files.len();
 
     let mut chunked_files: Vec<(String, Vec<String>)> = Vec::with_capacity(total);
@@ -1101,14 +1028,6 @@ async fn handle_upload_start() {
             .chunks(CHUNK_SIZE)
             .map(|c| String::from_utf8_lossy(c).into_owned())
             .collect();
-        let interim_show = format!("正在发送 1/{} ({}片)", total, chunks.len());
-        show_upload_status(StatusState::Processing(interim_show)).await;
-        {
-            let mut state = ui_state()
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.upload_current_file = file_key.clone();
-        }
         chunked_files.push((file_key, chunks));
     }
 
@@ -1124,11 +1043,19 @@ async fn handle_upload_start() {
             current_file: 0,
             current_chunk: 0,
             total_files: total,
+            awaiting: None,
+            retry_count: 0,
+            header_str: header_str.clone(),
+            header_acked: false,
+            header_retry: 0,
         });
         state.upload_current_file = first_file_key;
     }
 
-    send_next_chunk().await;
+    // 先发头部并等快应用确认（import_header_ack）后再发分片，
+    // 防止安卓端乱序导致分片先于头部到达被丢弃
+    show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
+    send_import_header(device_addr, &header_str).await;
 }
 
 async fn send_next_chunk() {
@@ -1159,6 +1086,8 @@ async fn send_next_chunk() {
                 state.upload_current_file.clear();
                 state.upload_session = None;
             }
+
+            disarm_ack_timeout().await;
 
             let done_msg = json!({
                 "type": "import_comic_done",
@@ -1201,7 +1130,9 @@ async fn send_next_chunk() {
         let file_key = session.all_files[session.current_file].0.clone();
         let chunk = session.all_files[session.current_file].1[session.current_chunk].clone();
         let idx = session.current_chunk;
+        let file_idx = session.current_file;
         session.current_chunk += 1;
+        session.awaiting = Some((file_idx, idx));
 
         let msg = json!({
             "type": "import_comic_chunk",
@@ -1233,6 +1164,7 @@ async fn send_next_chunk() {
 
         match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str).await {
             Ok(_) => {
+                arm_ack_timeout().await;
                 let status_text = {
                     let state = ui_state()
                         .read()
@@ -1249,6 +1181,13 @@ async fn send_next_chunk() {
             }
             Err(e) => {
                 tracing::error!("发送分片失败: {:?}", e);
+                disarm_ack_timeout().await;
+                {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.upload_session = None;
+                }
                 reset_upload_progress();
                 show_upload_status(StatusState::Error("发送中断，请重试。".to_string())).await;
             }
@@ -1258,7 +1197,7 @@ async fn send_next_chunk() {
     }
 }
 
-const TARGET_WIDTH: u32 = 480;
+const MASTER_WIDTH: u32 = 1280;
 const THUMBNAIL_WIDTH: u32 = 100;
 const CHUNK_SIZE: usize = 5500;
 
@@ -1401,6 +1340,308 @@ async fn fetch_domain_config_async(domain: String) {
     }
 }
 
+/// ACK 超时（毫秒）与最大重传次数
+const ACK_TIMEOUT_MS: u64 = 3000;
+const MAX_ACK_RETRIES: u32 = 5;
+
+/// 连接手表快应用并完成握手。
+/// 使用重构后的握手模块，借鉴 FetchBridge v3 协议：
+/// - 会话状态持久化，复用已完成的握手
+/// - 自动清理过期会话
+/// - 分段异步等待，避免完全阻塞
+/// - 解决安卓端乱序和握手错位问题
+async fn connect_and_handshake(min_version: u32) -> Result<Option<WatchSettings>, String> {
+    handshake::connect_and_handshake(min_version).await
+}
+
+/// 当前生效的快应用设置（未握手时使用与快应用一致的缺省值）
+fn current_watch_settings() -> WatchSettings {
+    // 降级到 UI 状态的缓存，最后用默认值
+    // 握手完成后会自动更新到握手模块，这里保持 UI 状态兼容旧代码
+    let state = ui_state()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.watch_settings.clone().unwrap_or_default()
+}
+
+/// 按快应用设置处理待发送的图片：缩放到 imageSize 后，
+/// 页面：imagePreTranscode 时转 LVGL indexed-8 bin，否则按 imageUsePng/imageQuality 编码；
+/// 封面（is_page=false）：始终普通图片格式（与下载链路行为一致）。
+fn process_for_send(data: &[u8], settings: &WatchSettings, is_page: bool) -> Vec<u8> {
+    let img = match image::load_from_memory(data) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::warn!("发送前图片解码失败，使用原始数据: {}", e);
+            return data.to_vec();
+        }
+    };
+
+    let target = settings.image_size.clamp(100, 4096);
+    let img = if img.width() > target {
+        let new_h = ((img.height() as f64 * target as f64 / img.width() as f64).round() as u32).max(1);
+        img.resize_exact(target, new_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    if is_page && settings.image_pre_transcode {
+        return crate::lvgl::convert_to_lvgl_i8(&img);
+    }
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if settings.image_use_png {
+        match img.write_to(&mut buf, image::ImageFormat::Png) {
+            Ok(_) => buf.into_inner(),
+            Err(e) => {
+                tracing::warn!("PNG 编码失败，使用原始数据: {}", e);
+                data.to_vec()
+            }
+        }
+    } else {
+        let rgb = img.to_rgb8();
+        let quality = settings.image_quality.clamp(1, 100) as u8;
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+        match encoder.write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8) {
+            Ok(_) => buf.into_inner(),
+            Err(e) => {
+                tracing::warn!("JPEG 编码失败，使用原始数据: {}", e);
+                data.to_vec()
+            }
+        }
+    }
+}
+
+/// 武装/重武装 ACK 超时定时器
+async fn arm_ack_timeout() {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_ack_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_ACK_TIMEOUT_EVENT).await;
+    let mut state = ui_state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.upload_ack_timer_id = Some(tid);
+}
+
+async fn disarm_ack_timeout() {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_ack_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+}
+
+/// 发送导入头部并武装头部 ACK 超时定时器。
+/// 必须等快应用回 import_header_ack 后才开始发分片：
+/// 安卓端 QAIC 不保证消息顺序，分片可能反超头部被手表丢弃导致死锁。
+async fn send_import_header(device_addr: &str, header_str: &str) {
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, header_str).await {
+        Ok(_) => {
+            tracing::info!("头部消息发送成功，等待快应用确认");
+            arm_header_timeout().await;
+        }
+        Err(e) => {
+            tracing::error!("发送头部消息失败: {:?}", e);
+            {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.upload_session = None;
+            }
+            reset_upload_progress();
+            show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
+        }
+    }
+}
+
+async fn arm_header_timeout() {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_header_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_HEADER_TIMEOUT_EVENT).await;
+    let mut state = ui_state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.upload_header_timer_id = Some(tid);
+}
+
+async fn disarm_header_timeout() {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_header_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+}
+
+/// 头部 ACK 超时：重发头部（上限 3 次）；超限说明对端可能是
+/// 无 header ACK 机制的旧版快应用，退回兼容模式直接发分片。
+pub fn handle_upload_header_timeout() {
+    wit_bindgen::block_on(async {
+        enum Action {
+            Nothing,
+            Resend,
+            LegacyStart,
+        }
+
+        let (action, device_addr, header_str) = {
+            let mut state = ui_state()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state.upload_session.as_mut() {
+                Some(s) if !s.header_acked => {
+                    s.header_retry += 1;
+                    if s.header_retry > 3 {
+                        s.header_acked = true;
+                        (Action::LegacyStart, s.device_addr.clone(), String::new())
+                    } else {
+                        (Action::Resend, s.device_addr.clone(), s.header_str.clone())
+                    }
+                }
+                _ => (Action::Nothing, String::new(), String::new()),
+            }
+        };
+
+        match action {
+            Action::Nothing => {}
+            Action::Resend => {
+                tracing::warn!("头部 ACK 超时，重发头部消息");
+                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str).await {
+                    Ok(_) => {
+                        arm_header_timeout().await;
+                    }
+                    Err(e) => {
+                        tracing::error!("重发头部消息失败: {:?}", e);
+                        disarm_header_timeout().await;
+                        {
+                            let mut state = ui_state()
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.upload_session = None;
+                        }
+                        reset_upload_progress();
+                        show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
+                    }
+                }
+            }
+            Action::LegacyStart => {
+                tracing::warn!("未收到头部确认，按旧版兼容模式直接发送分片");
+                send_next_chunk().await;
+            }
+        }
+    });
+}
+
+/// ACK 超时处理：重传当前在途分片；超过重传上限则中止上传。
+/// 由定时器事件 UPLOAD_ACK_TIMEOUT_EVENT 触发。
+pub fn handle_upload_ack_timeout() {
+    wit_bindgen::block_on(async {
+        enum Action {
+            Nothing,
+            Resend(usize, usize),
+            Abort,
+        }
+
+        let (action, device_addr) = {
+            let mut state = ui_state()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state.upload_session.as_mut() {
+                Some(s) if s.awaiting.is_some() => {
+                    s.retry_count += 1;
+                    if s.retry_count > MAX_ACK_RETRIES {
+                        (Action::Abort, s.device_addr.clone())
+                    } else {
+                        let (fi, ci) = s.awaiting.unwrap();
+                        (Action::Resend(fi, ci), s.device_addr.clone())
+                    }
+                }
+                _ => (Action::Nothing, String::new()),
+            }
+        };
+
+        match action {
+            Action::Nothing => {}
+            Action::Abort => {
+                tracing::error!("分片重传超过上限，中止上传");
+                {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.upload_session = None;
+                }
+                reset_upload_progress();
+                show_upload_status(StatusState::Error("发送中断，请重试。".to_string())).await;
+            }
+            Action::Resend(fi, ci) => {
+                let (comic_name, file_key, chunk, total) = {
+                    let state = ui_state()
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match &state.upload_session {
+                        Some(s) => (
+                            s.comic_name.clone(),
+                            s.all_files[fi].0.clone(),
+                            s.all_files[fi].1[ci].clone(),
+                            s.all_files[fi].1.len(),
+                        ),
+                        None => return,
+                    }
+                };
+
+                tracing::warn!("ACK 超时，重传分片: file={}, index={}", file_key, ci);
+
+                let chunk_str = json!({
+                    "type": "import_comic_chunk",
+                    "name": comic_name,
+                    "file": file_key,
+                    "index": ci,
+                    "total": total,
+                    "data": chunk,
+                })
+                .to_string();
+
+                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str).await {
+                    Ok(_) => {
+                        arm_ack_timeout().await;
+                    }
+                    Err(e) => {
+                        tracing::error!("重传分片失败: {:?}", e);
+                        disarm_ack_timeout().await;
+                        {
+                            let mut state = ui_state()
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.upload_session = None;
+                        }
+                        reset_upload_progress();
+                        show_upload_status(StatusState::Error("发送中断，请重试。".to_string())).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn handle_sync() {
     let (cookie, domain, mut source_name) = {
         let state = ui_state()
@@ -1463,37 +1704,10 @@ async fn handle_sync() {
 
     let device_addr = &devices[0].addr;
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
-        Ok(apps) => apps,
-        Err(e) => {
-            tracing::error!("获取快应用列表失败: {:?}", e);
-            show_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-
-    if app.version_code < 184 {
-        show_status(StatusState::Error("请先安装腕上漫画快应用的新版本！".to_string())).await;
+    if let Err(msg) = connect_and_handshake(206).await {
+        show_status(StatusState::Error(msg)).await;
         return;
     }
-
-    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
-
-    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_status(StatusState::Error("启动快应用失败。".to_string())).await;
-        return;
-    }
-
-    std::thread::sleep(Duration::from_secs(2));
 
     show_status(StatusState::Processing("正在发送到手表...".to_string())).await;
 
@@ -1630,31 +1844,10 @@ async fn handle_delete_comic(index: usize) {
 
     let device_addr = &devices[0].addr;
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
-        Ok(apps) => apps,
-        Err(_) => {
-            show_app_data_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_app_data_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-
-    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_app_data_status(StatusState::Error("启动快应用失败。".to_string())).await;
+    if let Err(msg) = connect_and_handshake(0).await {
+        show_app_data_status(StatusState::Error(msg)).await;
         return;
     }
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
 
     let delete_msg = json!({
         "type": "delete_comic",
@@ -1762,31 +1955,10 @@ async fn handle_delete_source(index: usize) {
 
     let device_addr = &devices[0].addr;
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
-        Ok(apps) => apps,
-        Err(_) => {
-            show_app_data_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_app_data_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-
-    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_app_data_status(StatusState::Error("启动快应用失败。".to_string())).await;
+    if let Err(msg) = connect_and_handshake(0).await {
+        show_app_data_status(StatusState::Error(msg)).await;
         return;
     }
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
 
     let delete_msg = json!({
         "type": "delete_source",
@@ -1851,33 +2023,35 @@ async fn handle_fetch_app_data() {
 
     let device_addr = &devices[0].addr;
 
-    let app_list = match thirdpartyapp::get_thirdparty_app_list(device_addr).await {
-        Ok(apps) => apps,
-        Err(_) => {
-            show_app_data_status(StatusState::Error("无法获取快应用列表。".to_string())).await;
-            return;
-        }
-    };
-
-    let app = match app_list.iter().find(|a| a.package_name == WATCH_APP_PKG_NAME) {
-        Some(a) => a,
-        None => {
-            show_app_data_status(StatusState::Error("请先安装腕上漫画快应用！".to_string())).await;
-            return;
-        }
-    };
-
     show_app_data_status(StatusState::Processing("正在启动快应用...".to_string())).await;
 
-    if let Err(e) = thirdpartyapp::launch_qa(device_addr, app, "/pages/index").await {
-        tracing::error!("启动快应用失败: {:?}", e);
-        show_app_data_status(StatusState::Error("启动快应用失败。".to_string())).await;
+    if let Err(msg) = connect_and_handshake(0).await {
+        show_app_data_status(StatusState::Error(msg)).await;
         return;
     }
 
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = register::register_interconnect_recv(device_addr, WATCH_APP_PKG_NAME).await;
+    // 新一轮数据会话：清空上一轮残留。
+    // 清理动作必须在发起请求时完成——安卓端消息乱序，
+    // 靠 app_data_header 到达时机清理会误删已收到的数据
+    {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_comics.clear();
+        state.app_sources.clear();
+        state.app_comic_count = None;
+        state.app_source_count = None;
+        state.cover_chunk_buffers.clear();
+        // 清理过期的 pending_covers（30秒未补挂的丢弃）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state.pending_covers.retain(|_, (_, ts)| now - *ts < 30);
+        if !state.pending_covers.is_empty() {
+            tracing::info!("清理了 {} 个过期封面缓存", state.pending_covers.len());
+        }
+    }
 
     let request_msg = json!({
         "type": "request_data"
@@ -1904,8 +2078,36 @@ async fn handle_fetch_app_data() {
     }
 }
 
+/// 发送 app_data 消息的 ACK 确认
+/// 快应用端等待此 ACK 后继续发送下一个消息，确保安卓端严格顺序
+fn send_app_data_ack(device_addr: &str, index: usize) {
+    let ack_msg = json!({
+        "type": "app_data_ack",
+        "index": index,
+    });
+
+    if let Ok(ack_str) = serde_json::to_string(&ack_msg) {
+        wit_bindgen::block_on(async {
+            let _ = interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &ack_str).await;
+        });
+    }
+}
+
 pub fn handle_interconnect_message(payload: &str) {
     tracing::info!("收到互联消息: {}", payload);
+
+    // 先获取设备地址，用于发送 ACK
+    let device_addr = {
+        let devices = device::get_connected_device_list();
+        wit_bindgen::block_on(async {
+            let devices = devices.await;
+            if !devices.is_empty() {
+                Some(devices[0].addr.clone())
+            } else {
+                None
+            }
+        })
+    };
 
     let outer = match serde_json::from_str::<Value>(payload) {
         Ok(v) => v,
@@ -1945,36 +2147,64 @@ pub fn handle_interconnect_message(payload: &str) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.app_comic_count = Some(comic_count);
             state.app_source_count = Some(source_count);
-            state.app_comics = vec![ComicInfo {
-                name: String::new(),
-                page_count: 0,
-                chapters: 0,
-                cover_base64: String::new(),
-            }; comic_count];
-            state.app_sources = vec![SourceInfo {
-                name: String::new(),
-                api_url: String::new(),
-            }; source_count];
-            state.cover_chunk_buffers.clear();
+            // 安卓端消息可能乱序：comic/source/封面分片可能先于 header 到达，
+            // 这里只按需扩容（不重建、不清缓冲区），数据按 index/名字落位
+            if state.app_comics.len() < comic_count {
+                state.app_comics.resize(comic_count, ComicInfo::default());
+            }
+            if state.app_sources.len() < source_count {
+                state.app_sources.resize(source_count, SourceInfo::default());
+            }
             state.app_data_status = StatusState::Processing("接收中...".to_string());
+
+            // 发送 ACK 确认，让快应用继续发下一个
+            // 快应用 msgIndex = 0，ACK 后 msgIndex++ 变成 1，所以 ACK 序号 = 0
+            if let Some(ref addr) = device_addr {
+                send_app_data_ack(addr, 0);
+            }
         }
         Some("app_data_comic") => {
             let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let comic = parsed.get("comic");
 
             if let Some(comic) = comic {
-                let info = ComicInfo {
+                let mut info = ComicInfo {
                     name: comic.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     page_count: comic.get("page_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                     chapters: comic.get("chapters").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
                     cover_base64: String::new(),
                 };
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if index < state.app_comics.len() {
+                let root_id = {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // 乱序容忍：header 未到时按需扩容
+                    if index >= state.app_comics.len() {
+                        state.app_comics.resize(index + 1, ComicInfo::default());
+                    }
+                    // 封面先于漫画信息拼完的，补挂（取出并丢弃时间戳）
+                    if let Some((cover, _ts)) = state.pending_covers.remove(&info.name) {
+                        info.cover_base64 = cover;
+                    }
                     state.app_comics[index] = info;
+                    // app_data_done 已渲染过的，迟到的数据需要补一次渲染
+                    if matches!(state.app_data_status, StatusState::Success(_)) {
+                        state.root_element_id.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(root_id) = root_id {
+                    let ui = build_main_ui();
+                    psys_host::ui_v3::render(&root_id, ui);
+                    build::render_comic_data_card(COMIC_DATA_CARD_ID);
                 }
+            }
+            // 发送 ACK 确认，让快应用继续发下一个
+            // 当前消息在快应用的 msgIndex = (index + 1)，所以 ACK 序号 = (index + 1)
+            // 因为 header 占用 msgIndex 0，所以 comic 从 1 开始
+            if let Some(ref addr) = device_addr {
+                send_app_data_ack(addr, 1 + index);
             }
         }
         Some("app_data_source") => {
@@ -1986,12 +2216,37 @@ pub fn handle_interconnect_message(payload: &str) {
                     name: source.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     api_url: source.get("apiUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 };
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if index < state.app_sources.len() {
+                let root_id = {
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if index >= state.app_sources.len() {
+                        state.app_sources.resize(index + 1, SourceInfo::default());
+                    }
                     state.app_sources[index] = info;
+                    if matches!(state.app_data_status, StatusState::Success(_)) {
+                        state.root_element_id.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(root_id) = root_id {
+                    let ui = build_main_ui();
+                    psys_host::ui_v3::render(&root_id, ui);
                 }
+            }
+            // 发送 ACK 确认，让快应用继续发下一个
+            // header 占 1 + 前面 comic 占 N 个，所以当前 msgIndex = 1 + comics.len() + index
+            // 从 state 获取 comic_count
+            let total_comics = {
+                let state = ui_state()
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.app_comic_count.unwrap_or(0)
+            };
+            let msg_index = 1 + total_comics + index;
+            if let Some(ref addr) = device_addr {
+                send_app_data_ack(addr, msg_index);
             }
         }
         Some("app_data_done") => {
@@ -2011,6 +2266,22 @@ pub fn handle_interconnect_message(payload: &str) {
             }
 
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
+
+            // done 消息也要 ACK，表示可以开始发封面
+            // msgIndex = 1 + comic_count + source_count = done 的位置
+            let (comic_count, source_count) = {
+                let state = ui_state()
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (
+                    state.app_comic_count.unwrap_or(0),
+                    state.app_source_count.unwrap_or(0),
+                )
+            };
+            let msg_index = 1 + comic_count + source_count;
+            if let Some(ref addr) = device_addr {
+                send_app_data_ack(addr, msg_index);
+            }
         }
         Some("cover_data_chunk") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2044,11 +2315,22 @@ pub fn handle_interconnect_message(payload: &str) {
                 let all_done = buf.1.iter().all(|s| !s.is_empty());
                 if all_done {
                     let cover = buf.1.concat();
-                    if let Some(comic) = state.app_comics.iter_mut().find(|c| c.name == name) {
+                    // 漫画信息可能因乱序尚未到达：找不到时暂存，
+                    // 等 app_data_comic 到达时补挂，避免封面被丢弃
+                    // 记录当前时间戳，超过 30 秒未补挂的会被清理
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let attached = if let Some(comic) = state.app_comics.iter_mut().find(|c| c.name == name) {
                         comic.cover_base64 = cover;
-                    }
+                        true
+                    } else {
+                        state.pending_covers.insert(name.to_string(), (cover, now));
+                        false
+                    };
                     state.cover_chunk_buffers.remove(name);
-                    (true, state.root_element_id.clone())
+                    (attached, state.root_element_id.clone())
                 } else {
                     (false, state.root_element_id.clone())
                 }
@@ -2062,21 +2344,99 @@ pub fn handle_interconnect_message(payload: &str) {
                 build::render_comic_data_card(COMIC_DATA_CARD_ID);
             }
         }
+        Some("import_header_ack") => {
+            let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+            // 快应用确认收到头部：开始发分片。重复 ACK（如重发头部导致）直接忽略
+            let start = {
+                let mut state = ui_state()
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match state.upload_session.as_mut() {
+                    Some(s) if s.comic_name == name && !s.header_acked => {
+                        s.header_acked = true;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+
+            if start {
+                tracing::info!("头部已确认: name={}，开始发送分片", name);
+                wit_bindgen::block_on(async {
+                    disarm_header_timeout().await;
+                    send_next_chunk().await;
+                });
+            }
+        }
+        Some("hs_pong") => {
+            let session = parsed
+                .get("session")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let settings = parsed
+                .get("settings")
+                .map(WatchSettings::from_json)
+                .unwrap_or_default();
+            tracing::info!("收到握手应答: session={}, settings={:?}", session, settings);
+
+            // 新握手协议：从当前连接的设备地址更新会话
+            let devices = device::get_connected_device_list();
+            wit_bindgen::block_on(async {
+                let devices = devices.await;
+                if !devices.is_empty() {
+                    let device_addr = &devices[0].addr;
+                    handshake::handle_hs_pong(device_addr, &session, &parsed);
+                    // 同时更新 UI 状态保持兼容
+                    let mut state = ui_state()
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.watch_settings = Some(settings);
+                }
+            });
+        }
         Some("import_chunk_ack") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let file = parsed.get("file").and_then(|v| v.as_str()).unwrap_or("");
-            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-            let has_session = {
-                let state = ui_state()
-                    .read()
+            // 只接受与当前在途分片匹配的 ACK，忽略陈旧/重复 ACK，
+            // 否则旧 ACK 会错误推进会话导致跳片、传输错位
+            let advance = {
+                let mut state = ui_state()
+                    .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.upload_session.is_some()
+                match state.upload_session.as_mut() {
+                    Some(s) if s.comic_name == name => match s.awaiting {
+                        Some((afi, aci))
+                            if afi < s.all_files.len()
+                                && s.all_files[afi].0 == file
+                                && aci == index =>
+                        {
+                            s.awaiting = None;
+                            s.retry_count = 0;
+                            true
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "忽略不匹配的分片 ACK: file={}, index={}（非当前在途分片）",
+                                file,
+                                index
+                            );
+                            false
+                        }
+                    },
+                    _ => false,
+                }
             };
 
-            if has_session {
+            if advance {
                 tracing::info!("收到 chunk ACK: name={}, file={}, index={}", name, file, index);
-                wit_bindgen::block_on(send_next_chunk());
+                wit_bindgen::block_on(async {
+                    disarm_ack_timeout().await;
+                    send_next_chunk().await;
+                });
             }
         }
         _ => {

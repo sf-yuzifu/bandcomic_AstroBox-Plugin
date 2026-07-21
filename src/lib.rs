@@ -1,7 +1,6 @@
 use wit_bindgen::FutureReader;
 
 use crate::exports::astrobox::psys_plugin::{
-    event,
     event_v3,
     lifecycle,
 };
@@ -9,6 +8,7 @@ use crate::exports::astrobox::psys_plugin::{
 pub mod logger;
 pub mod ui;
 pub mod network;
+pub mod lvgl;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -37,69 +37,6 @@ impl lifecycle::Guest for MyPlugin {
     }
 }
 
-impl event::Guest for MyPlugin {
-    #[allow(async_fn_in_trait)]
-    fn on_event(event_type: event::EventType, event_payload: _rt::String) -> FutureReader<String> {
-        let (writer, reader) = wit_future::new::<String>(|| "".to_string());
-
-        match event_type {
-            event::EventType::Timer => {
-                if event_payload == ui::state::HIDE_STATUS_EVENT {
-                    ui::hide_status();
-                } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
-                    ui::hide_app_data_status();
-                } else if event_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
-                    ui::event_handler::hide_upload_status();
-                }
-            }
-            _ => {}
-        };
-
-        wit_bindgen::spawn(async move {
-            let _ = writer.write("".to_string()).await;
-        });
-
-        reader
-    }
-
-    fn on_ui_event(
-        _event_id: _rt::String,
-        _event_type: crate::astrobox::psys_host::ui::Event,
-        _event_payload: _rt::String,
-    ) -> wit_bindgen::rt::async_support::FutureReader<_rt::String> {
-        let (writer, reader) = wit_future::new::<String>(|| "".to_string());
-
-        wit_bindgen::spawn(async move {
-            let _ = writer.write("".to_string()).await;
-        });
-
-        reader
-    }
-
-    fn on_ui_render(_element_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
-        let (writer, reader) = wit_future::new::<()>(|| ());
-
-        wit_bindgen::spawn(async move {
-            let _ = writer.write(()).await;
-        });
-
-        reader
-    }
-
-    fn on_card_render(card_id: _rt::String) -> wit_bindgen::rt::async_support::FutureReader<()> {
-        let (writer, reader) = wit_future::new::<()>(|| ());
-
-        tracing::info!("on_card_render(legacy) called: {}", card_id);
-        ui::render_card(&card_id);
-
-        wit_bindgen::spawn(async move {
-            let _ = writer.write(()).await;
-        });
-
-        reader
-    }
-}
-
 impl event_v3::Guest for MyPlugin {
     #[allow(async_fn_in_trait)]
     fn on_event(event_type: event_v3::EventType, event_payload: _rt::String) -> FutureReader<String> {
@@ -119,6 +56,10 @@ impl event_v3::Guest for MyPlugin {
                     ui::hide_app_data_status();
                 } else if event_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
                     ui::event_handler::hide_upload_status();
+                } else if event_payload == ui::state::UPLOAD_ACK_TIMEOUT_EVENT {
+                    ui::event_handler::handle_upload_ack_timeout();
+                } else if event_payload == ui::state::UPLOAD_HEADER_TIMEOUT_EVENT {
+                    ui::event_handler::handle_upload_header_timeout();
                 }
             }
             _ => {}
