@@ -1,10 +1,10 @@
-use super::state::*;
+use super::COMIC_DATA_CARD_ID;
 use super::handshake;
-use super::{COMIC_DATA_CARD_ID};
-use image::ImageEncoder;
+use super::state::*;
 use crate::astrobox::psys_host::{self, device, dialog, interconnect, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
-use serde_json::{json, Value};
+use image::ImageEncoder;
+use serde_json::{Value, json};
 
 use super::build::{self, build_main_ui};
 use super::message::{hide_status, show_status};
@@ -723,8 +723,10 @@ async fn handle_chapter_upload(chapter_index: usize) {
     };
 
     // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续上传流程
-    handshake::begin_wait(device_addr.clone(), upload_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        upload_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
             }
@@ -735,8 +737,8 @@ async fn handle_chapter_upload(chapter_index: usize) {
                     device_addr,
                 ));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -770,7 +772,8 @@ async fn chapter_upload_continue(
             "正在处理 {}/{}",
             fi + 1,
             total
-        ))).await;
+        )))
+        .await;
 
         // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
         let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
@@ -869,7 +872,10 @@ async fn handle_upload_start() {
     if !is_single {
         let has_any_files = chapters.iter().any(|c| !c.files.is_empty());
         if !has_any_files {
-            show_upload_status(StatusState::Error("所有章节都没有图片，请先添加图片。".to_string())).await;
+            show_upload_status(StatusState::Error(
+                "所有章节都没有图片，请先添加图片。".to_string(),
+            ))
+            .await;
             return;
         }
     }
@@ -886,16 +892,18 @@ async fn handle_upload_start() {
     };
 
     // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续上传流程
-    handshake::begin_wait(device_addr.clone(), upload_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        upload_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
             }
             Ok(_) => {
                 wit_bindgen::block_on(upload_start_continue(device_addr));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -920,7 +928,10 @@ async fn upload_start_continue(device_addr: String) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let raw = state.upload_comic_name_input.trim().to_string();
         if raw.is_empty() {
-            items.first().map(|i| i.comic_name.clone()).unwrap_or_default()
+            items
+                .first()
+                .map(|i| i.comic_name.clone())
+                .unwrap_or_default()
         } else {
             raw
         }
@@ -941,10 +952,12 @@ async fn upload_start_continue(device_addr: String) {
                     "正在处理 封面 ({}/{})",
                     all_files.len() + 1,
                     "-"
-                ))).await;
+                )))
+                .await;
 
                 // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（封面不转码）
-                let b64 = base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
+                let b64 =
+                    base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
                 file_names.push("cover".to_string());
                 all_files.push(("cover".to_string(), b64));
             }
@@ -964,7 +977,8 @@ async fn upload_start_continue(device_addr: String) {
                     "正在处理 ({}/{})",
                     all_files.len() + 1,
                     "-"
-                ))).await;
+                )))
+                .await;
 
                 // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
                 let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
@@ -991,7 +1005,9 @@ async fn upload_start_continue(device_addr: String) {
         }
 
         for (ci, chapter) in chapters.iter().enumerate() {
-            if chapter.files.is_empty() { continue; }
+            if chapter.files.is_empty() {
+                continue;
+            }
             let mut chap_names: Vec<String> = Vec::new();
             let mut page_num: u32 = 0;
 
@@ -1018,7 +1034,8 @@ async fn upload_start_continue(device_addr: String) {
                     ci + 1,
                     fi + 1,
                     chapter.files.len()
-                ))).await;
+                )))
+                .await;
 
                 // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
                 let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
@@ -1136,7 +1153,9 @@ async fn send_next_chunk() {
                     return;
                 }
             };
-            if let Err(e) = interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &done_str).await {
+            if let Err(e) =
+                interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &done_str).await
+            {
                 tracing::error!("发送完成消息失败: {:?}", e);
             }
             show_upload_status(StatusState::Success("上传完成！".to_string())).await;
@@ -1155,7 +1174,8 @@ async fn send_next_chunk() {
                     let mut state = ui_state()
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state.upload_progress = session.current_file as f32 / session.total_files as f32;
+                    state.upload_progress =
+                        session.current_file as f32 / session.total_files as f32;
                     state.upload_current_file = next_key;
                 }
             }
@@ -1470,7 +1490,8 @@ fn process_for_send(data: &[u8], settings: &WatchSettings, is_page: bool) -> Vec
 
     let target = settings.image_size.clamp(100, 4096);
     let img = if img.width() > target {
-        let new_h = ((img.height() as f64 * target as f64 / img.width() as f64).round() as u32).max(1);
+        let new_h =
+            ((img.height() as f64 * target as f64 / img.width() as f64).round() as u32).max(1);
         img.resize_exact(target, new_h, image::imageops::FilterType::Lanczos3)
     } else {
         img
@@ -1493,7 +1514,12 @@ fn process_for_send(data: &[u8], settings: &WatchSettings, is_page: bool) -> Vec
         let rgb = img.to_rgb8();
         let quality = settings.image_quality.clamp(1, 100) as u8;
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-        match encoder.write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8) {
+        match encoder.write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        ) {
             Ok(_) => buf.into_inner(),
             Err(e) => {
                 tracing::warn!("JPEG 编码失败，使用原始数据: {}", e);
@@ -1617,7 +1643,9 @@ pub fn handle_upload_header_timeout() {
             Action::Nothing => {}
             Action::Resend => {
                 tracing::warn!("头部 ACK 超时，重发头部消息");
-                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str).await {
+                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str)
+                    .await
+                {
                     Ok(_) => {
                         arm_header_timeout().await;
                     }
@@ -1631,7 +1659,8 @@ pub fn handle_upload_header_timeout() {
                             state.upload_session = None;
                         }
                         reset_upload_progress();
-                        show_upload_status(StatusState::Error("发送失败，请重试。".to_string())).await;
+                        show_upload_status(StatusState::Error("发送失败，请重试。".to_string()))
+                            .await;
                     }
                 }
             }
@@ -1712,7 +1741,9 @@ pub fn handle_upload_ack_timeout() {
                 })
                 .to_string();
 
-                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str).await {
+                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str)
+                    .await
+                {
                     Ok(_) => {
                         arm_ack_timeout().await;
                     }
@@ -1726,7 +1757,8 @@ pub fn handle_upload_ack_timeout() {
                             state.upload_session = None;
                         }
                         reset_upload_progress();
-                        show_upload_status(StatusState::Error("发送中断，请重试。".to_string())).await;
+                        show_upload_status(StatusState::Error("发送中断，请重试。".to_string()))
+                            .await;
                     }
                 }
             }
@@ -1788,7 +1820,7 @@ async fn handle_sync() {
     show_status(StatusState::Processing("正在检查快应用...".to_string())).await;
 
     let progress = sync_progress();
-    let device_addr = match handshake::prepare_launch(206, &progress).await {
+    let device_addr = match handshake::prepare_launch(259, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_status(StatusState::Error(msg)).await;
@@ -1797,25 +1829,22 @@ async fn handle_sync() {
     };
 
     // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续同步流程
-    handshake::begin_wait(device_addr.clone(), sync_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        sync_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_status(StatusState::Error(msg)));
             }
             Ok(_) => {
                 wit_bindgen::block_on(sync_continue(cookie, domain, source_name, device_addr));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
-async fn sync_continue(
-    cookie: String,
-    domain: String,
-    source_name: String,
-    device_addr: String,
-) {
+async fn sync_continue(cookie: String, domain: String, source_name: String, device_addr: String) {
     show_status(StatusState::Processing("正在发送到手表...".to_string())).await;
 
     if !cookie.is_empty() {
@@ -1933,14 +1962,19 @@ async fn handle_delete_comic(index: usize) {
         dialog::DialogType::Alert,
         dialog::DialogStyle::Website,
         &dialog_info,
-    ).await;
+    )
+    .await;
 
     if dialog_result.clicked_btn_id != "confirm" {
         tracing::info!("用户取消删除: {}", comic_name);
         return;
     }
 
-    show_app_data_status(StatusState::Processing(format!("正在删除: {}...", comic_name))).await;
+    show_app_data_status(StatusState::Processing(format!(
+        "正在删除: {}...",
+        comic_name
+    )))
+    .await;
 
     let progress = app_data_progress();
     let device_addr = match handshake::prepare_launch(0, &progress).await {
@@ -1952,16 +1986,18 @@ async fn handle_delete_comic(index: usize) {
     };
 
     // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
-    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        app_data_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
             }
             Ok(_) => {
                 wit_bindgen::block_on(delete_comic_continue(comic_name, index, device_addr));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -2054,14 +2090,19 @@ async fn handle_delete_source(index: usize) {
         dialog::DialogType::Alert,
         dialog::DialogStyle::Website,
         &dialog_info,
-    ).await;
+    )
+    .await;
 
     if dialog_result.clicked_btn_id != "confirm" {
         tracing::info!("用户取消删除漫画源: {}", source_name);
         return;
     }
 
-    show_app_data_status(StatusState::Processing(format!("正在删除漫画源: {}...", source_name))).await;
+    show_app_data_status(StatusState::Processing(format!(
+        "正在删除漫画源: {}...",
+        source_name
+    )))
+    .await;
 
     let progress = app_data_progress();
     let device_addr = match handshake::prepare_launch(0, &progress).await {
@@ -2073,16 +2114,18 @@ async fn handle_delete_source(index: usize) {
     };
 
     // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
-    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        app_data_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
             }
             Ok(_) => {
                 wit_bindgen::block_on(delete_source_continue(source_name, index, device_addr));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -2115,7 +2158,11 @@ async fn delete_source_continue(source_name: String, index: usize, device_addr: 
                 }
             }
 
-            show_app_data_status(StatusState::Success(format!("已删除漫画源: {}", source_name))).await;
+            show_app_data_status(StatusState::Success(format!(
+                "已删除漫画源: {}",
+                source_name
+            )))
+            .await;
 
             let root_id: Option<String>;
             {
@@ -2236,16 +2283,18 @@ async fn handle_fetch_app_data() {
 
     // 握手等待由定时器事件驱动，完成（pong 到达）后才发 request_data，
     // 保证快应用确实已启动并能收到消息
-    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
-        match result {
+    handshake::begin_wait(
+        device_addr.clone(),
+        app_data_progress(),
+        move |result| match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
             }
             Ok(_) => {
                 wit_bindgen::block_on(fetch_app_data_send_request(device_addr));
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -2271,7 +2320,8 @@ async fn fetch_app_data_send_request(device_addr: String) {
         }
         Err(e) => {
             tracing::error!("发送数据请求失败: {:?}", e);
-            show_app_data_status(StatusState::Error("发送请求失败，请检查连接。".to_string())).await;
+            show_app_data_status(StatusState::Error("发送请求失败，请检查连接。".to_string()))
+                .await;
         }
     }
 }
@@ -2286,7 +2336,8 @@ fn send_app_data_ack(device_addr: &str, index: usize) {
 
     if let Ok(ack_str) = serde_json::to_string(&ack_msg) {
         wit_bindgen::block_on(async {
-            let _ = interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &ack_str).await;
+            let _ =
+                interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &ack_str).await;
         });
     }
 }
@@ -2341,10 +2392,20 @@ pub fn handle_interconnect_message(payload: &str) {
 
     match msg_type {
         Some("app_data_header") => {
-            let comic_count = parsed.get("comic_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let source_count = parsed.get("source_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let comic_count = parsed
+                .get("comic_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let source_count = parsed
+                .get("source_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
 
-            tracing::info!("收到数据头: comic_count={}, source_count={}", comic_count, source_count);
+            tracing::info!(
+                "收到数据头: comic_count={}, source_count={}",
+                comic_count,
+                source_count
+            );
 
             let mut state = ui_state()
                 .write()
@@ -2357,7 +2418,9 @@ pub fn handle_interconnect_message(payload: &str) {
                 state.app_comics.resize(comic_count, ComicInfo::default());
             }
             if state.app_sources.len() < source_count {
-                state.app_sources.resize(source_count, SourceInfo::default());
+                state
+                    .app_sources
+                    .resize(source_count, SourceInfo::default());
             }
             state.app_data_status = StatusState::Processing("接收中...".to_string());
 
@@ -2373,8 +2436,15 @@ pub fn handle_interconnect_message(payload: &str) {
 
             if let Some(comic) = comic {
                 let mut info = ComicInfo {
-                    name: comic.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    page_count: comic.get("page_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    name: comic
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    page_count: comic
+                        .get("page_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
                     chapters: comic.get("chapters").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
                     cover_base64: String::new(),
                 };
@@ -2418,8 +2488,16 @@ pub fn handle_interconnect_message(payload: &str) {
 
             if let Some(source) = source {
                 let info = SourceInfo {
-                    name: source.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    api_url: source.get("apiUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    name: source
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    api_url: source
+                        .get("apiUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 };
                 let root_id = {
                     let mut state = ui_state()
@@ -2520,7 +2598,10 @@ pub fn handle_interconnect_message(payload: &str) {
 
             tracing::info!(
                 "收到封面切片: name={}, {}/{}, len={}",
-                name, index + 1, total, data.len()
+                name,
+                index + 1,
+                total,
+                data.len()
             );
 
             let (done, root_id) = {
@@ -2528,7 +2609,8 @@ pub fn handle_interconnect_message(payload: &str) {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-                let buf = state.cover_chunk_buffers
+                let buf = state
+                    .cover_chunk_buffers
                     .entry(name.to_string())
                     .or_insert_with(|| (total, vec![String::new(); total]));
 
@@ -2569,7 +2651,9 @@ pub fn handle_interconnect_message(payload: &str) {
                     });
                     if let Ok(ack_str) = serde_json::to_string(&ack) {
                         wit_bindgen::block_on(async {
-                            let _ = interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str).await;
+                            let _ =
+                                interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str)
+                                    .await;
                         });
                     }
                 }
@@ -2664,7 +2748,12 @@ pub fn handle_interconnect_message(payload: &str) {
             };
 
             if advance {
-                tracing::info!("收到 chunk ACK: name={}, file={}, index={}", name, file, index);
+                tracing::info!(
+                    "收到 chunk ACK: name={}, file={}, index={}",
+                    name,
+                    file,
+                    index
+                );
                 wit_bindgen::block_on(async {
                     disarm_ack_timeout().await;
                     send_next_chunk().await;
