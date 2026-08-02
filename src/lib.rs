@@ -50,16 +50,36 @@ impl event_v3::Guest for MyPlugin {
                 ui::handle_interconnect_message(&event_payload);
             }
             event_v3::EventType::Timer => {
-                if event_payload == ui::state::HIDE_STATUS_EVENT {
+                // 宿主把定时器 payload 包在 JSON 信封里送达：
+                // {"kind":"timeout","payload":"...","timerId":N}
+                // 解开信封拿到注册时的 payload 字符串再分发
+                let timer_payload = serde_json::from_str::<serde_json::Value>(&event_payload)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("payload")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| event_payload.to_string());
+
+                if timer_payload == ui::state::HIDE_STATUS_EVENT {
                     ui::hide_status();
-                } else if event_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
+                } else if timer_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
                     ui::hide_app_data_status();
-                } else if event_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
+                } else if timer_payload == ui::state::HIDE_UPLOAD_STATUS_EVENT {
                     ui::event_handler::hide_upload_status();
-                } else if event_payload == ui::state::UPLOAD_ACK_TIMEOUT_EVENT {
+                } else if timer_payload == ui::state::UPLOAD_ACK_TIMEOUT_EVENT {
                     ui::event_handler::handle_upload_ack_timeout();
-                } else if event_payload == ui::state::UPLOAD_HEADER_TIMEOUT_EVENT {
+                } else if timer_payload == ui::state::UPLOAD_HEADER_TIMEOUT_EVENT {
                     ui::event_handler::handle_upload_header_timeout();
+                } else if timer_payload == ui::state::APP_DATA_RECV_TIMEOUT_EVENT {
+                    ui::event_handler::handle_app_data_recv_timeout();
+                } else if timer_payload == ui::state::HS_REGISTER_RETRY_EVENT
+                    || timer_payload == ui::state::HS_PING_EVENT
+                {
+                    ui::handshake::on_timer(&timer_payload);
+                } else {
+                    tracing::warn!("未知 Timer 事件 payload: {}", timer_payload);
                 }
             }
             _ => {}

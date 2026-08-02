@@ -712,18 +712,39 @@ async fn handle_chapter_upload(chapter_index: usize) {
     }
 
     show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
-    let devices = device::get_connected_device_list().await;
-    if devices.is_empty() {
-        show_upload_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
-        return;
-    }
-    let device_addr = devices[0].addr.clone();
 
-    if let Err(msg) = connect_and_handshake(0).await {
-        show_upload_status(StatusState::Error(msg)).await;
-        return;
-    }
+    let progress = upload_progress();
+    let device_addr = match handshake::prepare_launch(0, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_upload_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
 
+    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续上传流程
+    handshake::begin_wait(device_addr.clone(), upload_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(chapter_upload_continue(
+                    comic_name,
+                    chapter_data,
+                    device_addr,
+                ));
+            }
+        }
+    })
+    .await;
+}
+
+async fn chapter_upload_continue(
+    comic_name: String,
+    chapter_data: (String, Vec<UploadFile>),
+    device_addr: String,
+) {
     reset_upload_progress();
     let watch_settings = current_watch_settings();
 
@@ -825,7 +846,7 @@ async fn handle_upload_start() {
     reset_upload_progress();
 
     let upload_mode;
-    let (is_single, items, chapters, multi_cover);
+    let (is_single, items, chapters);
 
     {
         let state = ui_state()
@@ -835,7 +856,6 @@ async fn handle_upload_start() {
         is_single = upload_mode == UploadMode::Single;
         items = state.upload_items.clone();
         chapters = state.upload_chapters.clone();
-        multi_cover = state.multi_cover.clone();
     } // release read lock
 
     if is_single && items.is_empty() {
@@ -856,27 +876,42 @@ async fn handle_upload_start() {
 
     show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
 
-    let devices = device::get_connected_device_list().await;
+    let progress = upload_progress();
+    let device_addr = match handshake::prepare_launch(0, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_upload_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
 
-    if devices.is_empty() {
-        show_upload_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
-        return;
-    }
+    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续上传流程
+    handshake::begin_wait(device_addr.clone(), upload_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(upload_start_continue(device_addr));
+            }
+        }
+    })
+    .await;
+}
 
-    let device_addr = &devices[0].addr;
-
-    if let Err(msg) = connect_and_handshake(0).await {
-        show_upload_status(StatusState::Error(msg)).await;
-        return;
-    }
-
+async fn upload_start_continue(device_addr: String) {
     let watch_settings = current_watch_settings();
 
-    let upload_mode = {
+    let (upload_mode, items, chapters, multi_cover) = {
         let state = ui_state()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.upload_mode.clone()
+        (
+            state.upload_mode.clone(),
+            state.upload_items.clone(),
+            state.upload_chapters.clone(),
+            state.multi_cover.clone(),
+        )
     };
 
     let comic_name = {
@@ -1055,7 +1090,7 @@ async fn handle_upload_start() {
     // 先发头部并等快应用确认（import_header_ack）后再发分片，
     // 防止安卓端乱序导致分片先于头部到达被丢弃
     show_upload_status(StatusState::Processing("正在发送数据...".to_string())).await;
-    send_import_header(device_addr, &header_str).await;
+    send_import_header(&device_addr, &header_str).await;
 }
 
 async fn send_next_chunk() {
@@ -1350,8 +1385,65 @@ const MAX_ACK_RETRIES: u32 = 5;
 /// - 自动清理过期会话
 /// - 分段异步等待，避免完全阻塞
 /// - 解决安卓端乱序和握手错位问题
-async fn connect_and_handshake(min_version: u32) -> Result<Option<WatchSettings>, String> {
-    handshake::connect_and_handshake(min_version).await
+/// 同步渲染上传页状态栏（无定时器管理），
+/// 在定时器事件等同步上下文中也能安全调用（spawn 在同步上下文不可靠）
+fn render_upload_progress(msg: String) {
+    let root_id = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_status = StatusState::Processing(msg);
+        state.root_element_id.clone()
+    };
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+/// 同步渲染数据页状态栏（无定时器管理）
+fn render_app_data_progress(msg: String) {
+    let root_id = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_data_status = StatusState::Processing(msg);
+        state.root_element_id.clone()
+    };
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+/// 同步渲染同步页状态栏（无定时器管理）
+fn render_sync_progress(msg: String) {
+    let root_id = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.current_status = StatusState::Processing(msg);
+        state.root_element_id.clone()
+    };
+    if let Some(root_id) = root_id {
+        let ui = build_main_ui();
+        psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+/// 生成一个把握手阶段进度转发到上传状态栏的回调
+fn upload_progress() -> impl Fn(String) {
+    |msg| render_upload_progress(msg)
+}
+
+/// 生成一个把握手阶段进度转发到数据页状态栏的回调
+fn app_data_progress() -> impl Fn(String) {
+    |msg| render_app_data_progress(msg)
+}
+
+/// 生成一个把握手阶段进度转发到同步页状态栏的回调
+fn sync_progress() -> impl Fn(String) {
+    |msg| render_sync_progress(msg)
 }
 
 /// 当前生效的快应用设置（未握手时使用与快应用一致的缺省值）
@@ -1695,20 +1787,35 @@ async fn handle_sync() {
 
     show_status(StatusState::Processing("正在检查快应用...".to_string())).await;
 
-    let devices = device::get_connected_device_list().await;
+    let progress = sync_progress();
+    let device_addr = match handshake::prepare_launch(206, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
 
-    if devices.is_empty() {
-        show_status(StatusState::Error("没有已连接的设备，请检查手表连接。".to_string())).await;
-        return;
-    }
+    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续同步流程
+    handshake::begin_wait(device_addr.clone(), sync_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(sync_continue(cookie, domain, source_name, device_addr));
+            }
+        }
+    })
+    .await;
+}
 
-    let device_addr = &devices[0].addr;
-
-    if let Err(msg) = connect_and_handshake(206).await {
-        show_status(StatusState::Error(msg)).await;
-        return;
-    }
-
+async fn sync_continue(
+    cookie: String,
+    domain: String,
+    source_name: String,
+    device_addr: String,
+) {
     show_status(StatusState::Processing("正在发送到手表...".to_string())).await;
 
     if !cookie.is_empty() {
@@ -1726,7 +1833,7 @@ async fn handle_sync() {
             }
         };
 
-        match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &cookie_str).await {
+        match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &cookie_str).await {
             Ok(_) => {
                 tracing::info!("Cookie 发送成功");
             }
@@ -1778,7 +1885,7 @@ async fn handle_sync() {
         }
     };
 
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &source_msg_str).await {
+    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &source_msg_str).await {
         Ok(_) => {
             show_status(StatusState::Success("同步成功！".to_string())).await;
         }
@@ -1835,20 +1942,30 @@ async fn handle_delete_comic(index: usize) {
 
     show_app_data_status(StatusState::Processing(format!("正在删除: {}...", comic_name))).await;
 
-    let devices = device::get_connected_device_list().await;
+    let progress = app_data_progress();
+    let device_addr = match handshake::prepare_launch(0, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_app_data_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
 
-    if devices.is_empty() {
-        show_app_data_status(StatusState::Error("没有已连接的设备。".to_string())).await;
-        return;
-    }
+    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
+    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(delete_comic_continue(comic_name, index, device_addr));
+            }
+        }
+    })
+    .await;
+}
 
-    let device_addr = &devices[0].addr;
-
-    if let Err(msg) = connect_and_handshake(0).await {
-        show_app_data_status(StatusState::Error(msg)).await;
-        return;
-    }
-
+async fn delete_comic_continue(comic_name: String, index: usize, device_addr: String) {
     let delete_msg = json!({
         "type": "delete_comic",
         "name": comic_name
@@ -1863,7 +1980,7 @@ async fn handle_delete_comic(index: usize) {
         }
     };
 
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
         Ok(_) => {
             tracing::info!("删除命令已发送: {}", comic_name);
 
@@ -1946,20 +2063,30 @@ async fn handle_delete_source(index: usize) {
 
     show_app_data_status(StatusState::Processing(format!("正在删除漫画源: {}...", source_name))).await;
 
-    let devices = device::get_connected_device_list().await;
+    let progress = app_data_progress();
+    let device_addr = match handshake::prepare_launch(0, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_app_data_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
 
-    if devices.is_empty() {
-        show_app_data_status(StatusState::Error("没有已连接的设备。".to_string())).await;
-        return;
-    }
+    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
+    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(delete_source_continue(source_name, index, device_addr));
+            }
+        }
+    })
+    .await;
+}
 
-    let device_addr = &devices[0].addr;
-
-    if let Err(msg) = connect_and_handshake(0).await {
-        show_app_data_status(StatusState::Error(msg)).await;
-        return;
-    }
-
+async fn delete_source_continue(source_name: String, index: usize, device_addr: String) {
     let delete_msg = json!({
         "type": "delete_source",
         "name": source_name
@@ -1974,7 +2101,7 @@ async fn handle_delete_source(index: usize) {
         }
     };
 
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
         Ok(_) => {
             tracing::info!("删除漫画源命令已发送: {}", source_name);
 
@@ -2011,24 +2138,69 @@ async fn handle_delete_source(index: usize) {
     }
 }
 
+/// 列表数据接收超时（request_data 发出到 app_data_done）
+const APP_DATA_RECV_TIMEOUT_MS: u64 = 20_000;
+/// 封面接收超时（app_data_done 到 cover_done）
+const COVER_RECV_TIMEOUT_MS: u64 = 30_000;
+
+/// 武装/重武装拉取数据整体接收超时定时器
+async fn arm_app_data_recv_timeout(timeout_ms: u64) {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_data_recv_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+    let tid = timer::set_timeout(timeout_ms, APP_DATA_RECV_TIMEOUT_EVENT).await;
+    let mut state = ui_state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.app_data_recv_timer_id = Some(tid);
+}
+
+async fn disarm_app_data_recv_timeout() {
+    let old = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.app_data_recv_timer_id.take()
+    };
+    if let Some(t) = old {
+        let _ = timer::clear_timer(t).await;
+    }
+}
+
+/// 拉取数据整体接收超时：列表阶段超时报错；封面阶段超时降级为成功（封面可能不完整）
+pub fn handle_app_data_recv_timeout() {
+    wit_bindgen::block_on(async {
+        let (has_data, status) = {
+            let state = ui_state()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.app_comics.iter().any(|c| !c.name.is_empty()),
+                state.app_data_status.clone(),
+            )
+        };
+        // 已结束（Success/Error）的会话不处理
+        if matches!(status, StatusState::Processing(_)) {
+            if has_data {
+                show_app_data_status(StatusState::Success(
+                    "数据获取完成（封面可能不完整）".to_string(),
+                ))
+                .await;
+            } else {
+                show_app_data_status(StatusState::Error("接收超时，请重试。".to_string())).await;
+            }
+        }
+    });
+}
+
 async fn handle_fetch_app_data() {
     show_app_data_status(StatusState::Processing("正在获取快应用数据...".to_string())).await;
-
-    let devices = device::get_connected_device_list().await;
-
-    if devices.is_empty() {
-        show_app_data_status(StatusState::Error("没有已连接的设备。".to_string())).await;
-        return;
-    }
-
-    let device_addr = &devices[0].addr;
-
-    show_app_data_status(StatusState::Processing("正在启动快应用...".to_string())).await;
-
-    if let Err(msg) = connect_and_handshake(0).await {
-        show_app_data_status(StatusState::Error(msg)).await;
-        return;
-    }
 
     // 新一轮数据会话：清空上一轮残留。
     // 清理动作必须在发起请求时完成——安卓端消息乱序，
@@ -2053,6 +2225,31 @@ async fn handle_fetch_app_data() {
         }
     }
 
+    let progress = app_data_progress();
+    let device_addr = match handshake::prepare_launch(0, &progress).await {
+        Ok(addr) => addr,
+        Err(msg) => {
+            show_app_data_status(StatusState::Error(msg)).await;
+            return;
+        }
+    };
+
+    // 握手等待由定时器事件驱动，完成（pong 到达）后才发 request_data，
+    // 保证快应用确实已启动并能收到消息
+    handshake::begin_wait(device_addr.clone(), app_data_progress(), move |result| {
+        match result {
+            Err(msg) => {
+                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+            }
+            Ok(_) => {
+                wit_bindgen::block_on(fetch_app_data_send_request(device_addr));
+            }
+        }
+    })
+    .await;
+}
+
+async fn fetch_app_data_send_request(device_addr: String) {
     let request_msg = json!({
         "type": "request_data"
     });
@@ -2066,9 +2263,10 @@ async fn handle_fetch_app_data() {
         }
     };
 
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &request_str).await {
+    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &request_str).await {
         Ok(_) => {
             tracing::info!("数据请求已发送，等待手表回复...");
+            arm_app_data_recv_timeout(APP_DATA_RECV_TIMEOUT_MS).await;
             show_app_data_status(StatusState::Processing("等待手表返回数据...".to_string())).await;
         }
         Err(e) => {
@@ -2096,17 +2294,23 @@ fn send_app_data_ack(device_addr: &str, index: usize) {
 pub fn handle_interconnect_message(payload: &str) {
     tracing::info!("收到互联消息: {}", payload);
 
-    // 先获取设备地址，用于发送 ACK
-    let device_addr = {
-        let devices = device::get_connected_device_list();
-        wit_bindgen::block_on(async {
-            let devices = devices.await;
-            if !devices.is_empty() {
-                Some(devices[0].addr.clone())
-            } else {
-                None
-            }
-        })
+    // 设备地址懒获取：只有需要回 ACK 的消息分支才查询，
+    // 避免封面分片等高频消息每条都做一次设备列表 FFI
+    let addr_cell = std::cell::OnceCell::new();
+    let get_addr = || -> Option<String> {
+        addr_cell
+            .get_or_init(|| {
+                let devices = device::get_connected_device_list();
+                wit_bindgen::block_on(async {
+                    let devices = devices.await;
+                    if !devices.is_empty() {
+                        Some(devices[0].addr.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .clone()
     };
 
     let outer = match serde_json::from_str::<Value>(payload) {
@@ -2159,7 +2363,7 @@ pub fn handle_interconnect_message(payload: &str) {
 
             // 发送 ACK 确认，让快应用继续发下一个
             // 快应用 msgIndex = 0，ACK 后 msgIndex++ 变成 1，所以 ACK 序号 = 0
-            if let Some(ref addr) = device_addr {
+            if let Some(ref addr) = get_addr() {
                 send_app_data_ack(addr, 0);
             }
         }
@@ -2187,12 +2391,13 @@ pub fn handle_interconnect_message(payload: &str) {
                         info.cover_base64 = cover;
                     }
                     state.app_comics[index] = info;
-                    // app_data_done 已渲染过的，迟到的数据需要补一次渲染
-                    if matches!(state.app_data_status, StatusState::Success(_)) {
-                        state.root_element_id.clone()
-                    } else {
-                        None
-                    }
+                    // 接收进度提示
+                    state.app_data_status = StatusState::Processing(format!(
+                        "接收漫画 {}/{}",
+                        index + 1,
+                        state.app_comic_count.unwrap_or(0)
+                    ));
+                    state.root_element_id.clone()
                 };
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
@@ -2203,7 +2408,7 @@ pub fn handle_interconnect_message(payload: &str) {
             // 发送 ACK 确认，让快应用继续发下一个
             // 当前消息在快应用的 msgIndex = (index + 1)，所以 ACK 序号 = (index + 1)
             // 因为 header 占用 msgIndex 0，所以 comic 从 1 开始
-            if let Some(ref addr) = device_addr {
+            if let Some(ref addr) = get_addr() {
                 send_app_data_ack(addr, 1 + index);
             }
         }
@@ -2224,11 +2429,13 @@ pub fn handle_interconnect_message(payload: &str) {
                         state.app_sources.resize(index + 1, SourceInfo::default());
                     }
                     state.app_sources[index] = info;
-                    if matches!(state.app_data_status, StatusState::Success(_)) {
-                        state.root_element_id.clone()
-                    } else {
-                        None
-                    }
+                    // 接收进度提示
+                    state.app_data_status = StatusState::Processing(format!(
+                        "接收漫画源 {}/{}",
+                        index + 1,
+                        state.app_source_count.unwrap_or(0)
+                    ));
+                    state.root_element_id.clone()
                 };
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
@@ -2245,21 +2452,39 @@ pub fn handle_interconnect_message(payload: &str) {
                 state.app_comic_count.unwrap_or(0)
             };
             let msg_index = 1 + total_comics + index;
-            if let Some(ref addr) = device_addr {
+            if let Some(ref addr) = get_addr() {
                 send_app_data_ack(addr, msg_index);
             }
         }
         Some("app_data_done") => {
-            tracing::info!("数据接收完成，渲染 UI");
+            tracing::info!("列表数据接收完成，渲染 UI");
 
-            let root_id: Option<String>;
-            {
+            let (comic_count, source_count, root_id) = {
                 let mut state = ui_state()
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.app_data_status = StatusState::Success("数据获取成功！".to_string());
-                root_id = state.root_element_id.clone();
+                let comic_count = state.app_comic_count.unwrap_or(0);
+                // 有漫画时还有封面要收：进入封面接收阶段；
+                // 没有漫画则整个拉取流程结束
+                state.app_data_status = if comic_count > 0 {
+                    StatusState::Processing("正在接收封面...".to_string())
+                } else {
+                    StatusState::Success("数据获取成功！".to_string())
+                };
+                (
+                    comic_count,
+                    state.app_source_count.unwrap_or(0),
+                    state.root_element_id.clone(),
+                )
+            };
+
+            // 封面阶段重新武装整体超时；无封面则整个流程结束，解除超时
+            if comic_count > 0 {
+                wit_bindgen::block_on(arm_app_data_recv_timeout(COVER_RECV_TIMEOUT_MS));
+            } else {
+                wit_bindgen::block_on(disarm_app_data_recv_timeout());
             }
+
             if let Some(root_id) = root_id {
                 let ui = build_main_ui();
                 psys_host::ui_v3::render(&root_id, ui);
@@ -2269,19 +2494,19 @@ pub fn handle_interconnect_message(payload: &str) {
 
             // done 消息也要 ACK，表示可以开始发封面
             // msgIndex = 1 + comic_count + source_count = done 的位置
-            let (comic_count, source_count) = {
-                let state = ui_state()
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (
-                    state.app_comic_count.unwrap_or(0),
-                    state.app_source_count.unwrap_or(0),
-                )
-            };
             let msg_index = 1 + comic_count + source_count;
-            if let Some(ref addr) = device_addr {
+            if let Some(ref addr) = get_addr() {
                 send_app_data_ack(addr, msg_index);
             }
+        }
+        Some("cover_done") => {
+            // 快应用已全部封面发送完毕（且每张都已被 ACK）：整个拉取流程结束
+            tracing::info!("封面接收完成");
+            wit_bindgen::block_on(async {
+                disarm_app_data_recv_timeout().await;
+                show_app_data_status(StatusState::Success("数据获取成功！".to_string())).await;
+            });
+            build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Some("cover_data_chunk") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2322,21 +2547,32 @@ pub fn handle_interconnect_message(payload: &str) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    let attached = if let Some(comic) = state.app_comics.iter_mut().find(|c| c.name == name) {
+                    if let Some(comic) = state.app_comics.iter_mut().find(|c| c.name == name) {
                         comic.cover_base64 = cover;
-                        true
                     } else {
                         state.pending_covers.insert(name.to_string(), (cover, now));
-                        false
-                    };
+                    }
                     state.cover_chunk_buffers.remove(name);
-                    (attached, state.root_element_id.clone())
+                    // 无论挂载还是暂存都算拼完，都需要回 cover_ack
+                    (true, state.root_element_id.clone())
                 } else {
                     (false, state.root_element_id.clone())
                 }
             };
 
             if done {
+                // 回 cover_ack 通知快应用发下一张封面（无论挂载还是暂存都要回）
+                if let Some(ref addr) = get_addr() {
+                    let ack = json!({
+                        "type": "cover_ack",
+                        "name": name,
+                    });
+                    if let Ok(ack_str) = serde_json::to_string(&ack) {
+                        wit_bindgen::block_on(async {
+                            let _ = interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str).await;
+                        });
+                    }
+                }
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
                     psys_host::ui_v3::render(&root_id, ui);
@@ -2381,20 +2617,16 @@ pub fn handle_interconnect_message(payload: &str) {
                 .unwrap_or_default();
             tracing::info!("收到握手应答: session={}, settings={:?}", session, settings);
 
-            // 新握手协议：从当前连接的设备地址更新会话
-            let devices = device::get_connected_device_list();
-            wit_bindgen::block_on(async {
-                let devices = devices.await;
-                if !devices.is_empty() {
-                    let device_addr = &devices[0].addr;
-                    handshake::handle_hs_pong(device_addr, &session, &parsed);
-                    // 同时更新 UI 状态保持兼容
+            if let Some(ref addr) = get_addr() {
+                {
                     let mut state = ui_state()
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.watch_settings = Some(settings);
                 }
-            });
+                // 完成挂起的握手会话（内部会调用业务续体，必须在 block_on 之外）
+                handshake::handle_hs_pong(addr, &session, &parsed);
+            }
         }
         Some("import_chunk_ack") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");

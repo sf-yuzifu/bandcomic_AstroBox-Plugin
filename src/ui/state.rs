@@ -185,6 +185,8 @@ pub struct UiState {
     pub app_sources: Vec<SourceInfo>,
     pub app_data_status: StatusState,
     pub app_data_timer_id: Option<u64>,
+    /// 拉取数据整体接收超时定时器 id（request_data 发出后武装）
+    pub app_data_recv_timer_id: Option<u64>,
     pub cover_chunk_buffers: HashMap<String, (usize, Vec<String>)>,
     pub upload_items: Vec<UploadItem>,
     pub upload_chapters: Vec<ChapterItem>,
@@ -228,6 +230,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             app_sources: Vec::new(),
             app_data_status: StatusState::Default,
             app_data_timer_id: None,
+            app_data_recv_timer_id: None,
             cover_chunk_buffers: HashMap::new(),
             upload_items: Vec::new(),
             upload_chapters: Vec::new(),
@@ -258,6 +261,12 @@ pub const TAB_SYNC_EVENT: &str = "tab_sync";
 pub const TAB_DATA_EVENT: &str = "tab_data";
 pub const FETCH_APP_DATA_EVENT: &str = "fetch_app_data";
 pub const HIDE_APP_DATA_STATUS_EVENT: &str = "hide_app_data_status";
+/// 拉取数据整体接收超时定时器事件
+pub const APP_DATA_RECV_TIMEOUT_EVENT: &str = "app_data_recv_timeout";
+/// 握手：注册重试定时器事件
+pub const HS_REGISTER_RETRY_EVENT: &str = "hs_register_retry";
+/// 握手：ping 轮询定时器事件
+pub const HS_PING_EVENT: &str = "hs_ping_poll";
 
 pub const NODE_DOMAIN_LABEL: &str = "domain_label";
 pub const NODE_DOMAIN_INPUT: &str = "domain_input";
