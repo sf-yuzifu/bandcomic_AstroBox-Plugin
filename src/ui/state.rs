@@ -2,6 +2,8 @@ use std::sync::{OnceLock, RwLock};
 use std::collections::HashMap;
 use serde_json::Value;
 
+use crate::transfer::{RecvFrontier, WindowedSender};
+
 pub const WATCH_APP_PKG_NAME: &str = "moe.yzf.comic";
 pub const CONFIG_KEY_COOKIE: &str = "savedCookie";
 pub const CONFIG_KEY_DOMAIN: &str = "sourceDomain";
@@ -136,6 +138,34 @@ pub enum UploadMode {
     Multi,
 }
 
+/// 图片选择目标（对话框返回后暂存，处理推迟到定时器事件）
+#[derive(Debug, Clone, Copy)]
+pub enum PickTarget {
+    /// 上传列表（单本模式入 upload_items，多章模式入最后一个章节）
+    UploadItem,
+    /// 指定章节的图片
+    Chapter(usize),
+    /// 单本模式封面
+    CoverSingle,
+    /// 多章模式书级封面
+    CoverMulti,
+}
+
+/// 已选待处理的图片（原图字节，处理时才解码缩放）
+pub struct PendingPick {
+    pub name: String,
+    pub data: Vec<u8>,
+    pub target: PickTarget,
+}
+
+/// 窗口模式上传会话（滑窗 + 累计 ACK，移植自 InterconnectFetch transfer.rs）
+#[derive(Debug, Clone)]
+pub struct WindowedUpload {
+    pub sender: WindowedSender,
+    /// gseq → (file_idx, chunk_idx) 扁平映射，跨文件统一编号
+    pub order: Vec<(usize, usize)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadSession {
     pub device_addr: String,
@@ -154,6 +184,9 @@ pub struct UploadSession {
     pub header_acked: bool,
     /// 头部重发次数，超过上限退回旧版兼容模式（直接发分片）
     pub header_retry: u32,
+    /// 窗口模式；Some 时走滑动窗口 + 累计 ACK（awaiting 字段闲置），
+    /// None 表示旧版逐片停等
+    pub windowed: Option<WindowedUpload>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +242,12 @@ pub struct UiState {
     /// 已拼完但漫画信息尚未到达（消息乱序）的封面，按漫画名暂存
     /// 值: (封面数据, 插入时间戳秒)，超过 30 秒未补挂的会被清理
     pub pending_covers: HashMap<String, (String, u64)>,
+    /// 手表通过 hs_pong caps 声明的导入接收窗口；None 表示旧版快应用（逐片停等）
+    pub watch_import_window: Option<usize>,
+    /// 方向 B 滑窗接收前沿：手表→插件的同步帧按 gseq 乱序缓存、按序消费
+    pub sync_recv: Option<RecvFrontier>,
+    /// 已选待处理的图片（对话框与 CPU 密集处理解耦，见 handle_pick_process）
+    pub pending_pick: Option<PendingPick>,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -247,6 +286,9 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             upload_ack_timer_id: None,
             upload_header_timer_id: None,
             pending_covers: HashMap::new(),
+            watch_import_window: None,
+            sync_recv: None,
+            pending_pick: None,
         })
     })
 }
@@ -296,6 +338,8 @@ pub const HIDE_UPLOAD_STATUS_EVENT: &str = "hide_upload_status";
 pub const UPLOAD_ACK_TIMEOUT_EVENT: &str = "upload_ack_timeout";
 /// 上传头部 ACK 超时重发定时器事件
 pub const UPLOAD_HEADER_TIMEOUT_EVENT: &str = "upload_header_timeout";
+/// 图片选取结果处理定时器事件（对话框关闭后延迟一拍再做解码缩放）
+pub const PICK_PROCESS_EVENT: &str = "pick_process";
 
 // 多章节模式
 pub const UPLOAD_ADD_CHAPTER_EVENT: &str = "upload_add_chapter";

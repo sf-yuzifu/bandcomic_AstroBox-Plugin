@@ -9,6 +9,7 @@ pub mod logger;
 pub mod ui;
 pub mod network;
 pub mod lvgl;
+pub mod transfer;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -78,6 +79,8 @@ impl event_v3::Guest for MyPlugin {
                     || timer_payload == ui::state::HS_PING_EVENT
                 {
                     ui::handshake::on_timer(&timer_payload);
+                } else if timer_payload == ui::state::PICK_PROCESS_EVENT {
+                    ui::event_handler::handle_pick_process();
                 } else {
                     tracing::warn!("未知 Timer 事件 payload: {}", timer_payload);
                 }

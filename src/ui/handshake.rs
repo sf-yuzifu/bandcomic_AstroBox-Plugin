@@ -143,6 +143,8 @@ const REGISTER_RETRY_TIMEOUT_MS: u64 = 5000;
 const HANDSHAKE_POLL_INTERVAL_MS: u64 = 500;
 /// 握手 ping 轮询整体超时（毫秒）
 const HANDSHAKE_POLL_TIMEOUT_MS: u64 = 10_000;
+/// 方向 B（手表→插件同步）滑窗接收窗口大小，随 hs_ping caps 声明给快应用
+const SYNC_WINDOW: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HandshakePhase {
@@ -237,9 +239,12 @@ pub async fn begin_wait(
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
+    // caps 声明本端能力：syncWindow = 方向 B（手表→插件同步）滑窗接收窗口。
+    // 旧快应用忽略未知字段天然兼容；快应用无 caps 回包时自动回落停等协议。
     let ping_str = json!({
         "type": "hs_ping",
         "session": session,
+        "caps": { "syncWindow": SYNC_WINDOW },
     })
     .to_string();
 
