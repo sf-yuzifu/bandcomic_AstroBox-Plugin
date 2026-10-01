@@ -10,6 +10,7 @@ pub mod ui;
 pub mod network;
 pub mod lvgl;
 pub mod transfer;
+pub mod sync_receive;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -73,8 +74,11 @@ impl event_v3::Guest for MyPlugin {
                     ui::event_handler::handle_upload_ack_timeout();
                 } else if timer_payload == ui::state::UPLOAD_HEADER_TIMEOUT_EVENT {
                     ui::event_handler::handle_upload_header_timeout();
-                } else if timer_payload == ui::state::APP_DATA_RECV_TIMEOUT_EVENT {
-                    ui::event_handler::handle_app_data_recv_timeout();
+                } else if let Some(generation) = timer_payload
+                    .strip_prefix(ui::state::APP_DATA_RECV_TIMEOUT_EVENT)
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    ui::event_handler::handle_app_data_recv_timeout(generation);
                 } else if timer_payload == ui::state::HS_REGISTER_RETRY_EVENT
                     || timer_payload == ui::state::HS_PING_EVENT
                 {

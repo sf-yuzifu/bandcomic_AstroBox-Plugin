@@ -113,6 +113,7 @@ pub fn record_activity(device_addr: &str) {
 /// 参考 FetchBridge 协议：任何一端收到 count < 2 都回显 count+1
 /// 这里 bandcomic 快应用使用 hs_ping/hs_pong 自定义流程
 pub fn handle_hs_pong(device_addr: &str, session_id: &str, parsed: &Value) {
+    if !accepts_pong(session_id) { return; }
     let settings = parsed
         .get("settings")
         .map(WatchSettings::from_json)
@@ -159,6 +160,7 @@ enum HandshakePhase {
 /// 所以所有等待都必须由定时器事件驱动：注册重试和 ping 轮询各自挂在
 /// HS_REGISTER_RETRY_EVENT / HS_PING_EVENT 上逐步推进，pong 由消息事件完成。
 struct PendingHandshake {
+    session: String,
     device_addr: String,
     ping_str: String,
     phase: HandshakePhase,
@@ -173,6 +175,33 @@ static PENDING: OnceLock<Mutex<Option<PendingHandshake>>> = OnceLock::new();
 
 fn pending() -> &'static Mutex<Option<PendingHandshake>> {
     PENDING.get_or_init(|| Mutex::new(None))
+}
+
+/// 明确带session的迟到pong不能完成新握手；旧快应用未回session仍可兼容。
+pub fn accepts_pong(session_id: &str) -> bool {
+    pending().lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        .is_some_and(|ph| ph.phase == HandshakePhase::Pinging && (session_id.is_empty() || ph.session == session_id))
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn stale_pong_cannot_complete_a_new_pending_handshake() {
+        *pending().lock().unwrap() = Some(PendingHandshake {
+            session: "new".into(), device_addr: "test".into(), ping_str: "{}".into(),
+            phase: HandshakePhase::Registering, register_waited_ms: 0, ping_waited_ms: 0,
+            attempt: 0, progress: Box::new(|_| {}), on_done: None,
+        });
+        assert!(!accepts_pong("new"));
+        pending().lock().unwrap().as_mut().unwrap().phase = HandshakePhase::Pinging;
+        assert!(!accepts_pong("old"));
+        assert!(accepts_pong("new"));
+        assert!(accepts_pong("")); // 无会话字段的旧快应用
+        *pending().lock().unwrap() = None;
+        assert!(!accepts_pong("new"));
+    }
 }
 
 /// 完成挂起的握手会话并调用业务回调。
@@ -244,7 +273,7 @@ pub async fn begin_wait(
     let ping_str = json!({
         "type": "hs_ping",
         "session": session,
-        "caps": { "syncWindow": SYNC_WINDOW },
+        "caps": { "syncWindow": SYNC_WINDOW, "syncSession": true },
     })
     .to_string();
 
@@ -255,6 +284,7 @@ pub async fn begin_wait(
             tracing::warn!("取消上一个未完成的握手会话");
         }
         *guard = Some(PendingHandshake {
+            session,
             device_addr: device_addr.clone(),
             ping_str,
             phase: HandshakePhase::Registering,

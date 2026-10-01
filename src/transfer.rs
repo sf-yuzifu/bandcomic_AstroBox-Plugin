@@ -95,11 +95,19 @@ impl RecvFrontier {
         Self::default()
     }
 
+    pub fn ack(&self) -> usize {
+        self.next
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.buf.clear();
+    }
+
     /// 落入一帧：重复帧（已缓存或已消费）只回当前前沿；新帧缓存后
     /// 从前沿起按序取出全部连续帧。
     /// 返回 (按序就绪待派发的消息, 当前前沿, 是否重复帧)
     pub fn insert(&mut self, gseq: usize, msg: Value) -> (Vec<Value>, usize, bool) {
-        if gseq < self.next {
+        if gseq < self.next || gseq >= self.next.saturating_add(16) {
             return (Vec::new(), self.next, true);
         }
         if self.buf.contains_key(&gseq) {
@@ -112,5 +120,47 @@ impl RecvFrontier {
             self.next += 1;
         }
         (ready, self.next, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reordered_frames_advance_once_and_duplicates_do_not_replay_business_data() {
+        let mut recv = RecvFrontier::new();
+        assert_eq!(recv.insert(1, json!({"seq": 1})), (vec![], 0, false));
+        assert_eq!(recv.insert(1, json!({"seq": 1})), (vec![], 0, true));
+        assert_eq!(recv.insert(0, json!({"seq": 0})),
+            (vec![json!({"seq": 0}), json!({"seq": 1})], 2, false));
+        assert_eq!(recv.insert(0, json!({"seq": 0})), (vec![], 2, true));
+    }
+
+    #[test]
+    fn out_of_window_frames_do_not_accumulate() {
+        let mut recv = RecvFrontier::new();
+        for seq in 16..1000 { recv.insert(seq, json!({"data": "ignored"})); }
+        assert!(recv.buf.is_empty());
+        for seq in 1..16 { recv.insert(seq, json!({"seq": seq})); }
+        assert_eq!(recv.buf.len(), 15);
+        let (ready, ack, _) = recv.insert(0, json!({"seq": 0}));
+        assert_eq!(ready.len(), 16);
+        assert_eq!(ack, 16);
+        assert!(recv.buf.is_empty());
+    }
+
+    #[test]
+    fn clearing_incomplete_tail_preserves_the_final_ack_frontier() {
+        let mut recv = RecvFrontier::new();
+        recv.insert(0, json!({"type": "header"}));
+        recv.insert(2, json!({"type": "partial"}));
+        recv.clear_pending();
+        assert_eq!(recv.ack(), 1);
+        assert_eq!(recv.insert(0, json!({"type": "header"})), (vec![], 1, true));
+        let (ready, ack, _) = recv.insert(1, json!({"type": "missing"}));
+        assert_eq!(ready.len(), 1); // 清理前的seq2不能被重新派发
+        assert_eq!(ack, 2);
     }
 }

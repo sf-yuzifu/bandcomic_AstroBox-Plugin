@@ -4,6 +4,8 @@ use super::state::*;
 use crate::astrobox::psys_host::{self, device, dialog, interconnect, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
 use crate::transfer::{RecvFrontier, WindowedSender};
+use crate::sync_receive::{CoverChunks, MAX_COVER_CHUNKS};
+use std::time::Instant;
 use image::ImageEncoder;
 use serde_json::{Value, json};
 
@@ -2317,68 +2319,93 @@ async fn delete_source_continue(source_name: String, index: usize, device_addr: 
     }
 }
 
-/// 列表数据接收超时（request_data 发出到 app_data_done）
-const APP_DATA_RECV_TIMEOUT_MS: u64 = 20_000;
-/// 封面接收超时（app_data_done 到 cover_done）
-const COVER_RECV_TIMEOUT_MS: u64 = 30_000;
-
-/// 武装/重武装拉取数据整体接收超时定时器
-async fn arm_app_data_recv_timeout(timeout_ms: u64) {
-    let old = {
+/// 到有效进展的截止时间才检查，不每个封面片都clear/set宿主定时器。
+async fn schedule_app_data_recv_timeout() {
+    let (old, generation, remaining) = {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.app_data_recv_timer_id.take()
+        let generation = state.sync_receive.generation();
+        (
+            state.app_data_recv_timer_id.take(),
+            generation,
+            state.sync_receive.remaining(generation, Instant::now()),
+        )
     };
     if let Some(t) = old {
         let _ = timer::clear_timer(t).await;
     }
-    let tid = timer::set_timeout(timeout_ms, APP_DATA_RECV_TIMEOUT_EVENT).await;
+    let Some(remaining) = remaining else { return; };
+    let event = format!("{}{}", APP_DATA_RECV_TIMEOUT_EVENT, generation);
+    let tid = timer::set_timeout(remaining.as_millis().max(1) as u64, &event).await;
     let mut state = ui_state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.app_data_recv_timer_id = Some(tid);
+    if state.sync_receive.generation() == generation && state.sync_receive.active() {
+        state.app_data_recv_timer_id = Some(tid);
+    } else {
+        drop(state);
+        let _ = timer::clear_timer(tid).await;
+    }
 }
 
-async fn disarm_app_data_recv_timeout() {
-    let old = {
+async fn disarm_app_data_recv_timeout() -> u64 {
+    let (old, generation) = {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.app_data_recv_timer_id.take()
+        state.sync_receive.finish();
+        state.sync_comics_seen.clear();
+        state.sync_sources_seen.clear();
+        (state.app_data_recv_timer_id.take(), state.sync_receive.generation())
     };
     if let Some(t) = old {
         let _ = timer::clear_timer(t).await;
     }
+    generation
 }
 
-/// 拉取数据整体接收超时：列表阶段超时报错；封面阶段超时降级为成功（封面可能不完整）
-pub fn handle_app_data_recv_timeout() {
+/// 只有无有效进展20s/30s才结束；旧会话/旧阶段的定时器不能中止新接收。
+pub fn handle_app_data_recv_timeout(generation: u64) {
     wit_bindgen::block_on(async {
-        let (has_data, status) = {
-            let state = ui_state()
-                .read()
+        let cover_phase = {
+            let mut state = ui_state()
+                .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                state.app_comics.iter().any(|c| !c.name.is_empty()),
-                state.app_data_status.clone(),
-            )
-        };
-        // 已结束（Success/Error）的会话不处理
-        if matches!(status, StatusState::Processing(_)) {
-            if has_data {
-                show_app_data_status(StatusState::Success(
-                    "数据获取完成（封面可能不完整）".to_string(),
-                ))
-                .await;
-            } else {
-                show_app_data_status(StatusState::Error("接收超时，请重试。".to_string())).await;
+            match state.sync_receive.remaining(generation, Instant::now()) {
+                None => return,
+                Some(remaining) if !remaining.is_zero() => {
+                    drop(state);
+                    schedule_app_data_recv_timeout().await;
+                    return;
+                }
+                _ => {}
             }
+            let covers = state.sync_receive.cover_phase();
+            state.cover_chunk_buffers.clear();
+            state.pending_covers.clear();
+            if let Some(frontier) = state.sync_recv.as_mut() {
+                frontier.clear_pending();
+            }
+            covers
+        };
+        let finished = disarm_app_data_recv_timeout().await;
+        if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished {
+            return;
+        }
+        if cover_phase {
+            show_app_data_status(StatusState::Success(
+                "数据获取完成（封面可能不完整）".to_string(),
+            )).await;
+        } else {
+            show_app_data_status(StatusState::Error("接收超时，请重试。".to_string())).await;
         }
     });
 }
 
 async fn handle_fetch_app_data() {
+    let operation = disarm_app_data_recv_timeout().await;
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
     show_app_data_status(StatusState::Processing("正在获取快应用数据...".to_string())).await;
 
     // 新一轮数据会话：清空上一轮残留。
@@ -2388,6 +2415,7 @@ async fn handle_fetch_app_data() {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.sync_receive.generation() != operation { return; }
         state.app_comics.clear();
         state.app_sources.clear();
         state.app_comic_count = None;
@@ -2406,36 +2434,56 @@ async fn handle_fetch_app_data() {
         }
     }
 
-    let progress = app_data_progress();
+    let progress = move |message: String| {
+        let current = ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() == operation;
+        if current { app_data_progress()(message); }
+    };
     let device_addr = match handshake::prepare_launch(0, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
+            if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
             show_app_data_status(StatusState::Error(msg)).await;
             return;
         }
     };
 
     // 握手等待由定时器事件驱动，完成（pong 到达）后才发 request_data，
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
     // 保证快应用确实已启动并能收到消息
     handshake::begin_wait(
         device_addr.clone(),
-        app_data_progress(),
-        move |result| match result {
+        move |message| {
+            let current = ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() == operation;
+            if current { app_data_progress()(message); }
+        },
+        move |result| {
+            if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
+            match result {
             Err(msg) => {
                 wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
             }
             Ok(_) => {
-                wit_bindgen::block_on(fetch_app_data_send_request(device_addr));
+                wit_bindgen::block_on(fetch_app_data_send_request(device_addr, operation));
+            }
             }
         },
     )
     .await;
 }
 
-async fn fetch_app_data_send_request(device_addr: String) {
-    let request_msg = json!({
+async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
+    let session = {
+        let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+        state.watch_sync_session.then(|| format!("sync{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)))
+    };
+    let mut request_msg = json!({
         "type": "request_data"
     });
+    if let Some(ref session) = session {
+        request_msg["session"] = json!(session);
+    }
 
     let request_str = match serde_json::to_string(&request_msg) {
         Ok(s) => s,
@@ -2446,13 +2494,27 @@ async fn fetch_app_data_send_request(device_addr: String) {
         }
     };
 
+    show_app_data_status(StatusState::Processing("等待手表返回数据...".to_string())).await;
+    let generation = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.sync_receive.generation() != operation { return; }
+        state.sync_receive.start(Instant::now(), session);
+        state.sync_receive.generation()
+    };
+    schedule_app_data_recv_timeout().await;
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != generation { return; }
     match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &request_str).await {
         Ok(_) => {
             tracing::info!("数据请求已发送，等待手表回复...");
-            arm_app_data_recv_timeout(APP_DATA_RECV_TIMEOUT_MS).await;
-            show_app_data_status(StatusState::Processing("等待手表返回数据...".to_string())).await;
         }
         Err(e) => {
+            {
+                let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+                if state.sync_receive.generation() != generation || state.app_comic_count.is_some()
+                    || !state.sync_comics_seen.is_empty() || !state.sync_sources_seen.is_empty() { return; }
+            }
+            let finished = disarm_app_data_recv_timeout().await;
+            if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished { return; }
             tracing::error!("发送数据请求失败: {:?}", e);
             show_app_data_status(StatusState::Error("发送请求失败，请检查连接。".to_string()))
                 .await;
@@ -2483,7 +2545,7 @@ fn send_app_data_ack(device_addr: &str, index: usize, windowed: bool) {
 }
 
 pub fn handle_interconnect_message(payload: &str) {
-    tracing::info!("收到互联消息: {}", payload);
+    tracing::debug!("收到互联消息，长度={}", payload.len());
 
     // 设备地址懒获取：只有需要回 ACK 的消息分支才查询，
     // 避免封面分片等高频消息每条都做一次设备列表 FFI
@@ -2531,19 +2593,32 @@ pub fn handle_interconnect_message(payload: &str) {
     // 方向 B 滑窗接收：带 gseq 的同步帧先经 RecvFrontier 乱序缓存、按序还原后再派发；
     // 每帧（含重复帧）都回累计 ACK（sync_ack）。旧快应用帧无 gseq，直接走旧路径。
     if let Some(gseq) = parsed.get("gseq").and_then(|v| v.as_u64()) {
-        let (ready, ack) = {
+        let Ok(gseq) = usize::try_from(gseq) else { return; };
+        let (ready, ack, session) = {
             let mut state = ui_state()
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.sync_receive.matches_session(parsed.get("session").and_then(Value::as_str)) {
+                return;
+            }
+            let session = state.sync_receive.session().map(str::to_string);
+            let active = state.sync_receive.active();
+            // 收尾后仍回旧序号ACK，恢复丢失的最终ACK；不接受新片复活已结束会话。
+            if !active && state.sync_recv.is_none() { return; }
             let frontier = state.sync_recv.get_or_insert_with(RecvFrontier::new);
-            let (ready, frontier, _dup) = frontier.insert(gseq as usize, parsed);
-            (ready, frontier)
+            let (ready, ack, _dup) = if active && valid_sync_message(&parsed) {
+                frontier.insert(gseq, parsed)
+            } else {
+                (Vec::new(), frontier.ack(), true)
+            };
+            (ready, ack, session)
         };
         if let Some(ref addr) = get_addr() {
-            let ack_msg = json!({
+            let mut ack_msg = json!({
                 "type": "sync_ack",
                 "ack": ack,
             });
+            if let Some(session) = session { ack_msg["session"] = json!(session); }
             if let Ok(ack_str) = serde_json::to_string(&ack_msg) {
                 wit_bindgen::block_on(async {
                     let _ = interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str).await;
@@ -2559,11 +2634,38 @@ pub fn handle_interconnect_message(payload: &str) {
     dispatch_sync_message(&parsed, false, &get_addr);
 }
 
+fn sync_message_type(msg_type: &str) -> bool {
+    matches!(msg_type, "app_data_header" | "app_data_comic" | "app_data_source" |
+        "app_data_done" | "cover_data_chunk" | "cover_done")
+}
+
+fn valid_sync_message(msg: &Value) -> bool {
+    match msg.get("type").and_then(Value::as_str) {
+        Some("cover_data_chunk") => {
+            let index = msg.get("index").and_then(Value::as_u64);
+            let total = msg.get("total").and_then(Value::as_u64);
+            matches!((index, total), (Some(index), Some(total)) if total > 0 && total <= MAX_COVER_CHUNKS as u64 && index < total)
+                && msg.get("name").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                && msg.get("data").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+        }
+        Some("app_data_comic") => msg.get("comic").is_some_and(Value::is_object),
+        Some("app_data_source") => msg.get("source").is_some_and(Value::is_object),
+        Some(kind) => sync_message_type(kind),
+        None => false,
+    }
+}
+
 /// 同步消息派发（type 命名空间）。新旧协议共用：
 /// 旧快应用消息由 handle_interconnect_message 直接调用（windowed=false）；
 /// 滑窗会话帧经 RecvFrontier 按序还原后逐帧调用（windowed=true，抑制逐条 ACK）
 fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> Option<String>) {
     let msg_type = parsed.get("type").and_then(|v| v.as_str());
+    if msg_type.is_some_and(sync_message_type) {
+        let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+        if !state.sync_receive.active() || !valid_sync_message(parsed)
+            || !state.sync_receive.matches_session(parsed.get("session").and_then(Value::as_str))
+            || (!windowed && state.sync_receive.session().is_some()) { return; }
+    }
 
     match msg_type {
         Some("app_data_header") => {
@@ -2585,8 +2687,10 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
             let mut state = ui_state()
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let fresh = state.app_comic_count.is_none() && state.app_source_count.is_none();
             state.app_comic_count = Some(comic_count);
             state.app_source_count = Some(source_count);
+            if fresh { state.sync_receive.progress(Instant::now()); }
             // 安卓端消息可能乱序：comic/source/封面分片可能先于 header 到达，
             // 这里只按需扩容（不重建、不清缓冲区），数据按 index/名字落位
             if state.app_comics.len() < comic_count {
@@ -2636,6 +2740,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                         info.cover_base64 = cover;
                     }
                     state.app_comics[index] = info;
+                    if state.sync_comics_seen.insert(index) { state.sync_receive.progress(Instant::now()); }
                     // 接收进度提示
                     state.app_data_status = StatusState::Processing(format!(
                         "接收漫画 {}/{}",
@@ -2682,6 +2787,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                         state.app_sources.resize(index + 1, SourceInfo::default());
                     }
                     state.app_sources[index] = info;
+                    if state.sync_sources_seen.insert(index) { state.sync_receive.progress(Instant::now()); }
                     // 接收进度提示
                     state.app_data_status = StatusState::Processing(format!(
                         "接收漫画源 {}/{}",
@@ -2712,15 +2818,17 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
         Some("app_data_done") => {
             tracing::info!("列表数据接收完成，渲染 UI");
 
-            let (comic_count, source_count, root_id) = {
+            let (comic_count, source_count, root_id, fresh_done) = {
                 let mut state = ui_state()
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let comic_count = state.app_comic_count.unwrap_or(0);
+                let fresh_done = !state.sync_receive.cover_phase();
                 // 有漫画时还有封面要收：进入封面接收阶段；
                 // 没有漫画则整个拉取流程结束
-                state.app_data_status = if comic_count > 0 {
-                    StatusState::Processing("正在接收封面...".to_string())
+                state.app_data_status = if comic_count > 0 || windowed {
+                    if fresh_done { state.sync_receive.covers(Instant::now()); }
+                    StatusState::Processing(if comic_count > 0 { "正在接收封面..." } else { "正在完成同步..." }.to_string())
                 } else {
                     StatusState::Success("数据获取成功！".to_string())
                 };
@@ -2728,12 +2836,13 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     comic_count,
                     state.app_source_count.unwrap_or(0),
                     state.root_element_id.clone(),
+                    fresh_done,
                 )
             };
 
             // 封面阶段重新武装整体超时；无封面则整个流程结束，解除超时
-            if comic_count > 0 {
-                wit_bindgen::block_on(arm_app_data_recv_timeout(COVER_RECV_TIMEOUT_MS));
+            if comic_count > 0 || windowed {
+                if fresh_done { wit_bindgen::block_on(schedule_app_data_recv_timeout()); }
             } else {
                 wit_bindgen::block_on(disarm_app_data_recv_timeout());
             }
@@ -2755,9 +2864,22 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
         Some("cover_done") => {
             // 快应用已全部封面发送完毕（且每张都已被 ACK）：整个拉取流程结束
             tracing::info!("封面接收完成");
+            let incomplete = {
+                let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+                let incomplete = !state.cover_chunk_buffers.is_empty();
+                state.cover_chunk_buffers.clear();
+                state.pending_covers.clear();
+                if let Some(frontier) = state.sync_recv.as_mut() { frontier.clear_pending(); }
+                incomplete
+            };
             wit_bindgen::block_on(async {
-                disarm_app_data_recv_timeout().await;
-                show_app_data_status(StatusState::Success("数据获取成功！".to_string())).await;
+                let finished = disarm_app_data_recv_timeout().await;
+                if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished {
+                    return;
+                }
+                show_app_data_status(StatusState::Success(if incomplete {
+                    "数据获取完成（封面可能不完整）"
+                } else { "数据获取成功！" }.to_string())).await;
             });
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
@@ -2784,19 +2906,14 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-                let buf = state
-                    .cover_chunk_buffers
-                    .entry(name.to_string())
-                    .or_insert_with(|| (total, vec![String::new(); total]));
-
-                if buf.1.len() != total {
-                    buf.1.resize(total, String::new());
+                if index == 0 && state.cover_chunk_buffers.get(name).is_some_and(|buf| buf.total != total) {
+                    state.cover_chunk_buffers.remove(name);
                 }
-                buf.1[index] = data.to_string();
-
-                let all_done = buf.1.iter().all(|s| !s.is_empty());
-                if all_done {
-                    let cover = buf.1.concat();
+                let buf = state.cover_chunk_buffers.entry(name.to_string())
+                    .or_insert_with(|| CoverChunks::new(total).unwrap());
+                let (cover, fresh) = buf.insert(index, total, data);
+                if fresh { state.sync_receive.progress(Instant::now()); }
+                if let Some(cover) = cover {
                     // 漫画信息可能因乱序尚未到达：找不到时暂存，
                     // 等 app_data_comic 到达时补挂，避免封面被丢弃
                     // 记录当前时间戳，超过 30 秒未补挂的会被清理
@@ -2887,6 +3004,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if !handshake::accepts_pong(&session) { return; }
             let settings = parsed
                 .get("settings")
                 .map(WatchSettings::from_json)
@@ -2894,6 +3012,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
             tracing::info!("收到握手应答: session={}, settings={:?}", session, settings);
 
             if let Some(ref addr) = get_addr() {
+                if !handshake::accepts_pong(&session) { return; }
                 {
                     let mut state = ui_state()
                         .write()
@@ -2905,6 +3024,8 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                         .and_then(|c| c.get("importWindow"))
                         .and_then(|v| v.as_u64())
                         .map(|n| (n as usize).clamp(1, 16));
+                    state.watch_sync_session = parsed.get("caps").and_then(|c| c.get("syncSession"))
+                        .and_then(Value::as_bool).unwrap_or(false);
                 }
                 // 完成挂起的握手会话（内部会调用业务续体，必须在 block_on 之外）
                 handshake::handle_hs_pong(addr, &session, &parsed);
@@ -2972,24 +3093,27 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
 }
 
 pub async fn show_app_data_status(status: StatusState) {
-    let root_id: Option<String>;
-    {
+    // 更新状态后释放锁，再等待宿主timer；接收帧可以继续推进，不持UI锁跨await。
+    let (root_id, old_timer) = {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if let Some(old_timer) = state.app_data_timer_id {
-            let _ = timer::clear_timer(old_timer).await;
-        }
-
         state.app_data_status = status.clone();
-
-        if matches!(status, StatusState::Success(_) | StatusState::Error(_)) {
-            let new_timer = timer::set_timeout(5000, HIDE_APP_DATA_STATUS_EVENT).await;
+        (state.root_element_id.clone(), state.app_data_timer_id.take())
+    };
+    if let Some(old_timer) = old_timer {
+        let _ = timer::clear_timer(old_timer).await;
+    }
+    if matches!(status, StatusState::Success(_) | StatusState::Error(_)) {
+        let new_timer = timer::set_timeout(5000, HIDE_APP_DATA_STATUS_EVENT).await;
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.app_data_status == status {
             state.app_data_timer_id = Some(new_timer);
+        } else {
+            drop(state);
+            let _ = timer::clear_timer(new_timer).await;
         }
-
-        root_id = state.root_element_id.clone();
     }
 
     if let Some(root_id) = root_id {
@@ -3004,6 +3128,7 @@ pub fn hide_app_data_status() {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(state.app_data_status, StatusState::Processing(_)) { return; }
         state.app_data_status = StatusState::Default;
         state.app_data_timer_id = None;
         root_id = state.root_element_id.clone();
@@ -3011,5 +3136,34 @@ pub fn hide_app_data_status() {
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
         psys_host::ui_v3::render(&root_id, ui);
+    }
+}
+
+#[cfg(test)]
+mod sync_message_tests {
+    use super::*;
+
+    #[test]
+    fn cover_validation_rejects_invalid_slots_before_frontier_ack_or_allocation() {
+        let valid = json!({"type": "cover_data_chunk", "name": "book", "index": 0, "total": 2, "data": "base64"});
+        assert!(valid_sync_message(&valid));
+        for (key, value) in [
+            ("index", json!(2)), ("index", json!(-1)), ("total", json!(0)),
+            ("total", json!(MAX_COVER_CHUNKS + 1)), ("name", json!("")), ("data", json!("")),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[key] = value;
+            assert!(!valid_sync_message(&malformed));
+        }
+    }
+
+    #[test]
+    fn non_sync_and_malformed_metadata_cannot_renew_the_receive_watchdog() {
+        assert!(!valid_sync_message(&json!({"type": "cookie"})));
+        assert!(!valid_sync_message(&json!({"type": "app_data_comic", "comic": null})));
+        assert!(!valid_sync_message(&json!({"type": "app_data_source", "source": "bad"})));
+        assert!(valid_sync_message(&json!({"type": "app_data_comic", "comic": {"name": "book"}})));
+        assert!(valid_sync_message(&json!({"type": "app_data_done"})));
+        assert!(valid_sync_message(&json!({"type": "cover_done"})));
     }
 }

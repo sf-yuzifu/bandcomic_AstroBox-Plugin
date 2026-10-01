@@ -1,8 +1,9 @@
 use std::sync::{OnceLock, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::transfer::{RecvFrontier, WindowedSender};
+use crate::sync_receive::{CoverChunks, SyncReceive};
 
 pub const WATCH_APP_PKG_NAME: &str = "moe.yzf.comic";
 pub const CONFIG_KEY_COOKIE: &str = "savedCookie";
@@ -218,9 +219,13 @@ pub struct UiState {
     pub app_sources: Vec<SourceInfo>,
     pub app_data_status: StatusState,
     pub app_data_timer_id: Option<u64>,
-    /// 拉取数据整体接收超时定时器 id（request_data 发出后武装）
+    /// 无进展看门狗：收到有效数据只更新截止时间，不每片调用宿主定时器。
     pub app_data_recv_timer_id: Option<u64>,
-    pub cover_chunk_buffers: HashMap<String, (usize, Vec<String>)>,
+    pub sync_receive: SyncReceive,
+    pub watch_sync_session: bool,
+    pub sync_comics_seen: HashSet<usize>,
+    pub sync_sources_seen: HashSet<usize>,
+    pub cover_chunk_buffers: HashMap<String, CoverChunks>,
     pub upload_items: Vec<UploadItem>,
     pub upload_chapters: Vec<ChapterItem>,
     pub upload_comic_name_input: String,
@@ -270,6 +275,10 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             app_data_status: StatusState::Default,
             app_data_timer_id: None,
             app_data_recv_timer_id: None,
+            sync_receive: SyncReceive::default(),
+            watch_sync_session: false,
+            sync_comics_seen: HashSet::new(),
+            sync_sources_seen: HashSet::new(),
             cover_chunk_buffers: HashMap::new(),
             upload_items: Vec::new(),
             upload_chapters: Vec::new(),
@@ -304,7 +313,7 @@ pub const TAB_DATA_EVENT: &str = "tab_data";
 pub const FETCH_APP_DATA_EVENT: &str = "fetch_app_data";
 pub const HIDE_APP_DATA_STATUS_EVENT: &str = "hide_app_data_status";
 /// 拉取数据整体接收超时定时器事件
-pub const APP_DATA_RECV_TIMEOUT_EVENT: &str = "app_data_recv_timeout";
+pub const APP_DATA_RECV_TIMEOUT_EVENT: &str = "app_data_recv_timeout:";
 /// 握手：注册重试定时器事件
 pub const HS_REGISTER_RETRY_EVENT: &str = "hs_register_retry";
 /// 握手：ping 轮询定时器事件
