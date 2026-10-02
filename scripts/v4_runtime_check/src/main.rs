@@ -269,16 +269,14 @@ async fn main() -> wasmtime::Result<()> {
             serde_json::json!({"value": url}).to_string()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 2, "outgoing p2 HTTP config fetches");
 
-        // Test HTTP-2 IPv4 input and gateway_bind message dispatch
-        events.call_on_ui_event(accessor, "http_probe_ip_input".into(), Event::Change,
-            serde_json::json!({"value": "192.168.1.100"}).to_string()).await?;
+        // Fresh installs bind without entering an IP address.
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
 
         let sent = sent_interconnect.lock().unwrap().clone();
         assert!(!sent.is_empty(), "gateway_bind should be sent via interconnect");
         let bind_msg: serde_json::Value = serde_json::from_str(sent.last().unwrap()).unwrap();
         assert_eq!(bind_msg["type"], "gateway_bind");
-        assert_eq!(bind_msg["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_eq!(bind_msg["endpoint"], format!("http://127.0.0.1:{}", identity["port"]));
         assert_eq!(bind_msg["service"], "bandcomic-local-http");
         assert_eq!(bind_msg["instanceId"], identity["instanceId"]);
 
@@ -306,7 +304,68 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(cfg.status, 200);
         let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
         assert_eq!(cfg_val["LocalUpload"]["type"], "local");
-        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], format!("http://127.0.0.1:{}", identity["port"]));
+
+        // Editing a fallback must not change an already-bound source address.
+        events.call_on_ui_event(accessor, "http_probe_ip_input".into(), Event::Change,
+            serde_json::json!({"value": "192."}).to_string()).await?;
+        events.call_on_ui_event(accessor, "http_fallback_ip_save".into(), Event::Blur,
+            serde_json::json!({"value": "192.168.1.100"}).to_string()).await?;
+        let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
+        let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
+        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], bind_msg["endpoint"]);
+
+        // Device rejection advances once to the saved fallback with a new session.
+        events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(first["endpoint"], bind_msg["endpoint"], "saved LAN IP must not override loopback priority");
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": first["session"],
+            "success": false, "nativeFetch": true, "error": "loopback unavailable"
+        }).to_string()).await?;
+        let fallback: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(fallback["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_ne!(fallback["session"], first["session"]);
+        let count = sent_interconnect.lock().unwrap().len();
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": first["session"], "success": true
+        }).to_string()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), count, "late loopback result must be ignored");
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": fallback["session"], "success": true, "probeLength": 689
+        }).to_string()).await?;
+        let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
+        let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
+        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], fallback["endpoint"]);
+
+        // Timeout also advances; an old timeout cannot expire the fallback attempt.
+        events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        let timeout = serde_json::json!({"payload": format!("http_bind_timeout:{}", first["session"].as_str().unwrap())}).to_string();
+        events.call_on_event(accessor, EventType::Timer, timeout.clone()).await?;
+        let fallback: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(fallback["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        let count = sent_interconnect.lock().unwrap().len();
+        events.call_on_event(accessor, EventType::Timer, timeout).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), count);
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": fallback["session"],
+            "success": false, "nativeFetch": true, "error": "fallback unavailable"
+        }).to_string()).await?;
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": fallback["session"], "success": true
+        }).to_string()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), count, "finished attempts must reject late results");
+
+        // Missing native fetch is not an address error and must not trigger fallback.
+        events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        let count = sent_interconnect.lock().unwrap().len();
+        events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+            "type": "gateway_bind_result", "session": first["session"],
+            "success": false, "nativeFetch": false, "error": "no native fetch"
+        }).to_string()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), count);
 
         // Search returns catalog
         let search = http.call_handle(accessor, 1, req_query("/local/search/all/1", "")).await?;
@@ -369,6 +428,7 @@ async fn main() -> wasmtime::Result<()> {
         let bind_msg_str = sent_interconnect.lock().unwrap().last().cloned().unwrap();
         let bind_msg: serde_json::Value = serde_json::from_str(&bind_msg_str).unwrap();
         assert_eq!(bind_msg["type"], "gateway_bind");
+        assert_eq!(bind_msg["endpoint"], format!("http://127.0.0.1:{}", identity["port"]));
         let reply = serde_json::json!({ "type": "gateway_bind_result", "session": bind_msg["session"],
             "success": true, "nativeFetch": true, "probeLength": 689 });
         events.call_on_event(accessor, EventType::InterconnectMessage, reply.to_string()).await?;
@@ -377,6 +437,7 @@ async fn main() -> wasmtime::Result<()> {
         let task_msg_str = sent_interconnect.lock().unwrap().last().cloned().expect("import_http_task sent");
         let task_msg: serde_json::Value = serde_json::from_str(&task_msg_str).unwrap();
         assert_eq!(task_msg["type"], "import_http_task");
+        assert_eq!(task_msg["endpoint"], bind_msg["endpoint"]);
         let task_id = task_msg["taskId"].as_str().unwrap();
 
         // 1. Fetch task details
@@ -387,7 +448,18 @@ async fn main() -> wasmtime::Result<()> {
         let book_id = task_detail["comicId"].as_str().unwrap();
         assert!(book_id.starts_with("book_"));
         assert_eq!(task_detail["totalPages"], 4);
-        assert_eq!(task_detail["coverUrl"], format!("http://192.168.1.100:{}/local/album/{book_id}/cover", identity["port"]));
+        assert_eq!(task_detail["coverUrl"], format!("http://127.0.0.1:{}/local/album/{book_id}/cover", identity["port"]));
+        let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
+        let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
+        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], task_msg["endpoint"]);
+        let album = http.call_handle(accessor, 1, req_query(&format!("/local/album/{book_id}"), "")).await?;
+        let album: serde_json::Value = serde_json::from_slice(&album.body).unwrap();
+        assert_eq!(album["cover"], task_detail["coverUrl"]);
+        let photo = http.call_handle(accessor, 1, req_query(&format!("/local/photo/{book_id}/chapter/1"), "")).await?;
+        let photo: serde_json::Value = serde_json::from_slice(&photo.body).unwrap();
+        for image in photo["images"].as_array().unwrap() {
+            assert!(image["url"].as_str().unwrap().starts_with(&format!("{}/", task_msg["endpoint"].as_str().unwrap())));
+        }
         let cover_path = format!("/local/album/{book_id}/cover");
         let cover_before = http.call_handle(accessor, 1, req_query(&cover_path, "width=80&ifPNG=1")).await?;
         assert_eq!(cover_before.status, 200);
@@ -449,6 +521,7 @@ async fn main() -> wasmtime::Result<()> {
     for index in 0..5 {
         assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
     }
-    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; lifecycle, JPEG/PNG/LVGL, outgoing p2 HTTP, automatic binding, five distinct disk masters and cover/page responses, start/stop, stale id and concurrent event wakeup checked.");
+    assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
+    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; zero-config loopback binding, saved-IP fallback on rejection/timeout, stale replies/timeouts, native-fetch absence, consistent source/task/image endpoints, JPEG/PNG/LVGL, five distinct disk masters, start/stop and concurrent event wakeup checked.");
     Ok(())
 }

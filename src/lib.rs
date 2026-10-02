@@ -87,7 +87,7 @@ impl event::Guest for MyPlugin {
                     .unwrap_or_else(|| event_payload.to_string());
 
                 if let Some(session) = timer_payload.strip_prefix("http_bind_timeout:") {
-                    if http_server::expire_binding(session) {
+                    if http_server::expire_binding(session).await {
                         ui::event_handler::http_bind_timeout().await;
                     }
                 } else if timer_payload == ui::state::HIDE_STATUS_EVENT {

@@ -30,11 +30,22 @@ pub async fn ui_event_processor(
         crate::http_server::IP_INPUT_EVENT => {
             if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
                 if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
-                    crate::http_server::update_advertised_ip(text.to_string());
+                    crate::http_server::edit_fallback_ip(text.to_string());
                 }
             }
         }
-        crate::http_server::BIND_EVENT => crate::http_server::bind_device().await,
+        crate::http_server::IP_SAVE_EVENT => {
+            if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
+                if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
+                    crate::http_server::update_fallback_ip(text.to_string());
+                }
+            }
+        }
+        crate::http_server::SETTINGS_EVENT => crate::http_server::toggle_settings(),
+        crate::http_server::BIND_EVENT => {
+            crate::http_server::start().await;
+            let _ = crate::http_server::bind_device().await;
+        }
         DOMAIN_INPUT_CHANGE_EVENT => {
             if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
                 if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
@@ -715,18 +726,17 @@ static PENDING_HTTP_IMPORT: std::sync::Mutex<Option<PendingHttpImport>> = std::s
 pub async fn http_bind_timeout() {
     let had_pending = PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take().is_some();
     if had_pending {
-        show_upload_status(StatusState::Error("设备连接超时，请检查地址后重试".into())).await;
+        show_upload_status(StatusState::Error("设备连接超时，请检查 AstroBox 连接或设置备用 IPv4 后重试".into())).await;
     }
 }
 
 async fn prepare_http_import(device_addr: String, settings: Option<WatchSettings>, chapter: Option<usize>) {
-    if crate::http_server::status().advertised_ip.is_empty() {
-        show_upload_status(StatusState::Error("请在上传页填写本机 IPv4 地址后重试".into())).await;
-        return;
-    }
     *PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()) = Some((device_addr, settings, chapter));
     crate::http_server::start().await;
-    crate::http_server::bind_device().await;
+    if let Err(error) = crate::http_server::bind_device().await {
+        PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take();
+        show_upload_status(StatusState::Error(format!("本地连接失败：{}", error))).await;
+    }
 }
 
 async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchSettings>, chapter_index: Option<usize>) {
@@ -737,15 +747,15 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         return;
     }
 
-    let comic = crate::local_source::publish(catalog.into_iter().next().unwrap());
-    let endpoint = crate::http_server::status().url.unwrap_or_default();
-    let advertised_ip = crate::http_server::status().advertised_ip;
-    let port = crate::http_server::status().port.unwrap_or(0);
-    let actual_endpoint = if !advertised_ip.is_empty() && port > 0 {
-        format!("http://{}:{}", advertised_ip, port)
-    } else {
-        endpoint
+    let connection = crate::http_server::status();
+    let actual_endpoint = match connection.endpoint.filter(|_| connection.bound) {
+        Some(endpoint) => endpoint,
+        None => {
+            show_upload_status(StatusState::Error("本地 HTTP 连接已失效，请重新上传".into())).await;
+            return;
+        }
     };
+    let comic = crate::local_source::publish(catalog.into_iter().next().unwrap());
 
     let chapters = comic
         .chapters
@@ -3214,13 +3224,14 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             }
         }
         Some("gateway_bind_result") => {
-            if !crate::http_server::handle_bind_result(&parsed) { return; }
+            if !crate::http_server::handle_bind_result(&parsed).await { return; }
             let pending = PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take();
             if let Some((addr, settings, chapter)) = pending {
                 if crate::http_server::status().bound {
                     start_http_import_task(addr, settings, chapter).await;
                 } else {
-                    show_upload_status(StatusState::Error("本地连接失败，请检查地址后重新上传".into())).await;
+                    let error = crate::http_server::status().bind_status.unwrap_or_else(|| "本地连接失败".into());
+                    show_upload_status(StatusState::Error(error)).await;
                 }
             }
         }

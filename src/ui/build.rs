@@ -37,85 +37,102 @@ pub fn build_main_ui() -> ui::Element {
     container.child(tabs).child(content)
 }
 
-fn build_http_probe_ui() -> ui::Element {
+fn build_connection_ui() -> ui::Element {
     let status = crate::http_server::status();
-    let text = if status.busy {
-        "HTTP 本地服务：正在处理...".to_string()
-    } else if let Some(port) = status.port {
-        format!("HTTP 本地服务：监听 0.0.0.0:{}", port)
+    let error = status.error.as_deref().or_else(|| {
+        status.bind_status.as_deref().filter(|message| {
+            !status.busy && !message.starts_with("原生 HTTP 已连接")
+        })
+    });
+    let (title, description, color) = if status.busy {
+        ("正在连接设备", status.bind_status.as_deref().unwrap_or("正在准备本地服务…"), "#0090FF")
+    } else if let Some(error) = error {
+        ("连接需要检查", error, "#FF5252")
+    } else if status.bound {
+        ("原生 HTTP 已连接", "连接已就绪，选择漫画后即可上传", "#52C41A")
+    } else if status.port.is_some() {
+        ("上传时自动连接", "自动选择 HTTP 或互联通道，无需填写 IP", "#0090FF")
     } else {
-        "HTTP 本地服务：已停止".to_string()
+        ("本地服务已停止", "上传时自动启动并连接设备", "#888888")
     };
+
+    let icon = ui::Element::new(ui::ElementType::Svg, Some(&icon_link_svg()))
+        .width(22).height(22).flex_shrink(0.0).text_color(color);
+    let title_col = ui::Element::new(ui::ElementType::Div, None)
+        .flex().flex_direction(ui::FlexDirection::Column).flex_grow(1.0).min_width(0).gap(4)
+        .child(ui::Element::new(ui::ElementType::P, Some(title))
+            .size(15).text_color("#DDDDDD"));
+    let settings_button = build_mode_button(
+        if status.settings_expanded { "收起" } else { "设置" },
+        icon_chevron_svg(status.settings_expanded),
+        false,
+        crate::http_server::SETTINGS_EVENT,
+    ).flex_shrink(0.0);
+    let header = ui::Element::new(ui::ElementType::Div, None)
+        .flex().flex_direction(ui::FlexDirection::Row).align_center().gap(10)
+        .child(icon).child(title_col).child(settings_button);
+
     let mut panel = ui::Element::new(ui::ElementType::Div, None)
-        .bg("#1E1E1F").radius(18).padding(12).margin_bottom(12).width_full()
-        .child(ui::Element::new(ui::ElementType::P, Some(&text)).size(14));
+        .bg("#1E1E1F").radius(18).padding(14).width_full()
+        .flex().flex_direction(ui::FlexDirection::Column).gap(8)
+        .child(header)
+        .child(ui::Element::new(ui::ElementType::P, Some(description))
+            .size(12).text_color(if error.is_some() { "#FF5252" } else { "#888888" }));
 
-
-    if let Some(error) = &status.error {
-        panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&format!("服务错误：{}", error)))
-            .size(12).text_color("#ff4d4f").margin_top(4));
-    }
-
-    let (label, event) = if status.port.is_some() {
-        ("停止 HTTP 服务", crate::http_server::STOP_EVENT)
-    } else {
-        ("启动 HTTP 服务", crate::http_server::START_EVENT)
-    };
-    let mut toggle_button = ui::Element::new(ui::ElementType::Button, Some(label))
-        .on(ui::Event::Click, event).margin_top(8);
-    if status.busy { toggle_button = toggle_button.disabled(); }
-    panel = panel.child(toggle_button);
-
-    // HTTP-2: Windows IPv4 输入与手环绑定
-    {
-        let ip_label = ui::Element::new(ui::ElementType::P, Some("设备访问 Windows IPv4 地址："))
-            .size(13).text_color("#AAAAAA").margin_top(12).margin_bottom(4);
-        let ip_input = ui::Element::new(ui::ElementType::Input, Some(&status.advertised_ip))
+    if status.settings_expanded {
+        let divider = ui::Element::new(ui::ElementType::Div, None)
+            .height(1).width_full().bg("#2A2A2A").margin_top(4).margin_bottom(4);
+        let ip_label = build_section_title("备用 IPv4 · 可选");
+        let mut ip_input = ui::Element::new(ui::ElementType::Input, Some(&status.fallback_input))
             .on(ui::Event::Change, crate::http_server::IP_INPUT_EVENT)
-            .radius(12)
+            .on(ui::Event::Blur, crate::http_server::IP_SAVE_EVENT)
+            .radius(18)
             .bg("#2A2A2A")
-            .height(36)
+            .height(INPUT_HEIGHT)
             .width_full()
-            .padding_left(10)
-            .padding_right(10);
+            .padding_left(12)
+            .padding_right(12);
+        if status.busy { ip_input = ip_input.disabled().opacity(0.5); }
         let tip = ui::Element::new(ui::ElementType::P,
-            Some("说明：全网卡监听时 127.0.0.1 仅宿主本机可达，需填入宿主局域网 IPv4（例如 192.168.1.100）供手环访问。"))
-            .size(11).text_color("#666666").margin_top(4);
+            Some("默认连接本机 127.0.0.1。失败时使用此地址，填写运行 AstroBox 的电脑或手机 IP，无需端口。"))
+            .size(12).text_color("#888888").margin_left(12).margin_right(12);
 
-        panel = panel.child(ip_label).child(ip_input).child(tip);
+        panel = panel.child(divider).child(ip_label).child(ip_input).child(tip);
 
-        if !status.advertised_ip.is_empty() {
-            let endpoint = format!("http://{}:{}", status.advertised_ip, status.port.unwrap_or(0));
-            let endpoint_text = format!("预计设备端点：{}", endpoint);
-            panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&endpoint_text))
-                .size(12).text_color("#1890ff").margin_top(6));
-
-            let mut bind_button = ui::Element::new(ui::ElementType::Button, Some("测试设备连接"))
-                .on(ui::Event::Click, crate::http_server::BIND_EVENT)
-                .bg("#0090FF26")
-                .text_color("#0090FF")
-                .margin_top(8);
-            if status.busy { bind_button = bind_button.disabled(); }
-            panel = panel.child(bind_button);
+        if let Some(endpoint) = &status.endpoint {
+            let endpoint_box = ui::Element::new(ui::ElementType::Div, None)
+                .bg("#2A2A2A").radius(18).padding(12).width_full()
+                .flex().flex_direction(ui::FlexDirection::Column).gap(4)
+                .child(ui::Element::new(ui::ElementType::P, Some("当前服务地址"))
+                    .size(12).text_color("#888888"))
+                .child(ui::Element::new(ui::ElementType::P, Some(endpoint))
+                    .size(13).text_color("#BBBBBB"));
+            panel = panel.child(endpoint_box);
         }
-    }
-
-    if let Some(bind_status) = &status.bind_status {
-        let (color, bg) = if status.bound {
-            ("#52c41a", "#0D2818")
-        } else if bind_status.contains("失败") {
-            ("#ff4d4f", "#2D1111")
+        let mut bind_button = build_mode_button(
+            "测试连接", icon_sync_svg(), true, crate::http_server::BIND_EVENT,
+        ).width_full().justify_center();
+        let (label, event) = if status.port.is_some() {
+            ("停止服务", crate::http_server::STOP_EVENT)
         } else {
-            ("#1890ff", "#0D2137")
+            ("启动服务", crate::http_server::START_EVENT)
         };
-        let status_box = ui::Element::new(ui::ElementType::Div, None)
-            .bg(bg).radius(12).padding(8).margin_top(8).width_full()
-            .child(ui::Element::new(ui::ElementType::P, Some(bind_status))
-                .size(12).text_color(color));
-        panel = panel.child(status_box);
+        let mut toggle_button = build_mode_button(label, icon_power_svg(), false, event)
+            .width_full().justify_center();
+        if status.busy {
+            bind_button = bind_button.disabled().opacity(0.5);
+            toggle_button = toggle_button.disabled().opacity(0.5);
+        }
+        let actions = ui::Element::new(ui::ElementType::Grid, None)
+            .grid_template_columns("repeat(2, minmax(0, 1fr))").gap(8).margin_top(4)
+            .child(bind_button).child(toggle_button);
+        panel = panel.child(actions);
     }
 
-    panel
+    ui::Element::new(ui::ElementType::Div, None)
+        .flex().flex_direction(ui::FlexDirection::Column).gap(8).margin_bottom(8)
+        .child(build_section_title("设备连接"))
+        .child(panel)
 }
 
 pub fn rerender_main_ui() {
@@ -679,7 +696,7 @@ fn build_upload_ui(state: &UiState) -> ui::Element {
         .flex_direction(ui::FlexDirection::Column)
         .width_full()
         .gap(8)
-        .child(build_http_probe_ui())
+        .child(build_connection_ui())
         .child(comic_name_title)
         .child(name_input)
         .child(mode_title)
@@ -1358,6 +1375,15 @@ fn icon_book_svg() -> String {
 
 fn icon_link_svg() -> String {
     r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>"#.to_string()
+}
+
+fn icon_chevron_svg(expanded: bool) -> String {
+    let points = if expanded { "6 15 12 9 18 15" } else { "6 9 12 15 18 9" };
+    format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="{}"/></svg>"#, points)
+}
+
+fn icon_power_svg() -> String {
+    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.72 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>"#.to_string()
 }
 
 fn icon_trash_svg() -> String {
