@@ -211,7 +211,7 @@ pub async fn stop() {
     render();
 }
 
-pub async fn bind_device() -> Result<(), String> {
+fn begin_binding() -> Result<(), String> {
     {
         let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
         if state.busy || state.bind_session.is_some() { return Err("正在连接设备，请稍候".into()); }
@@ -230,6 +230,18 @@ pub async fn bind_device() -> Result<(), String> {
         state.bind_status = Some("正在自动连接快应用...".into());
     }
     render();
+    Ok(())
+}
+
+/// 上传入口已经检查版本、完成启动等待与握手，直接复用同一设备连接。
+pub async fn bind_connected_device(device_addr: String) -> Result<(), String> {
+    begin_binding()?;
+    state().lock().unwrap_or_else(|p| p.into_inner()).device_addr = Some(device_addr);
+    send_binding().await
+}
+
+pub async fn bind_device() -> Result<(), String> {
+    begin_binding()?;
 
     let progress = |msg: String| {
         let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
@@ -238,7 +250,9 @@ pub async fn bind_device() -> Result<(), String> {
         render();
     };
 
-    let device_addr = match crate::ui::handshake::prepare_launch(0, &progress).await {
+    let device_addr = match crate::ui::handshake::prepare_launch(
+        crate::ui::handshake::MIN_UPLOAD_VERSION, &progress,
+    ).await {
         Ok(addr) => addr,
         Err(err) => {
             let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
@@ -251,23 +265,17 @@ pub async fn bind_device() -> Result<(), String> {
         }
     };
 
-    // 必须向 AstroBox 注册接收该设备的互联消息，否则宿主不会将快应用的应答派发给插件
-    tracing::info!("向宿主注册互联接收: addr={}, pkg={}", device_addr, WATCH_APP_PKG_NAME);
-    let reg_result = crate::astrobox::psys_host_v4::register::register_interconnect_recv(
-        device_addr.clone(),
-        WATCH_APP_PKG_NAME.into(),
-    )
-    .await;
-    match reg_result {
-        Ok(()) => tracing::info!("向宿主注册互联接收成功"),
-        Err(err) => {
-            fail_binding(&format!("注册设备消息接收失败：{}", err), false).await;
-            return Err(err);
+    // 手动测试也走统一启动等待；HTTP 绑定超时从真正发出 gateway_bind 开始计时。
+    crate::ui::handshake::begin_wait(device_addr.clone(), progress, move |result| async move {
+        match result {
+            Ok(_) => {
+                state().lock().unwrap_or_else(|p| p.into_inner()).device_addr = Some(device_addr);
+                let _ = send_binding().await;
+            }
+            Err(error) => clear_failed_binding(&error),
         }
-    }
-
-    state().lock().unwrap_or_else(|p| p.into_inner()).device_addr = Some(device_addr);
-    send_binding().await
+    });
+    Ok(())
 }
 
 async fn send_binding() -> Result<(), String> {

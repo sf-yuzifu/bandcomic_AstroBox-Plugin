@@ -48,16 +48,7 @@ impl lifecycle::Guest for MyPlugin {
                 Err(reason) => tracing::warn!("漫画数据卡片注册失败: {}", reason),
             }
 
-        // 尝试自动为当前已连接的设备注册互联接收
-        let devices = crate::astrobox::psys_host_v4::device::get_connected_device_list().await;
-        for dev in devices {
-            tracing::info!("自动注册已连接设备互联接收: addr={}", dev.addr);
-            let _ = crate::astrobox::psys_host_v4::register::register_interconnect_recv(
-                dev.addr,
-                ui::state::WATCH_APP_PKG_NAME.into(),
-            ).await;
-        }
-
+        // 互联接收在用户操作启动快应用并等待 3 秒后由握手模块注册。
         http_server::start().await;
     }
 }
@@ -105,8 +96,8 @@ impl event::Guest for MyPlugin {
                     .and_then(|value| value.parse::<u64>().ok())
                 {
                     ui::event_handler::handle_app_data_recv_timeout(generation).await;
-                } else if timer_payload == ui::state::HS_REGISTER_RETRY_EVENT
-                    || timer_payload == ui::state::HS_PING_EVENT
+                } else if timer_payload.starts_with(&format!("{}:", ui::state::HS_REGISTER_RETRY_EVENT))
+                    || timer_payload.starts_with(&format!("{}:", ui::state::HS_PING_EVENT))
                 {
                     ui::handshake::on_timer(&timer_payload).await;
                 } else if timer_payload == ui::state::PICK_PROCESS_EVENT {

@@ -685,7 +685,7 @@ async fn handle_chapter_upload(chapter_index: usize) {
     show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
 
     let progress = upload_progress();
-    let device_addr = match handshake::prepare_launch(0, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_UPLOAD_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_upload_status(StatusState::Error(msg)).await;
@@ -731,9 +731,9 @@ pub async fn http_bind_timeout() {
 }
 
 async fn prepare_http_import(device_addr: String, settings: Option<WatchSettings>, chapter: Option<usize>) {
-    *PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()) = Some((device_addr, settings, chapter));
+    *PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()) = Some((device_addr.clone(), settings, chapter));
     crate::http_server::start().await;
-    if let Err(error) = crate::http_server::bind_device().await {
+    if let Err(error) = crate::http_server::bind_connected_device(device_addr).await {
         PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take();
         show_upload_status(StatusState::Error(format!("本地连接失败：{}", error))).await;
     }
@@ -968,7 +968,7 @@ async fn handle_upload_start() {
     show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
 
     let progress = upload_progress();
-    let device_addr = match handshake::prepare_launch(0, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_UPLOAD_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_upload_status(StatusState::Error(msg)).await;
@@ -2103,7 +2103,7 @@ async fn handle_sync() {
     show_status(StatusState::Processing("正在检查快应用...".to_string())).await;
 
     let progress = sync_progress();
-    let device_addr = match handshake::prepare_launch(259, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_status(StatusState::Error(msg)).await;
@@ -2259,7 +2259,7 @@ async fn handle_delete_comic(index: usize) {
     .await;
 
     let progress = app_data_progress();
-    let device_addr = match handshake::prepare_launch(0, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_app_data_status(StatusState::Error(msg)).await;
@@ -2386,7 +2386,7 @@ async fn handle_delete_source(index: usize) {
     .await;
 
     let progress = app_data_progress();
-    let device_addr = match handshake::prepare_launch(0, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             show_app_data_status(StatusState::Error(msg)).await;
@@ -2582,7 +2582,7 @@ async fn handle_fetch_app_data() {
         let current = ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() == operation;
         if current { app_data_progress()(message); }
     };
-    let device_addr = match handshake::prepare_launch(0, &progress).await {
+    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
         Ok(addr) => addr,
         Err(msg) => {
             if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }

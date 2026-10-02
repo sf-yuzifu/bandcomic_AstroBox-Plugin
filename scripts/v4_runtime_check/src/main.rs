@@ -28,6 +28,11 @@ struct Context {
     stops: u32,
     sent_interconnect: Arc<Mutex<Vec<String>>>,
     picked_images: usize,
+    app_version: u32,
+    launches: usize,
+    launched_at: Option<std::time::Instant>,
+    registrations: usize,
+    timers: Vec<(u64, String)>,
 }
 
 // Five distinct 2x2 BMPs: a cover followed by four pages. No image dependency is
@@ -98,7 +103,13 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/register")?.func_new_concurrent("register-interconnect-recv", |_, _, _, results| Box::pin(async move {
+    linker.instance("astrobox:psys-host-v4/register")?.func_new_concurrent("register-interconnect-recv", |accessor, _, _, results| Box::pin(async move {
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            assert!(ctx.launched_at.expect("registration must follow launch").elapsed() >= std::time::Duration::from_secs(3),
+                "interconnect registration happened before the 3-second startup delay");
+            ctx.registrations += 1;
+        });
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
@@ -124,30 +135,43 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::List(vec![dev]);
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("get-thirdparty-app-list", |_, _, _, results| Box::pin(async move {
+    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("get-thirdparty-app-list", |accessor, _, _, results| Box::pin(async move {
+        let version = accessor.with(|mut access| access.get().app_version);
         let app = Val::Record(vec![
             ("package-name".into(), Val::String("moe.yzf.comic".into())),
             ("fingerprint".into(), Val::List(vec![Val::U32(1)])),
-            ("version-code".into(), Val::U32(100)),
+            ("version-code".into(), Val::U32(version)),
             ("can-remove".into(), Val::Bool(true)),
             ("app-name".into(), Val::String("腕上漫画".into())),
         ]);
         results[0] = Val::Result(Ok(Some(Box::new(Val::List(vec![app])))));
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("launch-qa", |_, _, _, results| Box::pin(async move {
+    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("launch-qa", |accessor, _, _, results| Box::pin(async move {
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            ctx.launches += 1;
+            ctx.launched_at = Some(std::time::Instant::now());
+        });
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
     linker.instance("astrobox:psys-host-v4/interconnect")?.func_wrap_concurrent("send-qaic-message", |accessor, (_addr, _pkg, data): (String, String, String)| {
         accessor.with(|mut access| {
-            access.get().sent_interconnect.lock().unwrap().push(data);
+            let ctx = access.get();
+            assert!(ctx.launched_at.expect("send must follow launch").elapsed() >= std::time::Duration::from_secs(3),
+                "interconnect message sent before the 3-second startup delay");
+            ctx.sent_interconnect.lock().unwrap().push(data);
         });
         Box::pin(async { Ok((Ok::<(), String>(()),)) })
     })?;
 
     let mut timers = linker.instance("astrobox:psys-host-v4/timer")?;
-    timers.func_wrap("set-timeout", |_, (_delay, _payload): (u64, String)| Ok((1u64,)))?;
+    timers.func_wrap("set-timeout", |mut store, (delay, payload): (u64, String)| {
+        let ctx = store.data_mut();
+        ctx.timers.push((delay, payload));
+        Ok((ctx.timers.len() as u64,))
+    })?;
     timers.func_wrap("clear-timer", |_, (_id,): (u64,)| Ok(()))?;
 
     let mut servers = linker.instance("astrobox:psys-host-v4/http-server")?;
@@ -213,6 +237,43 @@ fn stub_unused_astrobox_imports(linker: &mut Linker<Context>, engine: &Engine, c
     Ok(())
 }
 
+// Exercise the actual guest deadline, including early delivery and stale timers.
+async fn complete_startup(
+    world: &bindings::PsysWorldV4Http,
+    accessor: &wasmtime::component::Accessor<Context>,
+) -> wasmtime::Result<()> {
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    let events = world.astrobox_psys_plugin_v4_event();
+    let (delay, payload, registrations, sent, launched_at) = accessor.with(|mut access| {
+        let ctx = access.get();
+        let (delay, payload) = ctx.timers.iter().rev().find(|(_, p)| p.starts_with("hs_register_retry:")).unwrap().clone();
+        (delay, payload, ctx.registrations, ctx.sent_interconnect.lock().unwrap().len(), ctx.launched_at.unwrap())
+    });
+    assert!(delay <= 3001 && delay > 0);
+    for early in [payload.clone(), "hs_register_retry:old-session".into(), "hs_ping_poll:old-session".into()] {
+        events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": early}).to_string()).await?;
+    }
+    accessor.with(|mut access| {
+        let ctx = access.get();
+        assert_eq!(ctx.registrations, registrations, "early/old timers must not register");
+        assert_eq!(ctx.sent_interconnect.lock().unwrap().len(), sent, "startup must stay silent");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(3050).saturating_sub(launched_at.elapsed())).await;
+    events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": payload}).to_string()).await?;
+    let ping: serde_json::Value = accessor.with(|mut access| {
+        let ctx = access.get();
+        assert_eq!(ctx.registrations, registrations + 1);
+        serde_json::from_str(ctx.sent_interconnect.lock().unwrap().last().unwrap()).unwrap()
+    });
+    assert_eq!(ping["type"], "hs_ping");
+    events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
+        "type": "hs_pong", "session": ping["session"],
+        "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false },
+        "caps": { "httpImport": true }
+    }).to_string()).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> wasmtime::Result<()> {
     let wasm = std::env::args().nth(1).expect("usage: v4-runtime-check <plugin.wasm>");
@@ -242,6 +303,11 @@ async fn main() -> wasmtime::Result<()> {
         stops: 0,
         sent_interconnect: sent_interconnect.clone(),
         picked_images: 0,
+        app_version: 382,
+        launches: 0,
+        launched_at: None,
+        registrations: 0,
+        timers: Vec::new(),
     });
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let world = bindings::PsysWorldV4Http::new(&mut store, &instance)?;
@@ -250,6 +316,11 @@ async fn main() -> wasmtime::Result<()> {
         use bindings::astrobox::psys_host_v4::{http_server::Request, ui::Event};
         use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
         world.astrobox_psys_plugin_v4_lifecycle().call_on_load(accessor).await?;
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            assert_eq!(ctx.registrations, 0, "plugin load must not register against a closed app");
+            assert!(ctx.sent_interconnect.lock().unwrap().is_empty());
+        });
         let http = world.astrobox_psys_plugin_v4_http();
         let events = world.astrobox_psys_plugin_v4_event();
         let request = |path: &str| Request { method: "GET".into(), path: path.into(), query: "".into(), headers: vec![], body: vec![] };
@@ -269,8 +340,39 @@ async fn main() -> wasmtime::Result<()> {
             serde_json::json!({"value": url}).to_string()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 2, "outgoing p2 HTTP config fetches");
 
+        // Both management tabs reject 317 before launch, registration or send.
+        accessor.with(|mut access| access.get().app_version = 317);
+        for event in ["sync_button", "fetch_app_data"] {
+            events.call_on_ui_event(accessor, event.into(), Event::Click, "{}".into()).await?;
+        }
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            assert_eq!(ctx.launches, 0);
+            assert_eq!(ctx.registrations, 0);
+            assert!(ctx.sent_interconnect.lock().unwrap().is_empty());
+        });
+        // 318 is accepted by sync/data, each with a fresh startup wait.
+        accessor.with(|mut access| access.get().app_version = 318);
+        events.call_on_ui_event(accessor, "sync_button".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
+        let last: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "source_config");
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
+        let last: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "request_data");
+
+        // Upload-tab connection testing also requires 382.
+        accessor.with(|mut access| access.get().app_version = 381);
+        let sent_count = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        accessor.with(|mut access| assert_eq!(access.get().launches, 2));
+        assert_eq!(sent_interconnect.lock().unwrap().len(), sent_count);
+        accessor.with(|mut access| access.get().app_version = 382);
+
         // Fresh installs bind without entering an IP address.
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
 
         let sent = sent_interconnect.lock().unwrap().clone();
         assert!(!sent.is_empty(), "gateway_bind should be sent via interconnect");
@@ -317,6 +419,7 @@ async fn main() -> wasmtime::Result<()> {
 
         // Device rejection advances once to the saved fallback with a new session.
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
         let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(first["endpoint"], bind_msg["endpoint"], "saved LAN IP must not override loopback priority");
         events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
@@ -340,6 +443,7 @@ async fn main() -> wasmtime::Result<()> {
 
         // Timeout also advances; an old timeout cannot expire the fallback attempt.
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
         let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
         let timeout = serde_json::json!({"payload": format!("http_bind_timeout:{}", first["session"].as_str().unwrap())}).to_string();
         events.call_on_event(accessor, EventType::Timer, timeout.clone()).await?;
@@ -359,6 +463,7 @@ async fn main() -> wasmtime::Result<()> {
 
         // Missing native fetch is not an address error and must not trigger fallback.
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
         let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
         let count = sent_interconnect.lock().unwrap().len();
         events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
@@ -406,23 +511,20 @@ async fn main() -> wasmtime::Result<()> {
             events.call_on_ui_event(accessor, "upload_pick_files".into(), Event::Click, "{}".into()).await?;
             events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "pick_process"}).to_string()).await?;
         }
-        events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
-
-        // Advance handshake state machine for upload
-        events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "hs_register_retry"}).to_string()).await?;
-        let ping_msg_str = sent_interconnect.lock().unwrap().last().cloned().expect("hs_ping sent");
-        let ping_msg: serde_json::Value = serde_json::from_str(&ping_msg_str).unwrap();
-        assert_eq!(ping_msg["type"], "hs_ping");
-        let hs_session = ping_msg["session"].as_str().unwrap();
-
-        // Device replies with hs_pong
-        let pong = serde_json::json!({
-            "type": "hs_pong",
-            "session": hs_session,
-            "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false },
-            "caps": { "httpImport": true }
+        let launches = accessor.with(|mut access| {
+            let ctx = access.get();
+            ctx.app_version = 381;
+            ctx.launches
         });
-        events.call_on_event(accessor, EventType::InterconnectMessage, pong.to_string()).await?;
+        let sent_count = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+        accessor.with(|mut access| assert_eq!(access.get().launches, launches));
+        assert_eq!(sent_interconnect.lock().unwrap().len(), sent_count);
+        accessor.with(|mut access| access.get().app_version = 382);
+        events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
+        accessor.with(|mut access| assert_eq!(access.get().launches, launches + 1,
+            "HTTP binding must reuse the upload handshake instead of launching twice"));
 
         // Upload now automatically revalidates the HTTP binding before dispatch.
         let bind_msg_str = sent_interconnect.lock().unwrap().last().cloned().unwrap();
@@ -522,6 +624,6 @@ async fn main() -> wasmtime::Result<()> {
         assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
     }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
-    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; zero-config loopback binding, saved-IP fallback on rejection/timeout, stale replies/timeouts, native-fetch absence, consistent source/task/image endpoints, JPEG/PNG/LVGL, five distinct disk masters, start/stop and concurrent event wakeup checked.");
+    println!("PASS: version gates 317/318 and 381/382, 3-second startup silence, stale/early handshake timers, single launch per HTTP import, loopback/fallback binding, source/task/image endpoints, JPEG/PNG/LVGL, disk masters and start/stop checked on the actual release WASM.");
     Ok(())
 }

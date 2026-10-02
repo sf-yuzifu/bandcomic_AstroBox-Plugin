@@ -17,6 +17,20 @@ use crate::ui::state::{
 
 /// 会话空闲超时（10分钟）- 保持与 FetchBridge 一致
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const MIN_MANAGEMENT_VERSION: u32 = 318;
+pub const MIN_UPLOAD_VERSION: u32 = 382;
+const APP_STARTUP_DELAY: Duration = Duration::from_secs(1);
+
+/// 启动成功后的最早互联时间；不通过抢先发送 ping 判断应用是否已启动。
+static LAUNCH_READY_AT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn launch_ready_at() -> &'static Mutex<HashMap<String, Instant>> {
+    LAUNCH_READY_AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn schedule_timer(delay_ms: u64, event: &str, session: &str) {
+    timer::set_timeout(delay_ms, &format!("{}:{}", event, session));
+}
 
 /// 握手状态
 #[derive(Debug, Clone)]
@@ -151,7 +165,9 @@ const SYNC_WINDOW: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HandshakePhase {
-    /// 等待快应用启动完成（注册重试阶段）
+    /// 启动命令后先静默等待 3 秒，不注册互联、不发送请求。
+    Launching,
+    /// 注册重试阶段
     Registering,
     /// 等待快应用应答握手（ping 轮询阶段）
     Pinging,
@@ -166,6 +182,7 @@ struct PendingHandshake {
     device_addr: String,
     ping_str: String,
     phase: HandshakePhase,
+    ready_at: Instant,
     register_waited_ms: u64,
     ping_waited_ms: u64,
     attempt: u32,
@@ -199,6 +216,7 @@ mod session_tests {
         *pending().lock().unwrap() = Some(PendingHandshake {
             session: "new".into(), device_addr: "test".into(), ping_str: "{}".into(),
             phase: HandshakePhase::Registering, register_waited_ms: 0, ping_waited_ms: 0,
+            ready_at: Instant::now(),
             attempt: 0, progress: Box::new(|_| {}), on_done: None,
         });
         assert!(!accepts_pong("new"));
@@ -246,7 +264,7 @@ pub async fn prepare_launch(
         .find(|a| a.package_name == WATCH_APP_PKG_NAME)
         .ok_or_else(|| "请先安装腕上漫画快应用！".to_string())?;
     if app.version_code < min_version {
-        return Err("请先安装腕上漫画快应用的新版本！".to_string());
+        return Err(format!("此功能要求腕上漫画版本号 ≥ {}，当前为 {}，请先更新快应用。", min_version, app.version_code));
     }
     if thirdpartyapp::launch_qa(device_addr.clone(), app.clone(), "/pages/index".into())
         .await
@@ -254,12 +272,14 @@ pub async fn prepare_launch(
     {
         return Err("启动快应用失败。".to_string());
     }
-    progress("正在启动快应用...".to_string());
+    launch_ready_at().lock().unwrap_or_else(|p| p.into_inner())
+        .insert(device_addr.clone(), Instant::now() + APP_STARTUP_DELAY);
+    progress("已发送启动命令，等待 1 秒后连接...".to_string());
     Ok(device_addr)
 }
 
 /// 第二阶段：注册挂起的握手会话并启动事件驱动状态机。
-/// 立即返回（首个注册尝试由 10ms 后的定时器事件触发）；
+/// 立即返回；首个注册尝试必须等启动命令后的 3 秒窗口结束。
 /// 握手完成/失败/超时后通过 on_done 回调业务续体。
 pub fn begin_wait<F, Fut>(
     device_addr: String,
@@ -285,6 +305,9 @@ pub fn begin_wait<F, Fut>(
     })
     .to_string();
 
+    let ready_at = launch_ready_at().lock().unwrap_or_else(|p| p.into_inner())
+        .remove(&device_addr).unwrap_or_else(|| Instant::now() + APP_STARTUP_DELAY);
+    let delay_ms = ready_at.saturating_duration_since(Instant::now()).as_millis() as u64 + 1;
     {
         let mut guard = pending().lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_some() {
@@ -292,10 +315,11 @@ pub fn begin_wait<F, Fut>(
             tracing::warn!("取消上一个未完成的握手会话");
         }
         *guard = Some(PendingHandshake {
-            session,
+            session: session.clone(),
             device_addr: device_addr.clone(),
             ping_str,
-            phase: HandshakePhase::Registering,
+            phase: HandshakePhase::Launching,
+            ready_at,
             register_waited_ms: 0,
             ping_waited_ms: 0,
             attempt: 0,
@@ -307,10 +331,8 @@ pub fn begin_wait<F, Fut>(
     // 重置会话状态
     touch_session(&device_addr, Some(false), None);
 
-    // 10ms 后由定时器事件驱动第一步注册尝试
-    tracing::info!("begin_wait: 注册 10ms 启动定时器...");
-    let timer_id = timer::set_timeout(10, HS_REGISTER_RETRY_EVENT);
-    tracing::info!("begin_wait: 定时器注册完成 id={}", timer_id);
+    // 会话写入定时器 payload，旧操作的迟到定时器不能跳过新操作的等待期。
+    schedule_timer(delay_ms, HS_REGISTER_RETRY_EVENT, &session);
 }
 
 enum HsAction {
@@ -368,7 +390,9 @@ async fn register_step() -> HsAction {
     }
 
     // 武装下一次重试
-    timer::set_timeout(REGISTER_RETRY_INTERVAL_MS, HS_REGISTER_RETRY_EVENT);
+    if let Some(ph) = pending().lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        schedule_timer(REGISTER_RETRY_INTERVAL_MS, HS_REGISTER_RETRY_EVENT, &ph.session);
+    }
     HsAction::Nothing
 }
 
@@ -376,7 +400,7 @@ async fn register_step() -> HsAction {
 /// 快应用 JS 侧回调初始化晚于系统通道就绪，启动窗口内的 ping 会被丢弃，
 /// 短间隔持续 ping 让应用一起来就能应答
 async fn ping_step() -> HsAction {
-    let (device_addr, ping_str) = {
+    let (device_addr, ping_str, session) = {
         let mut guard = pending().lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_mut() {
             Some(ph) if ph.phase == HandshakePhase::Pinging => {
@@ -390,7 +414,7 @@ async fn ping_step() -> HsAction {
                     ph.ping_waited_ms / 1000 + 1
                 ));
                 ph.ping_waited_ms += HANDSHAKE_POLL_INTERVAL_MS;
-                (ph.device_addr.clone(), ph.ping_str.clone())
+                (ph.device_addr.clone(), ph.ping_str.clone(), ph.session.clone())
             }
             _ => return HsAction::Nothing,
         }
@@ -403,15 +427,29 @@ async fn ping_step() -> HsAction {
         } else {
             tracing::info!("握手 ping 已发送，等待 pong...");
         }
-        timer::set_timeout(HANDSHAKE_POLL_INTERVAL_MS, HS_PING_EVENT);
+        schedule_timer(HANDSHAKE_POLL_INTERVAL_MS, HS_PING_EVENT, &session);
     HsAction::Nothing
 }
 
 /// 定时器事件入口（lib.rs 分发）
 pub async fn on_timer(payload: &str) {
-    let mut action = if payload == HS_REGISTER_RETRY_EVENT {
+    let Some((event, session)) = payload.split_once(':') else { return; };
+    {
+        let mut guard = pending().lock().unwrap_or_else(|p| p.into_inner());
+        let Some(ph) = guard.as_mut().filter(|ph| ph.session == session) else { return; };
+        if ph.phase == HandshakePhase::Launching {
+            if event != HS_REGISTER_RETRY_EVENT { return; }
+            let remaining = ph.ready_at.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                schedule_timer(remaining.as_millis() as u64 + 1, event, session);
+                return;
+            }
+            ph.phase = HandshakePhase::Registering;
+        }
+    }
+    let mut action = if event == HS_REGISTER_RETRY_EVENT {
         register_step().await
-    } else if payload == HS_PING_EVENT {
+    } else if event == HS_PING_EVENT {
         ping_step().await
     } else {
         HsAction::Nothing
