@@ -354,9 +354,20 @@ pub fn handle_pick_process() {
     let (thumbnail, master) = process_picked_image(&pick.data);
     let master_len = master.len();
     let original_len = pick.data.len();
+
+    // HTTP-4: 将母版保存到磁盘，内存中释放大尺寸图片缓冲
+    let (disk_path, data) = match crate::assets::save_master(&master) {
+        Ok(path) => (Some(path), Vec::new()),
+        Err(e) => {
+            tracing::warn!("母版落盘失败，回退到内存存储: {}", e);
+            (None, master)
+        }
+    };
+
     let file = UploadFile {
         name: pick.name.clone(),
-        data: master,
+        disk_path,
+        data,
         size: master_len,
         original_size: original_len,
         thumbnail,
@@ -678,15 +689,95 @@ async fn handle_chapter_upload(chapter_index: usize) {
             Err(msg) => {
                 show_upload_status(StatusState::Error(msg)).await;
             }
-            Ok(_) => {
-                chapter_upload_continue(
-                    comic_name,
-                    chapter_data,
-                    device_addr,
-                ).await;
+            Ok(settings_opt) => {
+                if crate::http_server::status().bound {
+                    start_http_import_task(device_addr, settings_opt).await;
+                } else {
+                    chapter_upload_continue(
+                        comic_name,
+                        chapter_data,
+                        device_addr,
+                    ).await;
+                }
             }
         } },
     );
+}
+
+async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchSettings>) {
+    let watch_settings = settings_opt.unwrap_or_else(current_watch_settings);
+    let catalog = crate::local_source::get_catalog();
+    if catalog.is_empty() {
+        show_upload_status(StatusState::Error("无可导入的本地漫画内容".to_string())).await;
+        return;
+    }
+
+    let comic = &catalog[0];
+    let endpoint = crate::http_server::status().url.unwrap_or_default();
+    let advertised_ip = crate::http_server::status().advertised_ip;
+    let port = crate::http_server::status().port.unwrap_or(0);
+    let actual_endpoint = if !advertised_ip.is_empty() && port > 0 {
+        format!("http://{}:{}", advertised_ip, port)
+    } else {
+        endpoint
+    };
+
+    let chapters = comic
+        .chapters
+        .iter()
+        .map(|c| crate::jobs::TaskChapter {
+            chapter_num: c.chapter_number,
+            title: c.title.clone(),
+            page_count: c.pages.len(),
+        })
+        .collect();
+
+    let cover_url = if comic.cover.is_some() {
+        format!("{}/local/album/{}/cover", actual_endpoint, comic.id)
+    } else {
+        String::new()
+    };
+
+    let image_profile = crate::jobs::TaskImageProfile {
+        width: watch_settings.image_size,
+        quality: watch_settings.image_quality as u8,
+        if_png: watch_settings.image_use_png,
+        if_lvgl: watch_settings.image_pre_transcode,
+    };
+
+    let task_id = crate::jobs::create_task(
+        comic.id.clone(),
+        comic.name.clone(),
+        comic.revision.clone(),
+        chapters,
+        cover_url,
+        image_profile,
+    );
+
+    let session = crate::http_server::status()
+        .bind_status
+        .unwrap_or_default();
+
+    let msg = json!({
+        "type": "import_http_task",
+        "taskId": task_id,
+        "session": session,
+        "endpoint": actual_endpoint,
+    })
+    .to_string();
+
+    show_upload_status(StatusState::Processing(format!(
+        "已派发 HTTP 导入任务，手环正在原生下载《{}》...",
+        comic.name
+    )))
+    .await;
+
+    if let Err(e) =
+        interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), msg).await
+    {
+        tracing::error!("发送 import_http_task 失败: {:?}", e);
+        show_upload_status(StatusState::Error("发送任务失败，请检查连接。".to_string())).await;
+    }
 }
 
 async fn chapter_upload_continue(
@@ -722,8 +813,9 @@ async fn chapter_upload_continue(
         )))
         .await;
 
-        // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
-        let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
+        // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（优先从磁盘读取）
+        let master_bytes = file.get_master_data().unwrap_or_else(|_| file.data.clone());
+        let b64 = base64_encode(&process_for_send(&master_bytes, &watch_settings, true));
         file_names.push(name.clone());
         all_files.push((name, b64));
     }
@@ -854,8 +946,12 @@ async fn handle_upload_start() {
             Err(msg) => {
                 show_upload_status(StatusState::Error(msg)).await;
             }
-            Ok(_) => {
-                upload_start_continue(device_addr).await;
+            Ok(settings_opt) => {
+                if crate::http_server::status().bound {
+                    start_http_import_task(device_addr, settings_opt).await;
+                } else {
+                    upload_start_continue(device_addr).await;
+                }
             }
         } },
     );
@@ -909,9 +1005,10 @@ async fn upload_start_continue(device_addr: String) {
                 )))
                 .await;
 
-                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（封面不转码）
+                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（封面不转码，优先读磁盘）
+                let raw_cover = cover_file.get_master_data().unwrap_or_else(|_| cover_file.data.clone());
                 let b64 =
-                    base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
+                    base64_encode(&process_for_send(&raw_cover, &watch_settings, false));
                 file_names.push("cover".to_string());
                 all_files.push(("cover".to_string(), b64));
             }
@@ -935,7 +1032,8 @@ async fn upload_start_continue(device_addr: String) {
                 .await;
 
                 // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
-                let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
+                let raw_page = file.get_master_data().unwrap_or_else(|_| file.data.clone());
+                let b64 = base64_encode(&process_for_send(&raw_page, &watch_settings, true));
                 file_names.push(name.clone());
                 all_files.push((name, b64));
             }
@@ -954,7 +1052,8 @@ async fn upload_start_continue(device_addr: String) {
         if let Some(ref cover_file) = multi_cover {
             show_upload_status(StatusState::Processing("正在处理 封面".to_string())).await;
 
-            let b64 = base64_encode(&process_for_send(&cover_file.data, &watch_settings, false));
+            let raw_cover = cover_file.get_master_data().unwrap_or_else(|_| cover_file.data.clone());
+            let b64 = base64_encode(&process_for_send(&raw_cover, &watch_settings, false));
             all_files.push(("cover".to_string(), b64));
         }
 
@@ -996,7 +1095,8 @@ async fn upload_start_continue(device_addr: String) {
                 .await;
 
                 // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
-                let b64 = base64_encode(&process_for_send(&file.data, &watch_settings, true));
+                let raw_page = file.get_master_data().unwrap_or_else(|_| file.data.clone());
+                let b64 = base64_encode(&process_for_send(&raw_page, &watch_settings, true));
                 chap_names.push(name.clone());
                 all_files.push((file_key, b64));
             }

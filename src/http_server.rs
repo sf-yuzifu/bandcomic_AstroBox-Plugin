@@ -315,6 +315,8 @@ pub fn handle(server_id: u32, request: host::Request) -> host::Response {
         &base_url,
     ) {
         local_resp
+    } else if let Some(task_resp) = crate::jobs::route_task(&request.method, &request.path, &request.body) {
+        task_resp
     } else if request.path.starts_with("/control/") {
         http_probe::route(&request.method, &request.path, &identity)
     } else {

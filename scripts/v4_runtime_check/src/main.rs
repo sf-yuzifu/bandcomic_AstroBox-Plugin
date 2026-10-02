@@ -77,6 +77,21 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
+    linker.instance("astrobox:psys-host-v4/dialog")?.func_new_concurrent("pick-file", |_, _, _, results| Box::pin(async move {
+        let png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222,
+            0, 0, 0, 12, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 0, 0,
+            3, 1, 1, 0, 24, 221, 141, 176, 0, 0, 0, 0, 73, 69, 78, 68,
+            174, 66, 96, 130,
+        ].into_iter().map(Val::U8).collect();
+        let pick_res = Val::Record(vec![
+            ("name".into(), Val::String("test_page.png".into())),
+            ("data".into(), Val::List(png)),
+        ]);
+        results[0] = Val::Result(Ok(Some(Box::new(pick_res))));
+        Ok(())
+    }))?;
     linker.instance("astrobox:psys-host-v4/device")?.func_new_concurrent("get-connected-device-list", |_, _, _, results| Box::pin(async move {
         let dev = Val::Record(vec![
             ("name".into(), Val::String("Xiaomi Smart Band 9 Pro".into())),
@@ -301,6 +316,61 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(page_lvgl.status, 200);
         assert!(page_lvgl.headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-type") && h.value == "application/octet-stream"));
         assert_eq!(page_lvgl.body.len(), 4 + 256 * 4 + 32 * 32);
+
+        // Test HTTP-6: pick file, process, and trigger HTTP task creation via upload_start
+        events.call_on_ui_event(accessor, "upload_pick_files".into(), Event::Click, "{}".into()).await?;
+        events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "pick_process"}).to_string()).await?;
+        events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+
+        // Advance handshake state machine for upload
+        events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "hs_register_retry"}).to_string()).await?;
+        let ping_msg_str = sent_interconnect.lock().unwrap().last().cloned().expect("hs_ping sent");
+        let ping_msg: serde_json::Value = serde_json::from_str(&ping_msg_str).unwrap();
+        assert_eq!(ping_msg["type"], "hs_ping");
+        let hs_session = ping_msg["session"].as_str().unwrap();
+
+        // Device replies with hs_pong
+        let pong = serde_json::json!({
+            "type": "hs_pong",
+            "session": hs_session,
+            "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false }
+        });
+        events.call_on_event(accessor, EventType::InterconnectMessage, pong.to_string()).await?;
+
+        // Now import_http_task has been dispatched!
+        let task_msg_str = sent_interconnect.lock().unwrap().last().cloned().expect("import_http_task sent");
+        let task_msg: serde_json::Value = serde_json::from_str(&task_msg_str).unwrap();
+        assert_eq!(task_msg["type"], "import_http_task");
+        let task_id = task_msg["taskId"].as_str().unwrap();
+
+        // 1. Fetch task details
+        let task_resp = http.call_handle(accessor, 1, req_query(&format!("/control/tasks/{}", task_id), "")).await?;
+        assert_eq!(task_resp.status, 200);
+        let task_detail: serde_json::Value = serde_json::from_slice(&task_resp.body).unwrap();
+        assert_eq!(task_detail["taskId"], task_id);
+        assert_eq!(task_detail["comicId"], "sample_book");
+
+        // 2. Report progress
+        let prog_req = Request {
+            method: "POST".into(),
+            path: format!("/control/tasks/{}/progress", task_id),
+            query: "".into(),
+            headers: vec![],
+            body: serde_json::json!({ "page": 1, "total": 2 }).to_string().into_bytes(),
+        };
+        let prog_resp = http.call_handle(accessor, 1, prog_req).await?;
+        assert_eq!(prog_resp.status, 200);
+
+        // 3. Report final result
+        let res_req = Request {
+            method: "POST".into(),
+            path: format!("/control/tasks/{}/result", task_id),
+            query: "".into(),
+            headers: vec![],
+            body: serde_json::json!({ "success": true, "savedPages": 2, "totalPages": 2 }).to_string().into_bytes(),
+        };
+        let res_resp = http.call_handle(accessor, 1, res_req).await?;
+        assert_eq!(res_resp.status, 200);
 
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;

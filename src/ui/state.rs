@@ -105,10 +105,26 @@ pub enum TabPage {
 #[derive(Debug, Clone)]
 pub struct UploadFile {
     pub name: String,
-    pub data: Vec<u8>,        // master image data (resized to MASTER_WIDTH)，发送前按快应用设置再处理
-    pub size: usize,          // compressed size
-    pub original_size: usize, // original file size before compression
-    pub thumbnail: Vec<u8>,   // tiny thumbnail for UI preview
+    pub disk_path: Option<String>, // 磁盘文件路径（HTTP-4），释放内存常驻
+    pub data: Vec<u8>,             // 内存兜底数据（无磁盘时或测试使用）
+    pub size: usize,               // compressed size
+    pub original_size: usize,      // original file size before compression
+    pub thumbnail: Vec<u8>,        // tiny thumbnail for UI preview
+}
+
+impl UploadFile {
+    pub fn get_master_data(&self) -> Result<Vec<u8>, String> {
+        if let Some(path) = &self.disk_path {
+            if let Ok(bytes) = crate::assets::read_master(path) {
+                return Ok(bytes);
+            }
+        }
+        if !self.data.is_empty() {
+            Ok(self.data.clone())
+        } else {
+            Err("图片数据丢失（未在内存且无法读取磁盘）".to_string())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

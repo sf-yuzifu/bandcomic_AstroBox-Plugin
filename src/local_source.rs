@@ -122,8 +122,15 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                     item.comic_name.clone()
                 };
                 let id = format!("single_{}", i + 1);
-                let pages: Vec<Vec<u8>> = item.files.iter().map(|f| f.data.clone()).collect();
-                let cover = item.cover.as_ref().map(|c| c.data.clone());
+                let pages: Vec<Vec<u8>> = item
+                    .files
+                    .iter()
+                    .filter_map(|f| f.get_master_data().ok())
+                    .collect();
+                let cover = item
+                    .cover
+                    .as_ref()
+                    .and_then(|c| c.get_master_data().ok());
                 comics.push(LocalComicData {
                     id,
                     name,
@@ -155,14 +162,21 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                     } else {
                         chapter.name.clone()
                     };
-                    let pages: Vec<Vec<u8>> = chapter.files.iter().map(|f| f.data.clone()).collect();
+                    let pages: Vec<Vec<u8>> = chapter
+                        .files
+                        .iter()
+                        .filter_map(|f| f.get_master_data().ok())
+                        .collect();
                     chapters.push(LocalChapterData {
                         chapter_number: ci + 1,
                         title,
                         pages,
                     });
                 }
-                let cover = state.multi_cover.as_ref().map(|c| c.data.clone());
+                let cover = state
+                    .multi_cover
+                    .as_ref()
+                    .and_then(|c| c.get_master_data().ok());
                 comics.push(LocalComicData {
                     id: "multi_1".to_string(),
                     name,
@@ -218,12 +232,34 @@ fn error_json(status: u16, msg: &str) -> ProbeResponse {
     json_response(status, &json!({ "code": status, "message": msg }))
 }
 
-/// 处理图片缩放与格式转换（优先 ifLVGL，其次 ifPNG，缺省为 JPEG）
+/// 处理图片缩放与格式转换（优先 ifLVGL，其次 ifPNG，缺省为 JPEG，带磁盘缓存与 LVGL 尺寸安全检查）
 pub fn process_image(
     data: &[u8],
     params: &QueryParams,
     allow_lvgl: bool,
 ) -> Result<(Vec<u8>, &'static str), String> {
+    let is_lvgl = allow_lvgl && params.if_lvgl;
+    let cache_key = format!(
+        "{}_{}_{}_{}_{}",
+        crate::assets::hash_bytes(data),
+        params.width,
+        params.quality,
+        params.if_png,
+        is_lvgl
+    );
+
+    let content_type: &'static str = if is_lvgl {
+        "application/octet-stream"
+    } else if params.if_png {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+
+    if let Some(cached) = crate::assets::read_rendered_cache(&cache_key) {
+        return Ok((cached, content_type));
+    }
+
     let img = image::load_from_memory(data).map_err(|e| format!("解码图片失败: {}", e))?;
 
     let (w, h) = img.dimensions();
@@ -235,37 +271,42 @@ pub fn process_image(
         img
     };
 
-    // 优先级：ifLVGL > ifPNG > JPEG
-    if allow_lvgl && params.if_lvgl {
-        let bin = crate::lvgl::convert_to_lvgl_i8(&resized);
-        return Ok((bin, "application/octet-stream"));
-    }
-
-    if params.if_png {
+    let result_bytes = if is_lvgl {
+        // LVGL 8 尺寸安全检查：宽高均限制在 11 bit (<= 2047) 以内，防止长图位移溢出
+        let safe_img = crate::assets::clamp_lvgl_dimensions(resized);
+        crate::lvgl::convert_to_lvgl_i8(&safe_img)
+    } else if params.if_png {
         let mut buf = Cursor::new(Vec::new());
         resized
             .write_to(&mut buf, ImageFormat::Png)
             .map_err(|e| format!("PNG 编码失败: {}", e))?;
-        return Ok((buf.into_inner(), "image/png"));
-    }
+        buf.into_inner()
+    } else {
+        // JPEG 编码：透明区域先合成到白色背景，避免黑边
+        let rgba = resized.to_rgba8();
+        let mut bg = image::RgbaImage::from_pixel(
+            rgba.width(),
+            rgba.height(),
+            image::Rgba([255, 255, 255, 255]),
+        );
+        image::imageops::overlay(&mut bg, &rgba, 0, 0);
+        let rgb = DynamicImage::ImageRgba8(bg).to_rgb8();
 
-    // JPEG 编码：透明区域先合成到白色背景，避免黑边
-    let rgba = resized.to_rgba8();
-    let mut bg = image::RgbaImage::from_pixel(
-        rgba.width(),
-        rgba.height(),
-        image::Rgba([255, 255, 255, 255]),
-    );
-    image::imageops::overlay(&mut bg, &rgba, 0, 0);
-    let rgb = DynamicImage::ImageRgba8(bg).to_rgb8();
+        let mut buf = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut buf,
+            params.quality.clamp(1, 100),
+        );
+        encoder
+            .encode_image(&DynamicImage::ImageRgb8(rgb))
+            .map_err(|e| format!("JPEG 编码失败: {}", e))?;
+        buf
+    };
 
-    let mut buf = Vec::new();
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, params.quality.clamp(1, 100));
-    encoder
-        .encode_image(&DynamicImage::ImageRgb8(rgb))
-        .map_err(|e| format!("JPEG 编码失败: {}", e))?;
-    Ok((buf, "image/jpeg"))
+    // 缓存渲染结果
+    crate::assets::write_rendered_cache(&cache_key, &result_bytes);
+
+    Ok((result_bytes, content_type))
 }
 
 /// 路由分发
@@ -275,6 +316,10 @@ pub fn route_local(
     query: &str,
     base_url: &str,
 ) -> Option<ProbeResponse> {
+    if !path.starts_with("/local/") && path != "/config" {
+        return None;
+    }
+
     if method != "GET" {
         let mut resp = error_json(405, "Method not allowed");
         resp.headers.push(("Allow".into(), "GET".into()));
