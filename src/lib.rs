@@ -44,6 +44,17 @@ impl lifecycle::Guest for MyPlugin {
                 Ok(()) => tracing::info!("漫画数据卡片已注册"),
                 Err(reason) => tracing::warn!("漫画数据卡片注册失败: {}", reason),
             }
+
+        // 尝试自动为当前已连接的设备注册互联接收
+        let devices = crate::astrobox::psys_host_v4::device::get_connected_device_list().await;
+        for dev in devices {
+            tracing::info!("自动注册已连接设备互联接收: addr={}", dev.addr);
+            let _ = crate::astrobox::psys_host_v4::register::register_interconnect_recv(
+                dev.addr,
+                ui::state::WATCH_APP_PKG_NAME.into(),
+            ).await;
+        }
+
         http_server::start().await;
     }
 }

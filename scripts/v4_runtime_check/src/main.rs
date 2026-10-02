@@ -2,7 +2,7 @@
 //! This exercises the built plugin, but does not replace installed AstroBox tests.
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 use wasmtime::{Config, Engine, Store};
 use wasmtime::component::{Component, Linker, ResourceTable, Val};
 use wasmtime::component::{types::ComponentItem, ResourceType};
@@ -26,6 +26,7 @@ struct Context {
     server_id: u32,
     starts: u32,
     stops: u32,
+    sent_interconnect: Arc<Mutex<Vec<String>>>,
 }
 
 impl WasiView for Context {
@@ -65,7 +66,6 @@ fn fixture() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
 
 fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
     linker.instance("astrobox:psys-host-v4/os")?.func_wrap_concurrent("device-id", |_, (): ()| Box::pin(async {
-        // Force an actual suspension to exercise cross-task wakeup/serialization.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         Ok((Ok::<_, String>("runtime-check-host".to_string()),))
     }))?;
@@ -73,9 +73,44 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
+    linker.instance("astrobox:psys-host-v4/register")?.func_new_concurrent("register-interconnect-recv", |_, _, _, results| Box::pin(async move {
+        results[0] = Val::Result(Ok(None));
+        Ok(())
+    }))?;
+    linker.instance("astrobox:psys-host-v4/device")?.func_new_concurrent("get-connected-device-list", |_, _, _, results| Box::pin(async move {
+        let dev = Val::Record(vec![
+            ("name".into(), Val::String("Xiaomi Smart Band 9 Pro".into())),
+            ("addr".into(), Val::String("11:22:33:44:55:66".into())),
+        ]);
+        results[0] = Val::List(vec![dev]);
+        Ok(())
+    }))?;
+    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("get-thirdparty-app-list", |_, _, _, results| Box::pin(async move {
+        let app = Val::Record(vec![
+            ("package-name".into(), Val::String("moe.yzf.comic".into())),
+            ("fingerprint".into(), Val::List(vec![Val::U32(1)])),
+            ("version-code".into(), Val::U32(100)),
+            ("can-remove".into(), Val::Bool(true)),
+            ("app-name".into(), Val::String("腕上漫画".into())),
+        ]);
+        results[0] = Val::Result(Ok(Some(Box::new(Val::List(vec![app])))));
+        Ok(())
+    }))?;
+    linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("launch-qa", |_, _, _, results| Box::pin(async move {
+        results[0] = Val::Result(Ok(None));
+        Ok(())
+    }))?;
+    linker.instance("astrobox:psys-host-v4/interconnect")?.func_wrap_concurrent("send-qaic-message", |accessor, (_addr, _pkg, data): (String, String, String)| {
+        accessor.with(|mut access| {
+            access.get().sent_interconnect.lock().unwrap().push(data);
+        });
+        Box::pin(async { Ok((Ok::<(), String>(()),)) })
+    })?;
+
     let mut timers = linker.instance("astrobox:psys-host-v4/timer")?;
     timers.func_wrap("set-timeout", |_, (_delay, _payload): (u64, String)| Ok((1u64,)))?;
     timers.func_wrap("clear-timer", |_, (_id,): (u64,)| Ok(()))?;
+
     let mut servers = linker.instance("astrobox:psys-host-v4/http-server")?;
     servers.func_new_concurrent("start", |accessor, _, params, results| Box::pin(async move {
         if let Val::Record(options) = &params[0] {
@@ -113,8 +148,6 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
 }
 
 fn stub_unused_astrobox_imports(linker: &mut Linker<Context>, engine: &Engine, component: &Component) -> wasmtime::Result<()> {
-    // Do not use define_unknown_imports_as_traps here: it would create exact
-    // WASI version stubs that shadow the real host's semver-compatible imports.
     for (name, import) in component.component_type().imports(engine) {
         if !name.starts_with("astrobox:") { continue; }
         let ComponentItem::ComponentInstance(instance) = import.ty else { continue; };
@@ -159,8 +192,17 @@ async fn main() -> wasmtime::Result<()> {
     let directory = tempfile::tempdir_in(std::env::temp_dir().join("opencode")).unwrap();
     let mut wasi = WasiCtxBuilder::new();
     wasi.inherit_stdout().inherit_stderr().preopened_dir(directory.path(), ".", FsPerms::ReadWrite).unwrap();
-    let mut store = Store::new(&engine, Context { wasi: wasi.build(), http: WasiHttpCtx::new(),
-        table: ResourceTable::new(), listener: None, server_id: 0, starts: 0, stops: 0 });
+    let sent_interconnect = Arc::new(Mutex::new(Vec::new()));
+    let mut store = Store::new(&engine, Context {
+        wasi: wasi.build(),
+        http: WasiHttpCtx::new(),
+        table: ResourceTable::new(),
+        listener: None,
+        server_id: 0,
+        starts: 0,
+        stops: 0,
+        sent_interconnect: sent_interconnect.clone(),
+    });
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let world = bindings::PsysWorldV4Http::new(&mut store, &instance)?;
     let (url, requests, fixture_task) = fixture();
@@ -181,11 +223,38 @@ async fn main() -> wasmtime::Result<()> {
             assert_eq!(response.body.len() as u64, sample["length"].as_u64().unwrap());
             assert!(response.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Content-Length") && h.value == response.body.len().to_string()));
         }
+
+        // Test outgoing WASI p2 fetch for sources
         events.call_on_ui_event(accessor, "domain_input_blur".into(), Event::Blur,
             serde_json::json!({"value": url}).to_string()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 2, "outgoing p2 HTTP config fetches");
-        events.call_on_ui_event(accessor, "http_probe_start".into(), Event::Click, "{}".into()).await?;
-        accessor.with(|mut access| assert_eq!(access.get().starts, 1));
+
+        // Test HTTP-2 IPv4 input and gateway_bind message dispatch
+        events.call_on_ui_event(accessor, "http_probe_ip_input".into(), Event::Change,
+            serde_json::json!({"value": "192.168.1.100"}).to_string()).await?;
+        events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
+
+        let sent = sent_interconnect.lock().unwrap().clone();
+        assert!(!sent.is_empty(), "gateway_bind should be sent via interconnect");
+        let bind_msg: serde_json::Value = serde_json::from_str(sent.last().unwrap()).unwrap();
+        assert_eq!(bind_msg["type"], "gateway_bind");
+        assert_eq!(bind_msg["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_eq!(bind_msg["service"], "bandcomic-local-http");
+        assert_eq!(bind_msg["instanceId"], identity["instanceId"]);
+
+        // Simulate device replying with successful gateway_bind_result
+        let bind_session = bind_msg["session"].as_str().unwrap();
+        let reply = serde_json::json!({
+            "type": "gateway_bind_result",
+            "session": bind_session,
+            "success": true,
+            "nativeFetch": true,
+            "instanceId": identity["instanceId"],
+            "probeLength": 689
+        });
+        events.call_on_event(accessor, EventType::InterconnectMessage, reply.to_string()).await?;
+
+        // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
         let port = identity["port"].as_u64().unwrap() as u16;
         drop(TcpListener::bind(("0.0.0.0", port)).expect("stop must release the listener"));
@@ -205,6 +274,6 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
-    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; lifecycle, handler, JPEG/PNG/LVGL, outgoing p2 HTTP, start/stop, stale id and concurrent event wakeup checked.");
+    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; lifecycle, handler, JPEG/PNG/LVGL, outgoing p2 HTTP, gateway_bind, start/stop, stale id and concurrent event wakeup checked.");
     Ok(())
 }

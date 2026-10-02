@@ -27,6 +27,14 @@ pub async fn ui_event_processor(
     match event_id {
         crate::http_server::START_EVENT => crate::http_server::start().await,
         crate::http_server::STOP_EVENT => crate::http_server::stop().await,
+        crate::http_server::IP_INPUT_EVENT => {
+            if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
+                if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
+                    crate::http_server::update_advertised_ip(text.to_string());
+                }
+            }
+        }
+        crate::http_server::BIND_EVENT => crate::http_server::bind_device().await,
         DOMAIN_INPUT_CHANGE_EVENT => {
             if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
                 if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
@@ -2549,20 +2557,29 @@ pub async fn handle_interconnect_message(payload: &str) {
         }
     };
 
-    let inner_str = if let Some(pt) = outer.get("payloadText").and_then(|v| v.as_str()) {
-        tracing::info!("从 payloadText 解包数据");
-        pt.to_string()
-    } else {
-        tracing::info!("直接使用原始 payload");
-        payload.to_string()
-    };
-
-    let parsed = match serde_json::from_str::<Value>(&inner_str) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("无法解析内部 JSON: {}", e);
-            return;
+    let parsed = if let Some(pt) = outer.get("payloadText") {
+        if let Some(s) = pt.as_str() {
+            tracing::info!("从 payloadText 字符串解包数据");
+            serde_json::from_str::<Value>(s).unwrap_or_else(|_| outer.clone())
+        } else if pt.is_object() {
+            tracing::info!("从 payloadText 对象解包数据");
+            pt.clone()
+        } else {
+            outer.clone()
         }
+    } else if let Some(data) = outer.get("data") {
+        if let Some(s) = data.as_str() {
+            tracing::info!("从 data 字符串解包数据");
+            serde_json::from_str::<Value>(s).unwrap_or_else(|_| outer.clone())
+        } else if data.is_object() {
+            tracing::info!("从 data 对象解包数据");
+            data.clone()
+        } else {
+            outer.clone()
+        }
+    } else {
+        tracing::info!("直接使用原始 payload 对象");
+        outer
     };
 
     // 方向 B 滑窗接收：带 gseq 的同步帧先经 RecvFrontier 乱序缓存、按序还原后再派发；
@@ -3061,6 +3078,9 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                     disarm_ack_timeout().await;
                     send_next_chunk().await;
             }
+        }
+        Some("gateway_bind_result") => {
+            crate::http_server::handle_bind_result(&parsed);
         }
         _ => {
             tracing::info!("收到未处理的消息类型: {:?}", msg_type);

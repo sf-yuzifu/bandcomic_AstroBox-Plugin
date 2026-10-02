@@ -40,35 +40,86 @@ pub fn build_main_ui() -> ui::Element {
 fn build_http_probe_ui() -> ui::Element {
     let status = crate::http_server::status();
     let text = if status.busy {
-        "HTTP 探针服务：正在处理...".to_string()
+        "HTTP 本地服务：正在处理...".to_string()
     } else if let Some(port) = status.port {
-        format!("HTTP 探针服务：监听 0.0.0.0:{}", port)
+        format!("HTTP 本地服务：监听 0.0.0.0:{}", port)
     } else {
-        "HTTP 探针服务：已停止".to_string()
+        "HTTP 本地服务：已停止".to_string()
     };
     let mut panel = ui::Element::new(ui::ElementType::Div, None)
         .bg("#1E1E1F").radius(18).padding(12).margin_bottom(12).width_full()
-        .child(ui::Element::new(ui::ElementType::P, Some(&text)).size(13));
-    if let Some(url) = status.url {
-        let text = format!("本机测试：{}/control/health", url);
+        .child(ui::Element::new(ui::ElementType::P, Some(&text)).size(14));
+
+    if let Some(url) = &status.url {
+        let text = format!("本机回环测试：{}/control/health", url);
         panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&text)).size(12).text_color("#888888"));
     }
-    panel = panel.child(ui::Element::new(ui::ElementType::P,
-        Some("HTTP-1 固定图片探针 · 设备地址与绑定见下一阶段"))
-        .size(12).text_color("#888888"));
-    if let Some(error) = status.error {
+
+    if let Some(error) = &status.error {
         panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&format!("服务错误：{}", error)))
-            .size(12).text_color("#ff4d4f"));
+            .size(12).text_color("#ff4d4f").margin_top(4));
     }
+
     let (label, event) = if status.port.is_some() {
         ("停止 HTTP 服务", crate::http_server::STOP_EVENT)
     } else {
         ("启动 HTTP 服务", crate::http_server::START_EVENT)
     };
-    let mut button = ui::Element::new(ui::ElementType::Button, Some(label))
+    let mut toggle_button = ui::Element::new(ui::ElementType::Button, Some(label))
         .on(ui::Event::Click, event).margin_top(8);
-    if status.busy { button = button.disabled(); }
-    panel.child(button)
+    if status.busy { toggle_button = toggle_button.disabled(); }
+    panel = panel.child(toggle_button);
+
+    // HTTP-2: Windows IPv4 输入与手环绑定
+    if status.port.is_some() {
+        let ip_label = ui::Element::new(ui::ElementType::P, Some("设备访问 Windows IPv4 地址："))
+            .size(13).text_color("#AAAAAA").margin_top(12).margin_bottom(4);
+        let ip_input = ui::Element::new(ui::ElementType::Input, Some(&status.advertised_ip))
+            .on(ui::Event::Change, crate::http_server::IP_INPUT_EVENT)
+            .radius(12)
+            .bg("#2A2A2A")
+            .height(36)
+            .width_full()
+            .padding_left(10)
+            .padding_right(10);
+        let tip = ui::Element::new(ui::ElementType::P,
+            Some("说明：全网卡监听时 127.0.0.1 仅宿主本机可达，需填入宿主局域网 IPv4（例如 192.168.1.100）供手环访问。"))
+            .size(11).text_color("#666666").margin_top(4);
+
+        panel = panel.child(ip_label).child(ip_input).child(tip);
+
+        if !status.advertised_ip.is_empty() {
+            let endpoint = format!("http://{}:{}", status.advertised_ip, status.port.unwrap_or(0));
+            let endpoint_text = format!("预计设备端点：{}", endpoint);
+            panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&endpoint_text))
+                .size(12).text_color("#1890ff").margin_top(6));
+
+            let mut bind_button = ui::Element::new(ui::ElementType::Button, Some("绑定到手环并测试原生 fetch 探针"))
+                .on(ui::Event::Click, crate::http_server::BIND_EVENT)
+                .bg("#0090FF26")
+                .text_color("#0090FF")
+                .margin_top(8);
+            if status.busy { bind_button = bind_button.disabled(); }
+            panel = panel.child(bind_button);
+        }
+    }
+
+    if let Some(bind_status) = &status.bind_status {
+        let (color, bg) = if status.bound {
+            ("#52c41a", "#0D2818")
+        } else if bind_status.contains("失败") {
+            ("#ff4d4f", "#2D1111")
+        } else {
+            ("#1890ff", "#0D2137")
+        };
+        let status_box = ui::Element::new(ui::ElementType::Div, None)
+            .bg(bg).radius(12).padding(8).margin_top(8).width_full()
+            .child(ui::Element::new(ui::ElementType::P, Some(bind_status))
+                .size(12).text_color(color));
+        panel = panel.child(status_box);
+    }
+
+    panel
 }
 
 pub fn rerender_main_ui() {
