@@ -281,18 +281,46 @@ fn to_host(result: ProbeResponse) -> host::Response {
 }
 
 pub fn handle(server_id: u32, request: host::Request) -> host::Response {
-    let identity = {
+    let (identity, advertised_ip, port) = {
         let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
-        if state.busy { None } else {
+        if state.busy {
+            (None, String::new(), 0)
+        } else {
             let identity = state.identity.as_ref().filter(|identity| identity.server_id == server_id).cloned();
             if identity.is_some() { state.requests = state.requests.saturating_add(1); }
-            identity
+            let port = state.info.as_ref().map(|i| i.port).unwrap_or(0);
+            (identity, state.advertised_ip.clone(), port)
         }
     };
     let Some(identity) = identity else {
         return to_host(http_probe::error(503, "HTTP probe server is not active"));
     };
-    let response = http_probe::route(&request.method, &request.path, &identity);
+
+    let host_header = request.headers.iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.as_str());
+
+    let base_url = if !advertised_ip.is_empty() && port > 0 {
+        format!("http://{}:{}", advertised_ip, port)
+    } else if let Some(host) = host_header {
+        format!("http://{}", host)
+    } else {
+        format!("http://127.0.0.1:{}", port)
+    };
+
+    let response = if let Some(local_resp) = crate::local_source::route_local(
+        &request.method,
+        &request.path,
+        &request.query,
+        &base_url,
+    ) {
+        local_resp
+    } else if request.path.starts_with("/control/") {
+        http_probe::route(&request.method, &request.path, &identity)
+    } else {
+        http_probe::error(404, "Route not found")
+    };
+
     tracing::info!("HTTP handler: server={} {} {} -> {} ({} bytes)", server_id,
         request.method, request.path, response.status, response.body.len());
     to_host(response)

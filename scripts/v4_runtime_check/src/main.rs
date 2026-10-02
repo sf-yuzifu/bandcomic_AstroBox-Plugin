@@ -254,6 +254,54 @@ async fn main() -> wasmtime::Result<()> {
         });
         events.call_on_event(accessor, EventType::InterconnectMessage, reply.to_string()).await?;
 
+        // Test HTTP-3 LocalUpload source routes: /config, /local/search, /local/album, /local/photo
+        let req_query = |path: &str, query: &str| Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: query.into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
+        assert_eq!(cfg.status, 200);
+        let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
+        assert_eq!(cfg_val["LocalUpload"]["type"], "local");
+        assert_eq!(cfg_val["LocalUpload"]["apiUrl"], format!("http://192.168.1.100:{}", identity["port"]));
+
+        // Search returns catalog
+        let search = http.call_handle(accessor, 1, req_query("/local/search/all/1", "")).await?;
+        assert_eq!(search.status, 200);
+        let s_val: serde_json::Value = serde_json::from_slice(&search.body).unwrap();
+        assert_eq!(s_val["page"], 1);
+        let results = s_val["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let item_id = results[0]["comic_id"].as_str().unwrap();
+
+        // Album detail
+        let album = http.call_handle(accessor, 1, req_query(&format!("/local/album/{}", item_id), "")).await?;
+        assert_eq!(album.status, 200);
+        let a_val: serde_json::Value = serde_json::from_slice(&album.body).unwrap();
+        assert_eq!(a_val["item_id"], item_id);
+        assert!(a_val["page_count"].as_u64().unwrap() > 0);
+
+        // Photo list
+        let photo = http.call_handle(accessor, 1, req_query(&format!("/local/photo/{}/chapter/1", item_id), "")).await?;
+        assert_eq!(photo.status, 200);
+        let p_val: serde_json::Value = serde_json::from_slice(&photo.body).unwrap();
+        let images = p_val["images"].as_array().unwrap();
+        assert!(!images.is_empty());
+
+        // Photo page JPEG
+        let page_jpg = http.call_handle(accessor, 1, req_query(&format!("/local/photo/{}/chapter/1/1.jpg", item_id), "width=80&quality=50")).await?;
+        assert_eq!(page_jpg.status, 200);
+        assert!(page_jpg.headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-type") && h.value == "image/jpeg"));
+
+        // Photo page LVGL binary
+        let page_lvgl = http.call_handle(accessor, 1, req_query(&format!("/local/photo/{}/chapter/1/1.jpg", item_id), "width=32&ifLVGL=1")).await?;
+        assert_eq!(page_lvgl.status, 200);
+        assert!(page_lvgl.headers.iter().any(|h| h.name.eq_ignore_ascii_case("content-type") && h.value == "application/octet-stream"));
+        assert_eq!(page_lvgl.body.len(), 4 + 256 * 4 + 32 * 32);
+
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
         let port = identity["port"].as_u64().unwrap() as u16;

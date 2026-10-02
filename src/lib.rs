@@ -12,6 +12,7 @@ pub mod transfer;
 pub mod sync_receive;
 pub mod http_server;
 pub mod http_probe;
+pub mod local_source;
 
 wit_bindgen::generate!({
     path: "wit",
