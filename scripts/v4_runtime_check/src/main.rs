@@ -333,7 +333,8 @@ async fn main() -> wasmtime::Result<()> {
         let pong = serde_json::json!({
             "type": "hs_pong",
             "session": hs_session,
-            "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false }
+            "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false },
+            "caps": { "httpImport": true }
         });
         events.call_on_event(accessor, EventType::InterconnectMessage, pong.to_string()).await?;
 

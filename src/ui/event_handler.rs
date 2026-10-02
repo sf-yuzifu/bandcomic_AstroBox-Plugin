@@ -690,7 +690,11 @@ async fn handle_chapter_upload(chapter_index: usize) {
                 show_upload_status(StatusState::Error(msg)).await;
             }
             Ok(settings_opt) => {
-                if crate::http_server::status().bound {
+                let http_capable = {
+                    let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+                    state.watch_http_import
+                };
+                if crate::http_server::status().bound && http_capable {
                     start_http_import_task(device_addr, settings_opt).await;
                 } else {
                     chapter_upload_continue(
@@ -947,7 +951,11 @@ async fn handle_upload_start() {
                 show_upload_status(StatusState::Error(msg)).await;
             }
             Ok(settings_opt) => {
-                if crate::http_server::status().bound {
+                let http_capable = {
+                    let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+                    state.watch_http_import
+                };
+                if crate::http_server::status().bound && http_capable {
                     start_http_import_task(device_addr, settings_opt).await;
                 } else {
                     upload_start_continue(device_addr).await;
@@ -3120,6 +3128,8 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         .and_then(|v| v.as_u64())
                         .map(|n| (n as usize).clamp(1, 16));
                     state.watch_sync_session = parsed.get("caps").and_then(|c| c.get("syncSession"))
+                        .and_then(Value::as_bool).unwrap_or(false);
+                    state.watch_http_import = parsed.get("caps").and_then(|c| c.get("httpImport"))
                         .and_then(Value::as_bool).unwrap_or(false);
                 }
                 // 完成挂起的握手会话，锁外直接等待业务续体。

@@ -269,6 +269,8 @@ pub struct UiState {
     pub sync_recv: Option<RecvFrontier>,
     /// 已选待处理的图片（对话框与 CPU 密集处理解耦，见 handle_pick_process）
     pub pending_pick: Option<PendingPick>,
+    /// 手表端是否支持原生 HTTP 导入能力（通过 hs_pong caps 协商）
+    pub watch_http_import: bool,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -314,6 +316,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             watch_import_window: None,
             sync_recv: None,
             pending_pick: None,
+            watch_http_import: false,
         })
     })
 }
