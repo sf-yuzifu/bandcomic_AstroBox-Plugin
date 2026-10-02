@@ -1,17 +1,18 @@
 [package]
 name = "bandcomic_astrobox_v2_plugin"
-version = "1.11.0"
+version = "1.13.0"
 edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { version = "0.47.0", features = ["async", "async-spawn"] }
+wit-bindgen = { version = "=0.62.0", features = ["async", "inter-task-wakeup"] }
+futures = { version = "=0.3.31", default-features = false, features = ["std", "async-await"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
-waki = "0.5.1"
+waki = "=0.5.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }

@@ -1,5 +1,5 @@
-use crate::astrobox::psys_host;
-use crate::astrobox::psys_host::ui_v3 as ui;
+use crate::astrobox::psys_host_v4 as psys_host;
+use crate::astrobox::psys_host_v4::ui;
 use super::state::*;
 use super::message::get_status_text;
 
@@ -13,7 +13,7 @@ pub fn render_main_ui(element_id: &str) {
         state.root_element_id = Some(element_id.to_string());
     }
     let ui_tree = build_main_ui();
-    psys_host::ui_v3::render(element_id, ui_tree);
+    psys_host::ui::render(element_id, ui_tree);
 }
 
 pub fn build_main_ui() -> ui::Element {
@@ -34,7 +34,41 @@ pub fn build_main_ui() -> ui::Element {
         TabPage::Upload => build_upload_ui(&state),
     };
 
-    container.child(tabs).child(content)
+    container.child(tabs).child(build_http_probe_ui()).child(content)
+}
+
+fn build_http_probe_ui() -> ui::Element {
+    let status = crate::http_server::status();
+    let text = if status.busy {
+        "HTTP 探针服务：正在处理...".to_string()
+    } else if let Some(port) = status.port {
+        format!("HTTP 探针服务：监听 0.0.0.0:{}", port)
+    } else {
+        "HTTP 探针服务：已停止".to_string()
+    };
+    let mut panel = ui::Element::new(ui::ElementType::Div, None)
+        .bg("#1E1E1F").radius(18).padding(12).margin_bottom(12).width_full()
+        .child(ui::Element::new(ui::ElementType::P, Some(&text)).size(13));
+    if let Some(url) = status.url {
+        let text = format!("本机测试：{}/control/health", url);
+        panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&text)).size(12).text_color("#888888"));
+    }
+    panel = panel.child(ui::Element::new(ui::ElementType::P,
+        Some("HTTP-1 固定图片探针 · 设备地址与绑定见下一阶段"))
+        .size(12).text_color("#888888"));
+    if let Some(error) = status.error {
+        panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&format!("服务错误：{}", error)))
+            .size(12).text_color("#ff4d4f"));
+    }
+    let (label, event) = if status.port.is_some() {
+        ("停止 HTTP 服务", crate::http_server::STOP_EVENT)
+    } else {
+        ("启动 HTTP 服务", crate::http_server::START_EVENT)
+    };
+    let mut button = ui::Element::new(ui::ElementType::Button, Some(label))
+        .on(ui::Event::Click, event).margin_top(8);
+    if status.busy { button = button.disabled(); }
+    panel.child(button)
 }
 
 pub fn rerender_main_ui() {
@@ -47,7 +81,7 @@ pub fn rerender_main_ui() {
 
     if let Some(element_id) = element_id {
         let ui_tree = build_main_ui();
-        psys_host::ui_v3::render(&element_id, ui_tree);
+        psys_host::ui::render(&element_id, ui_tree);
     }
 }
 
@@ -1397,5 +1431,5 @@ fn build_comic_data_card_ui() -> ui::Element {
 pub fn render_comic_data_card(card_id: &str) {
     tracing::info!("render_comic_data_card: card_id={}", card_id);
     let ui_tree = build_comic_data_card_ui();
-    psys_host::ui_v3::render(card_id, ui_tree);
+    psys_host::ui::render(card_id, ui_tree);
 }

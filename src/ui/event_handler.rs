@@ -1,7 +1,7 @@
 use super::COMIC_DATA_CARD_ID;
 use super::handshake;
 use super::state::*;
-use crate::astrobox::psys_host::{self, device, dialog, interconnect, timer};
+use crate::astrobox::psys_host_v4::{self as psys_host, device, dialog, interconnect, timer};
 use crate::network::{fetch_source_config, fetch_source_name};
 use crate::transfer::{RecvFrontier, WindowedSender};
 use crate::sync_receive::{CoverChunks, MAX_COVER_CHUNKS};
@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use super::build::{self, build_main_ui};
 use super::message::{hide_status, show_status};
 
-pub fn ui_event_processor(
-    event_type: crate::exports::astrobox::psys_plugin::event_v3::Event,
+pub async fn ui_event_processor(
+    event_type: psys_host::ui::Event,
     event_id: &str,
     event_payload: &str,
 ) {
@@ -25,6 +25,8 @@ pub fn ui_event_processor(
     );
 
     match event_id {
+        crate::http_server::START_EVENT => crate::http_server::start().await,
+        crate::http_server::STOP_EVENT => crate::http_server::stop().await,
         DOMAIN_INPUT_CHANGE_EVENT => {
             if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
                 if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
@@ -37,7 +39,7 @@ pub fn ui_event_processor(
             if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
                 if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
                     tracing::info!("域名输入框失去焦点，开始获取配置: {}", text);
-                    handle_domain_blur(text.to_string());
+                    handle_domain_blur(text.to_string()).await;
                 }
             }
         }
@@ -51,7 +53,7 @@ pub fn ui_event_processor(
         }
         SYNC_BUTTON_EVENT => {
             tracing::info!("同步按钮被点击");
-            wit_bindgen::block_on(handle_sync());
+            handle_sync().await;
         }
         HIDE_STATUS_EVENT => {
             hide_status();
@@ -92,11 +94,11 @@ pub fn ui_event_processor(
         }
         UPLOAD_PICK_FILES_EVENT => {
             tracing::info!("选择文件按钮被点击");
-            wit_bindgen::block_on(pick_and_stash(PickTarget::UploadItem, true));
+            pick_and_stash(PickTarget::UploadItem, true).await;
         }
         UPLOAD_START_EVENT => {
             tracing::info!("上传按钮被点击");
-            wit_bindgen::block_on(handle_upload_start());
+            handle_upload_start().await;
         }
         UPLOAD_CLEAR_EVENT => {
             tracing::info!("清空列表按钮被点击");
@@ -108,11 +110,11 @@ pub fn ui_event_processor(
         }
         UPLOAD_PICK_COVER_EVENT => {
             tracing::info!("封面选择按钮被点击");
-            wit_bindgen::block_on(pick_and_stash(PickTarget::CoverSingle, false));
+            pick_and_stash(PickTarget::CoverSingle, false).await;
         }
         UPLOAD_PICK_MULTI_COVER_EVENT => {
             tracing::info!("多章节封面选择按钮被点击");
-            wit_bindgen::block_on(pick_and_stash(PickTarget::CoverMulti, false));
+            pick_and_stash(PickTarget::CoverMulti, false).await;
         }
         TAB_SYNC_EVENT => {
             switch_tab(TabPage::Sync);
@@ -125,7 +127,7 @@ pub fn ui_event_processor(
         }
         FETCH_APP_DATA_EVENT => {
             tracing::info!("获取快应用数据按钮被点击");
-            wit_bindgen::block_on(handle_fetch_app_data());
+            handle_fetch_app_data().await;
         }
         _ => {
             if let Some(index_str) = event_id.strip_prefix(UPLOAD_MOVE_UP_PREFIX) {
@@ -143,12 +145,12 @@ pub fn ui_event_processor(
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_PICK_FILES_PREFIX) {
                 if let Ok(chapter_index) = index_str.parse::<usize>() {
                     tracing::info!("章节{}选择文件", chapter_index);
-                    wit_bindgen::block_on(pick_and_stash(PickTarget::Chapter(chapter_index), true));
+                    pick_and_stash(PickTarget::Chapter(chapter_index), true).await;
                 }
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_UPLOAD_PREFIX) {
                 if let Ok(chapter_index) = index_str.parse::<usize>() {
                     tracing::info!("章节{}上传", chapter_index);
-                    wit_bindgen::block_on(handle_chapter_upload(chapter_index));
+                    handle_chapter_upload(chapter_index).await;
                 }
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_CLEAR_PREFIX) {
                 if let Ok(chapter_index) = index_str.parse::<usize>() {
@@ -188,12 +190,12 @@ pub fn ui_event_processor(
             } else if let Some(index_str) = event_id.strip_prefix(DELETE_COMIC_PREFIX) {
                 if let Ok(index) = index_str.parse::<usize>() {
                     tracing::info!("删除漫画按钮被点击: index={}", index);
-                    wit_bindgen::block_on(handle_delete_comic(index));
+                    handle_delete_comic(index).await;
                 }
             } else if let Some(index_str) = event_id.strip_prefix(DELETE_SOURCE_PREFIX) {
                 if let Ok(index) = index_str.parse::<usize>() {
                     tracing::info!("删除漫画源按钮被点击: index={}", index);
-                    wit_bindgen::block_on(handle_delete_source(index));
+                    handle_delete_source(index).await;
                 }
             }
         }
@@ -211,7 +213,7 @@ fn switch_tab(tab: TabPage) {
     }
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -227,7 +229,7 @@ pub fn hide_upload_status() {
     }
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -239,13 +241,13 @@ async fn show_upload_status(status: StatusState) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(timer_id) = state.upload_status_timer_id {
-            let _ = timer::clear_timer(timer_id).await;
+            timer::clear_timer(timer_id);
         }
 
         state.upload_status = status.clone();
 
         if matches!(&status, StatusState::Success(_) | StatusState::Error(_)) {
-            let timer_id = timer::set_timeout(5000, HIDE_UPLOAD_STATUS_EVENT).await;
+            let timer_id = timer::set_timeout(5000, HIDE_UPLOAD_STATUS_EVENT);
             state.upload_status_timer_id = Some(timer_id);
         }
 
@@ -254,7 +256,7 @@ async fn show_upload_status(status: StatusState) {
 
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -268,7 +270,7 @@ fn rerender_upload_ui() {
 
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -300,7 +302,14 @@ async fn pick_and_stash(target: PickTarget, multiple: bool) {
         copy_to: None,
     };
 
-    let result = psys_host::dialog::pick_file(&pick_config, &filter).await;
+    let result = match psys_host::dialog::pick_file(pick_config, filter).await {
+        Ok(result) => result,
+        Err(reason) => {
+            tracing::error!("选择图片失败: {}", reason);
+            show_upload_status(StatusState::Error(format!("选择图片失败：{}", reason))).await;
+            return;
+        }
+    };
 
     if result.data.is_empty() {
         tracing::info!("用户取消了文件选择");
@@ -318,7 +327,7 @@ async fn pick_and_stash(target: PickTarget, multiple: bool) {
         });
     }
 
-    timer::set_timeout(30, PICK_PROCESS_EVENT).await;
+    timer::set_timeout(30, PICK_PROCESS_EVENT);
 }
 
 /// 定时器事件里真正处理选中的图片：解码/缩放/入列/重渲染
@@ -657,20 +666,19 @@ async fn handle_chapter_upload(chapter_index: usize) {
     handshake::begin_wait(
         device_addr.clone(),
         upload_progress(),
-        move |result| match result {
+        move |result| async move { match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
+                show_upload_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(chapter_upload_continue(
+                chapter_upload_continue(
                     comic_name,
                     chapter_data,
                     device_addr,
-                ));
+                ).await;
             }
-        },
-    )
-    .await;
+        } },
+    );
 }
 
 async fn chapter_upload_continue(
@@ -834,16 +842,15 @@ async fn handle_upload_start() {
     handshake::begin_wait(
         device_addr.clone(),
         upload_progress(),
-        move |result| match result {
+        move |result| async move { match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_upload_status(StatusState::Error(msg)));
+                show_upload_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(upload_start_continue(device_addr));
+                upload_start_continue(device_addr).await;
             }
-        },
-    )
-    .await;
+        } },
+    );
 }
 
 async fn upload_start_continue(device_addr: String) {
@@ -1135,7 +1142,7 @@ async fn send_next_chunk() {
             }
         };
 
-        match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str).await {
+        match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), chunk_str).await {
             Ok(_) => {
                 arm_ack_timeout().await;
                 let status_text = {
@@ -1196,7 +1203,7 @@ async fn complete_upload(device_addr: String, comic_name: String) {
         }
     };
     if let Err(e) =
-        interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &done_str).await
+        interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), done_str).await
     {
         tracing::error!("发送完成消息失败: {:?}", e);
     }
@@ -1270,9 +1277,9 @@ async fn send_windowed_frames(device_addr: String, frames: Vec<String>) {
         return;
     }
     let total = frames.len();
-    for (i, frame) in frames.iter().enumerate() {
+    for (i, frame) in frames.into_iter().enumerate() {
         if let Err(e) =
-            interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, frame).await
+            interconnect::send_qaic_message(device_addr.clone(), WATCH_APP_PKG_NAME.into(), frame).await
         {
             tracing::error!("窗口分片发送失败 ({}/{}): {:?}", i + 1, total, e);
             disarm_ack_timeout().await;
@@ -1333,7 +1340,7 @@ async fn pump_upload_window() {
 
 /// 窗口模式的累计 ACK：ack = 下一个仍缺失的连续 gseq。
 /// 前进 → 补发新帧；停滞 → go-back-N 整窗重发一次；全部确认 → 收尾
-fn handle_windowed_chunk_ack(name: &str, ack: usize) {
+async fn handle_windowed_chunk_ack(name: &str, ack: usize) {
     enum WAction {
         Nothing,
         Frames(Vec<usize>),
@@ -1371,11 +1378,11 @@ fn handle_windowed_chunk_ack(name: &str, ack: usize) {
             device_addr,
             comic_name,
         } => {
-            wit_bindgen::block_on(complete_upload(device_addr, comic_name));
+            complete_upload(device_addr, comic_name).await;
         }
         WAction::Frames(gseqs) => {
             if let Some((device_addr, frames)) = build_windowed_frames(&gseqs) {
-                wit_bindgen::block_on(send_windowed_frames(device_addr, frames));
+                send_windowed_frames(device_addr, frames).await;
             }
         }
     }
@@ -1429,7 +1436,7 @@ fn handle_cookie_input(input_value: String) {
     state.config.cookie = input_value;
 }
 
-fn handle_domain_blur(input_value: String) {
+async fn handle_domain_blur(input_value: String) {
     tracing::info!("处理域名失去焦点: {}", input_value);
 
     {
@@ -1443,9 +1450,7 @@ fn handle_domain_blur(input_value: String) {
 
     if input_value.contains('.') {
         tracing::info!("域名包含点号，开始获取配置: {}", input_value);
-        wit_bindgen::block_on(async move {
-            fetch_domain_config_async(input_value).await;
-        });
+        fetch_domain_config_async(input_value).await;
     } else {
         tracing::info!("域名不包含点号，跳过获取: {}", input_value);
     }
@@ -1455,8 +1460,6 @@ async fn fetch_domain_config_async(domain: String) {
     tracing::info!("fetch_domain_config_async 被调用: {}", domain);
 
     show_status(StatusState::Processing("正在获取漫画源配置...".to_string())).await;
-
-    timer::set_timeout(50, "").await;
 
     tracing::info!("调用 fetch_source_name: {}", domain);
     match fetch_source_name(&domain).await {
@@ -1513,7 +1516,7 @@ fn render_upload_progress(msg: String) {
     };
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -1528,7 +1531,7 @@ fn render_app_data_progress(msg: String) {
     };
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -1543,7 +1546,7 @@ fn render_sync_progress(msg: String) {
     };
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -1634,9 +1637,9 @@ async fn arm_ack_timeout() {
         state.upload_ack_timer_id.take()
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
-    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_ACK_TIMEOUT_EVENT).await;
+    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_ACK_TIMEOUT_EVENT);
     let mut state = ui_state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1651,7 +1654,7 @@ async fn disarm_ack_timeout() {
         state.upload_ack_timer_id.take()
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
 }
 
@@ -1659,7 +1662,7 @@ async fn disarm_ack_timeout() {
 /// 必须等快应用回 import_header_ack 后才开始发分片：
 /// 安卓端 QAIC 不保证消息顺序，分片可能反超头部被手表丢弃导致死锁。
 async fn send_import_header(device_addr: &str, header_str: &str) {
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, header_str).await {
+    match interconnect::send_qaic_message(device_addr.into(), WATCH_APP_PKG_NAME.into(), header_str.into()).await {
         Ok(_) => {
             tracing::info!("头部消息发送成功，等待快应用确认");
             arm_header_timeout().await;
@@ -1686,9 +1689,9 @@ async fn arm_header_timeout() {
         state.upload_header_timer_id.take()
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
-    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_HEADER_TIMEOUT_EVENT).await;
+    let tid = timer::set_timeout(ACK_TIMEOUT_MS, UPLOAD_HEADER_TIMEOUT_EVENT);
     let mut state = ui_state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1703,14 +1706,13 @@ async fn disarm_header_timeout() {
         state.upload_header_timer_id.take()
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
 }
 
 /// 头部 ACK 超时：重发头部（上限 3 次）；超限说明对端可能是
 /// 无 header ACK 机制的旧版快应用，退回兼容模式直接发分片。
-pub fn handle_upload_header_timeout() {
-    wit_bindgen::block_on(async {
+pub async fn handle_upload_header_timeout() {
         enum Action {
             Nothing,
             Resend,
@@ -1741,7 +1743,7 @@ pub fn handle_upload_header_timeout() {
             Action::Nothing => {}
             Action::Resend => {
                 tracing::warn!("头部 ACK 超时，重发头部消息");
-                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &header_str)
+                match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), header_str)
                     .await
                 {
                     Ok(_) => {
@@ -1767,13 +1769,11 @@ pub fn handle_upload_header_timeout() {
                 send_next_chunk().await;
             }
         }
-    });
 }
 
 /// ACK 超时处理：窗口模式整窗 go-back-N 重发；逐片模式重传当前在途分片；
 /// 超过重传上限则中止上传。由定时器事件 UPLOAD_ACK_TIMEOUT_EVENT 触发。
-pub fn handle_upload_ack_timeout() {
-    wit_bindgen::block_on(async {
+pub async fn handle_upload_ack_timeout() {
         enum Action {
             Nothing,
             Resend(usize, usize),
@@ -1875,7 +1875,7 @@ pub fn handle_upload_ack_timeout() {
                 })
                 .to_string();
 
-                match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &chunk_str)
+                match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), chunk_str)
                     .await
                 {
                     Ok(_) => {
@@ -1897,7 +1897,6 @@ pub fn handle_upload_ack_timeout() {
                 }
             }
         }
-    });
 }
 
 async fn handle_sync() {
@@ -1966,16 +1965,15 @@ async fn handle_sync() {
     handshake::begin_wait(
         device_addr.clone(),
         sync_progress(),
-        move |result| match result {
+        move |result| async move { match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_status(StatusState::Error(msg)));
+                show_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(sync_continue(cookie, domain, source_name, device_addr));
+                sync_continue(cookie, domain, source_name, device_addr).await;
             }
-        },
-    )
-    .await;
+        } },
+    );
 }
 
 async fn sync_continue(cookie: String, domain: String, source_name: String, device_addr: String) {
@@ -1996,7 +1994,7 @@ async fn sync_continue(cookie: String, domain: String, source_name: String, devi
             }
         };
 
-        match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &cookie_str).await {
+        match interconnect::send_qaic_message(device_addr.clone(), WATCH_APP_PKG_NAME.into(), cookie_str).await {
             Ok(_) => {
                 tracing::info!("Cookie 发送成功");
             }
@@ -2048,7 +2046,7 @@ async fn sync_continue(cookie: String, domain: String, source_name: String, devi
         }
     };
 
-    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &source_msg_str).await {
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), source_msg_str).await {
         Ok(_) => {
             show_status(StatusState::Success("同步成功！".to_string())).await;
         }
@@ -2095,7 +2093,7 @@ async fn handle_delete_comic(index: usize) {
     let dialog_result = dialog::show_dialog(
         dialog::DialogType::Alert,
         dialog::DialogStyle::Website,
-        &dialog_info,
+        dialog_info,
     )
     .await;
 
@@ -2123,16 +2121,15 @@ async fn handle_delete_comic(index: usize) {
     handshake::begin_wait(
         device_addr.clone(),
         app_data_progress(),
-        move |result| match result {
+        move |result| async move { match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+                show_app_data_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(delete_comic_continue(comic_name, index, device_addr));
+                delete_comic_continue(comic_name, index, device_addr).await;
             }
-        },
-    )
-    .await;
+        } },
+    );
 }
 
 async fn delete_comic_continue(comic_name: String, index: usize, device_addr: String) {
@@ -2150,7 +2147,7 @@ async fn delete_comic_continue(comic_name: String, index: usize, device_addr: St
         }
     };
 
-    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), delete_str).await {
         Ok(_) => {
             tracing::info!("删除命令已发送: {}", comic_name);
 
@@ -2175,7 +2172,7 @@ async fn delete_comic_continue(comic_name: String, index: usize, device_addr: St
             }
             if let Some(root_id) = root_id {
                 let ui = build_main_ui();
-                psys_host::ui_v3::render(&root_id, ui);
+                psys_host::ui::render(&root_id, ui);
             }
 
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
@@ -2223,7 +2220,7 @@ async fn handle_delete_source(index: usize) {
     let dialog_result = dialog::show_dialog(
         dialog::DialogType::Alert,
         dialog::DialogStyle::Website,
-        &dialog_info,
+        dialog_info,
     )
     .await;
 
@@ -2251,16 +2248,15 @@ async fn handle_delete_source(index: usize) {
     handshake::begin_wait(
         device_addr.clone(),
         app_data_progress(),
-        move |result| match result {
+        move |result| async move { match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+                show_app_data_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(delete_source_continue(source_name, index, device_addr));
+                delete_source_continue(source_name, index, device_addr).await;
             }
-        },
-    )
-    .await;
+        } },
+    );
 }
 
 async fn delete_source_continue(source_name: String, index: usize, device_addr: String) {
@@ -2278,7 +2274,7 @@ async fn delete_source_continue(source_name: String, index: usize, device_addr: 
         }
     };
 
-    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &delete_str).await {
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), delete_str).await {
         Ok(_) => {
             tracing::info!("删除漫画源命令已发送: {}", source_name);
 
@@ -2307,7 +2303,7 @@ async fn delete_source_continue(source_name: String, index: usize, device_addr: 
             }
             if let Some(root_id) = root_id {
                 let ui = build_main_ui();
-                psys_host::ui_v3::render(&root_id, ui);
+                psys_host::ui::render(&root_id, ui);
             }
 
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
@@ -2333,11 +2329,11 @@ async fn schedule_app_data_recv_timeout() {
         )
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
     let Some(remaining) = remaining else { return; };
     let event = format!("{}{}", APP_DATA_RECV_TIMEOUT_EVENT, generation);
-    let tid = timer::set_timeout(remaining.as_millis().max(1) as u64, &event).await;
+    let tid = timer::set_timeout(remaining.as_millis().max(1) as u64, &event);
     let mut state = ui_state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2345,7 +2341,7 @@ async fn schedule_app_data_recv_timeout() {
         state.app_data_recv_timer_id = Some(tid);
     } else {
         drop(state);
-        let _ = timer::clear_timer(tid).await;
+        timer::clear_timer(tid);
     }
 }
 
@@ -2360,14 +2356,13 @@ async fn disarm_app_data_recv_timeout() -> u64 {
         (state.app_data_recv_timer_id.take(), state.sync_receive.generation())
     };
     if let Some(t) = old {
-        let _ = timer::clear_timer(t).await;
+        timer::clear_timer(t);
     }
     generation
 }
 
 /// 只有无有效进展20s/30s才结束；旧会话/旧阶段的定时器不能中止新接收。
-pub fn handle_app_data_recv_timeout(generation: u64) {
-    wit_bindgen::block_on(async {
+pub async fn handle_app_data_recv_timeout(generation: u64) {
         let cover_phase = {
             let mut state = ui_state()
                 .write()
@@ -2400,7 +2395,6 @@ pub fn handle_app_data_recv_timeout(generation: u64) {
         } else {
             show_app_data_status(StatusState::Error("接收超时，请重试。".to_string())).await;
         }
-    });
 }
 
 async fn handle_fetch_app_data() {
@@ -2456,19 +2450,18 @@ async fn handle_fetch_app_data() {
             let current = ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() == operation;
             if current { app_data_progress()(message); }
         },
-        move |result| {
+        move |result| async move {
             if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
             match result {
             Err(msg) => {
-                wit_bindgen::block_on(show_app_data_status(StatusState::Error(msg)));
+                show_app_data_status(StatusState::Error(msg)).await;
             }
             Ok(_) => {
-                wit_bindgen::block_on(fetch_app_data_send_request(device_addr, operation));
+                fetch_app_data_send_request(device_addr, operation).await;
             }
             }
         },
-    )
-    .await;
+    );
 }
 
 async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
@@ -2503,7 +2496,7 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
     };
     schedule_app_data_recv_timeout().await;
     if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != generation { return; }
-    match interconnect::send_qaic_message(&device_addr, WATCH_APP_PKG_NAME, &request_str).await {
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), request_str).await {
         Ok(_) => {
             tracing::info!("数据请求已发送，等待手表回复...");
         }
@@ -2526,7 +2519,7 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
 /// 快应用端等待此 ACK 后继续发送下一个，确保安卓端严格顺序；
 /// 滑窗会话（windowed=true）由 sync_ack 统一累计确认，逐条 ACK 被抑制
 /// （省 BLE 带宽、避免干扰窗口；不能在此读 ui_state——调用方可能正持锁）
-fn send_app_data_ack(device_addr: &str, index: usize, windowed: bool) {
+async fn send_app_data_ack(device_addr: &str, index: usize, windowed: bool) {
     if windowed {
         return;
     }
@@ -2537,34 +2530,16 @@ fn send_app_data_ack(device_addr: &str, index: usize, windowed: bool) {
     });
 
     if let Ok(ack_str) = serde_json::to_string(&ack_msg) {
-        wit_bindgen::block_on(async {
-            let _ =
-                interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME, &ack_str).await;
-        });
+        let _ = interconnect::send_qaic_message(device_addr.into(), WATCH_APP_PKG_NAME.into(), ack_str).await;
     }
 }
 
-pub fn handle_interconnect_message(payload: &str) {
+pub async fn handle_interconnect_message(payload: &str) {
     tracing::debug!("收到互联消息，长度={}", payload.len());
 
     // 设备地址懒获取：只有需要回 ACK 的消息分支才查询，
     // 避免封面分片等高频消息每条都做一次设备列表 FFI
     let addr_cell = std::cell::OnceCell::new();
-    let get_addr = || -> Option<String> {
-        addr_cell
-            .get_or_init(|| {
-                let devices = device::get_connected_device_list();
-                wit_bindgen::block_on(async {
-                    let devices = devices.await;
-                    if !devices.is_empty() {
-                        Some(devices[0].addr.clone())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .clone()
-    };
 
     let outer = match serde_json::from_str::<Value>(payload) {
         Ok(v) => v,
@@ -2613,25 +2588,33 @@ pub fn handle_interconnect_message(payload: &str) {
             };
             (ready, ack, session)
         };
-        if let Some(ref addr) = get_addr() {
+        if let Some(ref addr) = get_addr(&addr_cell).await {
             let mut ack_msg = json!({
                 "type": "sync_ack",
                 "ack": ack,
             });
             if let Some(session) = session { ack_msg["session"] = json!(session); }
             if let Ok(ack_str) = serde_json::to_string(&ack_msg) {
-                wit_bindgen::block_on(async {
-                    let _ = interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str).await;
-                });
+                let _ = interconnect::send_qaic_message(addr.clone(), WATCH_APP_PKG_NAME.into(), ack_str).await;
             }
         }
         for msg in &ready {
-            dispatch_sync_message(msg, true, &get_addr);
+            dispatch_sync_message(msg, true, &addr_cell).await;
         }
         return;
     }
 
-    dispatch_sync_message(&parsed, false, &get_addr);
+    dispatch_sync_message(&parsed, false, &addr_cell).await;
+}
+
+async fn get_addr(cache: &std::cell::OnceCell<Option<String>>) -> Option<String> {
+    if let Some(addr) = cache.get() {
+        return addr.clone();
+    }
+    let devices = device::get_connected_device_list().await;
+    let addr = devices.first().map(|device| device.addr.clone());
+    let _ = cache.set(addr.clone());
+    addr
 }
 
 fn sync_message_type(msg_type: &str) -> bool {
@@ -2658,7 +2641,7 @@ fn valid_sync_message(msg: &Value) -> bool {
 /// 同步消息派发（type 命名空间）。新旧协议共用：
 /// 旧快应用消息由 handle_interconnect_message 直接调用（windowed=false）；
 /// 滑窗会话帧经 RecvFrontier 按序还原后逐帧调用（windowed=true，抑制逐条 ACK）
-fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> Option<String>) {
+async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::cell::OnceCell<Option<String>>) {
     let msg_type = parsed.get("type").and_then(|v| v.as_str());
     if msg_type.is_some_and(sync_message_type) {
         let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
@@ -2702,11 +2685,12 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     .resize(source_count, SourceInfo::default());
             }
             state.app_data_status = StatusState::Processing("接收中...".to_string());
+            drop(state);
 
             // 发送 ACK 确认，让快应用继续发下一个
             // 快应用 msgIndex = 0，ACK 后 msgIndex++ 变成 1，所以 ACK 序号 = 0
-            if let Some(ref addr) = get_addr() {
-                send_app_data_ack(addr, 0, windowed);
+            if !windowed && let Some(ref addr) = get_addr(addr_cell).await {
+                send_app_data_ack(addr, 0, false).await;
             }
         }
         Some("app_data_comic") => {
@@ -2751,15 +2735,15 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 };
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
-                    psys_host::ui_v3::render(&root_id, ui);
+                    psys_host::ui::render(&root_id, ui);
                     build::render_comic_data_card(COMIC_DATA_CARD_ID);
                 }
             }
             // 发送 ACK 确认，让快应用继续发下一个
             // 当前消息在快应用的 msgIndex = (index + 1)，所以 ACK 序号 = (index + 1)
             // 因为 header 占用 msgIndex 0，所以 comic 从 1 开始
-            if let Some(ref addr) = get_addr() {
-                send_app_data_ack(addr, 1 + index, windowed);
+            if !windowed && let Some(ref addr) = get_addr(addr_cell).await {
+                send_app_data_ack(addr, 1 + index, false).await;
             }
         }
         Some("app_data_source") => {
@@ -2798,7 +2782,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 };
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
-                    psys_host::ui_v3::render(&root_id, ui);
+                    psys_host::ui::render(&root_id, ui);
                 }
             }
             // 发送 ACK 确认，让快应用继续发下一个
@@ -2811,8 +2795,8 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 state.app_comic_count.unwrap_or(0)
             };
             let msg_index = 1 + total_comics + index;
-            if let Some(ref addr) = get_addr() {
-                send_app_data_ack(addr, msg_index, windowed);
+            if !windowed && let Some(ref addr) = get_addr(addr_cell).await {
+                send_app_data_ack(addr, msg_index, false).await;
             }
         }
         Some("app_data_done") => {
@@ -2842,14 +2826,14 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
 
             // 封面阶段重新武装整体超时；无封面则整个流程结束，解除超时
             if comic_count > 0 || windowed {
-                if fresh_done { wit_bindgen::block_on(schedule_app_data_recv_timeout()); }
+                if fresh_done { schedule_app_data_recv_timeout().await; }
             } else {
-                wit_bindgen::block_on(disarm_app_data_recv_timeout());
+                disarm_app_data_recv_timeout().await;
             }
 
             if let Some(root_id) = root_id {
                 let ui = build_main_ui();
-                psys_host::ui_v3::render(&root_id, ui);
+                psys_host::ui::render(&root_id, ui);
             }
 
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
@@ -2857,8 +2841,8 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
             // done 消息也要 ACK，表示可以开始发封面
             // msgIndex = 1 + comic_count + source_count = done 的位置
             let msg_index = 1 + comic_count + source_count;
-            if let Some(ref addr) = get_addr() {
-                send_app_data_ack(addr, msg_index, windowed);
+            if !windowed && let Some(ref addr) = get_addr(addr_cell).await {
+                send_app_data_ack(addr, msg_index, false).await;
             }
         }
         Some("cover_done") => {
@@ -2872,7 +2856,6 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 if let Some(frontier) = state.sync_recv.as_mut() { frontier.clear_pending(); }
                 incomplete
             };
-            wit_bindgen::block_on(async {
                 let finished = disarm_app_data_recv_timeout().await;
                 if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished {
                     return;
@@ -2880,7 +2863,6 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 show_app_data_status(StatusState::Success(if incomplete {
                     "数据获取完成（封面可能不完整）"
                 } else { "数据获取成功！" }.to_string())).await;
-            });
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Some("cover_data_chunk") => {
@@ -2938,23 +2920,21 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 // 回 cover_ack 通知快应用发下一张封面（无论挂载还是暂存都要回）；
                 // 滑窗会话由 sync_ack 统一累计确认，抑制逐张 cover_ack
                 if !windowed {
-                    if let Some(ref addr) = get_addr() {
+                    if let Some(ref addr) = get_addr(addr_cell).await {
                         let ack = json!({
                             "type": "cover_ack",
                             "name": name,
                         });
                         if let Ok(ack_str) = serde_json::to_string(&ack) {
-                            wit_bindgen::block_on(async {
                                 let _ =
-                                    interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME, &ack_str)
+                                    interconnect::send_qaic_message(addr.clone(), WATCH_APP_PKG_NAME.into(), ack_str)
                                         .await;
-                            });
                         }
                     }
                 }
                 if let Some(root_id) = root_id {
                     let ui = build_main_ui();
-                    psys_host::ui_v3::render(&root_id, ui);
+                    psys_host::ui::render(&root_id, ui);
                 }
                 build::render_comic_data_card(COMIC_DATA_CARD_ID);
             }
@@ -2978,7 +2958,6 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
 
             if start {
                 tracing::info!("头部已确认: name={}，开始发送分片", name);
-                wit_bindgen::block_on(async {
                     disarm_header_timeout().await;
                     let windowed = {
                         let state = ui_state()
@@ -2995,7 +2974,6 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     } else {
                         send_next_chunk().await;
                     }
-                });
             }
         }
         Some("hs_pong") => {
@@ -3011,7 +2989,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                 .unwrap_or_default();
             tracing::info!("收到握手应答: session={}, settings={:?}", session, settings);
 
-            if let Some(ref addr) = get_addr() {
+            if let Some(ref addr) = get_addr(addr_cell).await {
                 if !handshake::accepts_pong(&session) { return; }
                 {
                     let mut state = ui_state()
@@ -3027,8 +3005,8 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     state.watch_sync_session = parsed.get("caps").and_then(|c| c.get("syncSession"))
                         .and_then(Value::as_bool).unwrap_or(false);
                 }
-                // 完成挂起的握手会话（内部会调用业务续体，必须在 block_on 之外）
-                handshake::handle_hs_pong(addr, &session, &parsed);
+                // 完成挂起的握手会话，锁外直接等待业务续体。
+                handshake::handle_hs_pong(addr, &session, &parsed).await;
             }
         }
         Some("import_chunk_ack") => {
@@ -3036,7 +3014,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
 
             // 窗口会话：ack 字段为累计前沿（下一个仍缺失的 gseq）
             if let Some(ack) = parsed.get("ack").and_then(|v| v.as_u64()) {
-                handle_windowed_chunk_ack(name, ack as usize);
+                handle_windowed_chunk_ack(name, ack as usize).await;
                 return;
             }
 
@@ -3080,10 +3058,8 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
                     file,
                     index
                 );
-                wit_bindgen::block_on(async {
                     disarm_ack_timeout().await;
                     send_next_chunk().await;
-                });
             }
         }
         _ => {
@@ -3093,7 +3069,7 @@ fn dispatch_sync_message(parsed: &Value, windowed: bool, get_addr: &dyn Fn() -> 
 }
 
 pub async fn show_app_data_status(status: StatusState) {
-    // 更新状态后释放锁，再等待宿主timer；接收帧可以继续推进，不持UI锁跨await。
+    // V4 Timer 为同步接口；先更新状态并释放UI锁再操作定时器。
     let (root_id, old_timer) = {
         let mut state = ui_state()
             .write()
@@ -3103,22 +3079,22 @@ pub async fn show_app_data_status(status: StatusState) {
         (state.root_element_id.clone(), state.app_data_timer_id.take())
     };
     if let Some(old_timer) = old_timer {
-        let _ = timer::clear_timer(old_timer).await;
+        timer::clear_timer(old_timer);
     }
     if matches!(status, StatusState::Success(_) | StatusState::Error(_)) {
-        let new_timer = timer::set_timeout(5000, HIDE_APP_DATA_STATUS_EVENT).await;
+        let new_timer = timer::set_timeout(5000, HIDE_APP_DATA_STATUS_EVENT);
         let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
         if state.app_data_status == status {
             state.app_data_timer_id = Some(new_timer);
         } else {
             drop(state);
-            let _ = timer::clear_timer(new_timer).await;
+            timer::clear_timer(new_timer);
         }
     }
 
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 
@@ -3135,7 +3111,7 @@ pub fn hide_app_data_status() {
     }
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        psys_host::ui_v3::render(&root_id, ui);
+        psys_host::ui::render(&root_id, ui);
     }
 }
 

@@ -1,0 +1,11 @@
+[package]
+name = "bandcomic-v4-probe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.57.1", features = ["async", "inter-task-wakeup"] }
+waki = "=0.5.1"

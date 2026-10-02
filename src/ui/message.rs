@@ -1,4 +1,4 @@
-use crate::astrobox::psys_host::timer;
+use crate::astrobox::psys_host_v4::timer;
 use super::state::{ui_state, StatusState, HIDE_STATUS_EVENT};
 use super::build::build_main_ui;
 
@@ -9,13 +9,13 @@ pub async fn show_status(status: StatusState) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(timer_id) = state.status_timer_id {
-            let _ = timer::clear_timer(timer_id).await;
+            timer::clear_timer(timer_id);
         }
 
         state.current_status = status.clone();
 
         if matches!(&status, StatusState::Success(_) | StatusState::Error(_)) {
-            let timer_id = timer::set_timeout(3000, HIDE_STATUS_EVENT).await;
+            let timer_id = timer::set_timeout(3000, HIDE_STATUS_EVENT);
             state.status_timer_id = Some(timer_id);
         }
 
@@ -24,7 +24,7 @@ pub async fn show_status(status: StatusState) {
 
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        crate::astrobox::psys_host::ui_v3::render(&root_id, ui);
+        crate::astrobox::psys_host_v4::ui::render(&root_id, ui);
     }
 }
 
@@ -41,7 +41,7 @@ pub fn hide_status() {
 
     if let Some(root_id) = root_id {
         let ui = build_main_ui();
-        crate::astrobox::psys_host::ui_v3::render(&root_id, ui);
+        crate::astrobox::psys_host_v4::ui::render(&root_id, ui);
     }
 }
 
