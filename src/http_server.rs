@@ -11,6 +11,17 @@ pub const STOP_EVENT: &str = "http_probe_stop";
 pub const IP_INPUT_EVENT: &str = "http_probe_ip_input";
 pub const BIND_EVENT: &str = "http_probe_bind_device";
 
+pub fn expire_binding(session: &str) -> bool {
+    let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
+    if state.bind_session.as_deref() != Some(session) || state.bound { return false; }
+    state.bind_session = None;
+    state.busy = false;
+    state.bind_status = Some("连接超时，请检查地址后重试".into());
+    drop(state);
+    render();
+    true
+}
+
 #[derive(Default)]
 struct ServerState {
     info: Option<host::ServerInfo>,
@@ -27,7 +38,10 @@ struct ServerState {
 static STATE: OnceLock<Mutex<ServerState>> = OnceLock::new();
 
 fn state() -> &'static Mutex<ServerState> {
-    STATE.get_or_init(|| Mutex::new(ServerState::default()))
+    STATE.get_or_init(|| Mutex::new(ServerState {
+        advertised_ip: std::fs::read_to_string("http-address.txt").unwrap_or_default().trim().to_string(),
+        ..ServerState::default()
+    }))
 }
 
 #[derive(Clone)]
@@ -63,6 +77,8 @@ fn render() {
 pub fn update_advertised_ip(ip: String) {
     let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
     state.advertised_ip = ip.trim().to_string();
+    state.bound = false;
+    let _ = std::fs::write("http-address.txt", &state.advertised_ip);
 }
 
 pub async fn start() {
@@ -211,6 +227,8 @@ pub async fn bind_device() {
     {
         let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
         state.bind_session = Some(session.clone());
+        state.bound = false;
+        state.bind_status = Some("正在验证设备连接...".into());
     }
 
     let bind_msg = json!({
@@ -222,6 +240,7 @@ pub async fn bind_device() {
         "instanceId": instance_id,
         "port": port
     }).to_string();
+    crate::astrobox::psys_host_v4::timer::set_timeout(30_000, &format!("http_bind_timeout:{}", session));
 
     match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), bind_msg).await {
         Ok(()) => {
@@ -238,12 +257,12 @@ pub async fn bind_device() {
     render();
 }
 
-pub fn handle_bind_result(parsed: &Value) {
+pub fn handle_bind_result(parsed: &Value) -> bool {
     let session = parsed.get("session").and_then(Value::as_str).unwrap_or("");
     let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
     if state.bind_session.as_deref() != Some(session) {
         tracing::warn!("忽略已过期的 gateway_bind_result: session={}", session);
-        return;
+        return false;
     }
 
     let success = parsed.get("success").and_then(Value::as_bool).unwrap_or(false);
@@ -270,6 +289,7 @@ pub fn handle_bind_result(parsed: &Value) {
     }
     drop(state);
     render();
+    true
 }
 
 fn to_host(result: ProbeResponse) -> host::Response {

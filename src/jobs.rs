@@ -37,12 +37,14 @@ pub struct TaskInfo {
     pub status: String,
     pub saved_pages: usize,
     pub total_pages: usize,
+    pub total_chapters: usize,
 }
 
 #[derive(Default)]
 struct TaskManager {
     tasks: HashMap<String, TaskInfo>,
     active_task_id: Option<String>,
+    last_progress: Option<std::time::Instant>,
 }
 
 static TASKS: OnceLock<Mutex<TaskManager>> = OnceLock::new();
@@ -58,6 +60,7 @@ pub fn create_task(
     chapters: Vec<TaskChapter>,
     cover_url: String,
     image_profile: TaskImageProfile,
+    total_chapters: usize,
 ) -> String {
     let task_id = format!(
         "task_{}",
@@ -81,11 +84,13 @@ pub fn create_task(
         status: "ready".to_string(),
         saved_pages: 0,
         total_pages,
+        total_chapters,
     };
 
     let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
     mgr.tasks.insert(task_id.clone(), task);
     mgr.active_task_id = Some(task_id.clone());
+    mgr.last_progress = Some(std::time::Instant::now());
     task_id
 }
 
@@ -94,11 +99,20 @@ pub fn get_task(task_id: &str) -> Option<TaskInfo> {
     mgr.tasks.get(task_id).cloned()
 }
 
+pub fn is_busy() -> bool {
+    let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.last_progress.map(|t| t.elapsed().as_secs() > 120).unwrap_or(true) { return false; }
+    mgr.active_task_id.as_ref().and_then(|id| mgr.tasks.get(id))
+        .map(|task| task.status == "ready" || task.status == "downloading").unwrap_or(false)
+}
+
 pub fn update_progress(task_id: &str, page: usize, total: usize) {
     let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.active_task_id.as_deref() != Some(task_id) { return; }
+    mgr.last_progress = Some(std::time::Instant::now());
     if let Some(task) = mgr.tasks.get_mut(task_id) {
-        task.saved_pages = page;
-        task.total_pages = total;
+        if task.status == "completed" || task.status == "failed" { return; }
+        task.saved_pages = task.saved_pages.max(page.min(task.total_pages));
         task.status = "downloading".to_string();
 
         let progress_str = format!("手环正在原生下载: {}/{} 页", page, total);
@@ -121,7 +135,10 @@ pub fn finish_task(
     error: Option<String>,
 ) {
     let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.active_task_id.as_deref() != Some(task_id) { return; }
     if let Some(task) = mgr.tasks.get_mut(task_id) {
+        if task.status == "completed" || task.status == "failed" { return; }
+        let success = success && saved_pages == task.total_pages && total_pages == task.total_pages;
         task.saved_pages = saved_pages;
         task.total_pages = total_pages;
         task.status = if success {

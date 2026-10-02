@@ -27,6 +27,31 @@ struct Context {
     starts: u32,
     stops: u32,
     sent_interconnect: Arc<Mutex<Vec<String>>>,
+    picked_images: usize,
+}
+
+// Five distinct 2x2 BMPs: a cover followed by four pages. No image dependency is
+// needed in the host; decoding/encoding and disk caching run in the real WASM.
+fn picked_image(index: usize) -> Vec<u8> {
+    let colors = [[0, 0, 255], [0, 255, 0], [255, 0, 0], [0, 255, 255], [255, 0, 255]];
+    let color = colors[index % colors.len()]; // BGR
+    let mut bmp = vec![0u8; 70];
+    bmp[..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&70u32.to_le_bytes());
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&2u32.to_le_bytes());
+    bmp[22..26].copy_from_slice(&2u32.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+    bmp[34..38].copy_from_slice(&16u32.to_le_bytes());
+    for row in 0..2 {
+        for col in 0..2 {
+            let offset = 54 + row * 8 + col * 3;
+            bmp[offset..offset + 3].copy_from_slice(&color);
+        }
+    }
+    bmp
 }
 
 impl WasiView for Context {
@@ -77,17 +102,16 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/dialog")?.func_new_concurrent("pick-file", |_, _, _, results| Box::pin(async move {
-        let png = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
-            0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222,
-            0, 0, 0, 12, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 0, 0,
-            3, 1, 1, 0, 24, 221, 141, 176, 0, 0, 0, 0, 73, 69, 78, 68,
-            174, 66, 96, 130,
-        ].into_iter().map(Val::U8).collect();
+    linker.instance("astrobox:psys-host-v4/dialog")?.func_new_concurrent("pick-file", |accessor, _, _, results| Box::pin(async move {
+        let index = accessor.with(|mut access| {
+            let ctx = access.get();
+            let index = ctx.picked_images;
+            ctx.picked_images += 1;
+            index
+        });
         let pick_res = Val::Record(vec![
-            ("name".into(), Val::String("test_page.png".into())),
-            ("data".into(), Val::List(png)),
+            ("name".into(), Val::String(format!("test_image_{index}.bmp"))),
+            ("data".into(), Val::List(picked_image(index).into_iter().map(Val::U8).collect())),
         ]);
         results[0] = Val::Result(Ok(Some(Box::new(pick_res))));
         Ok(())
@@ -217,6 +241,7 @@ async fn main() -> wasmtime::Result<()> {
         starts: 0,
         stops: 0,
         sent_interconnect: sent_interconnect.clone(),
+        picked_images: 0,
     });
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let world = bindings::PsysWorldV4Http::new(&mut store, &instance)?;
@@ -318,8 +343,10 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(page_lvgl.body.len(), 4 + 256 * 4 + 32 * 32);
 
         // Test HTTP-6: pick file, process, and trigger HTTP task creation via upload_start
-        events.call_on_ui_event(accessor, "upload_pick_files".into(), Event::Click, "{}".into()).await?;
-        events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "pick_process"}).to_string()).await?;
+        for _ in 0..5 {
+            events.call_on_ui_event(accessor, "upload_pick_files".into(), Event::Click, "{}".into()).await?;
+            events.call_on_event(accessor, EventType::Timer, serde_json::json!({"payload": "pick_process"}).to_string()).await?;
+        }
         events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
 
         // Advance handshake state machine for upload
@@ -338,6 +365,14 @@ async fn main() -> wasmtime::Result<()> {
         });
         events.call_on_event(accessor, EventType::InterconnectMessage, pong.to_string()).await?;
 
+        // Upload now automatically revalidates the HTTP binding before dispatch.
+        let bind_msg_str = sent_interconnect.lock().unwrap().last().cloned().unwrap();
+        let bind_msg: serde_json::Value = serde_json::from_str(&bind_msg_str).unwrap();
+        assert_eq!(bind_msg["type"], "gateway_bind");
+        let reply = serde_json::json!({ "type": "gateway_bind_result", "session": bind_msg["session"],
+            "success": true, "nativeFetch": true, "probeLength": 689 });
+        events.call_on_event(accessor, EventType::InterconnectMessage, reply.to_string()).await?;
+
         // Now import_http_task has been dispatched!
         let task_msg_str = sent_interconnect.lock().unwrap().last().cloned().expect("import_http_task sent");
         let task_msg: serde_json::Value = serde_json::from_str(&task_msg_str).unwrap();
@@ -349,7 +384,23 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(task_resp.status, 200);
         let task_detail: serde_json::Value = serde_json::from_slice(&task_resp.body).unwrap();
         assert_eq!(task_detail["taskId"], task_id);
-        assert_eq!(task_detail["comicId"], "sample_book");
+        let book_id = task_detail["comicId"].as_str().unwrap();
+        assert!(book_id.starts_with("book_"));
+        assert_eq!(task_detail["totalPages"], 4);
+        assert_eq!(task_detail["coverUrl"], format!("http://192.168.1.100:{}/local/album/{book_id}/cover", identity["port"]));
+        let cover_path = format!("/local/album/{book_id}/cover");
+        let cover_before = http.call_handle(accessor, 1, req_query(&cover_path, "width=80&ifPNG=1")).await?;
+        assert_eq!(cover_before.status, 200);
+        let mut image_bodies = vec![cover_before.body.clone()];
+        for page in 1..=4 {
+            let image = http.call_handle(accessor, 1,
+                req_query(&format!("/local/photo/{book_id}/chapter/1/{page}.jpg"), "width=80&ifPNG=1")).await?;
+            assert_eq!(image.status, 200);
+            assert!(!image_bodies.contains(&image.body), "cover/page {page} content must remain distinct");
+            image_bodies.push(image.body);
+        }
+        let cover_after = http.call_handle(accessor, 1, req_query(&cover_path, "width=80&ifPNG=1")).await?;
+        assert_eq!(cover_after.body, cover_before.body, "reading the last page must not replace the cover");
 
         // 2. Report progress
         let prog_req = Request {
@@ -357,7 +408,7 @@ async fn main() -> wasmtime::Result<()> {
             path: format!("/control/tasks/{}/progress", task_id),
             query: "".into(),
             headers: vec![],
-            body: serde_json::json!({ "page": 1, "total": 2 }).to_string().into_bytes(),
+            body: serde_json::json!({ "page": 1, "total": 4 }).to_string().into_bytes(),
         };
         let prog_resp = http.call_handle(accessor, 1, prog_req).await?;
         assert_eq!(prog_resp.status, 200);
@@ -368,7 +419,7 @@ async fn main() -> wasmtime::Result<()> {
             path: format!("/control/tasks/{}/result", task_id),
             query: "".into(),
             headers: vec![],
-            body: serde_json::json!({ "success": true, "savedPages": 2, "totalPages": 2 }).to_string().into_bytes(),
+            body: serde_json::json!({ "success": true, "savedPages": 4, "totalPages": 4 }).to_string().into_bytes(),
         };
         let res_resp = http.call_handle(accessor, 1, res_req).await?;
         assert_eq!(res_resp.status, 200);
@@ -393,6 +444,11 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
-    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; lifecycle, handler, JPEG/PNG/LVGL, outgoing p2 HTTP, gateway_bind, start/stop, stale id and concurrent event wakeup checked.");
+    let masters: Vec<_> = std::fs::read_dir(directory.path().join("cache/masters"))?.collect::<Result<_, _>>()?;
+    assert_eq!(masters.len(), 5, "WASI disk masters must not overwrite one another");
+    for index in 0..5 {
+        assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
+    }
+    println!("PASS: Wasmtime 48.0.2 loads the actual V4 component; lifecycle, JPEG/PNG/LVGL, outgoing p2 HTTP, automatic binding, five distinct disk masters and cover/page responses, start/stop, stale id and concurrent event wakeup checked.");
     Ok(())
 }

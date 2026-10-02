@@ -34,7 +34,7 @@ pub fn build_main_ui() -> ui::Element {
         TabPage::Upload => build_upload_ui(&state),
     };
 
-    container.child(tabs).child(build_http_probe_ui()).child(content)
+    container.child(tabs).child(content)
 }
 
 fn build_http_probe_ui() -> ui::Element {
@@ -50,10 +50,6 @@ fn build_http_probe_ui() -> ui::Element {
         .bg("#1E1E1F").radius(18).padding(12).margin_bottom(12).width_full()
         .child(ui::Element::new(ui::ElementType::P, Some(&text)).size(14));
 
-    if let Some(url) = &status.url {
-        let text = format!("本机回环测试：{}/control/health", url);
-        panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&text)).size(12).text_color("#888888"));
-    }
 
     if let Some(error) = &status.error {
         panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&format!("服务错误：{}", error)))
@@ -71,7 +67,7 @@ fn build_http_probe_ui() -> ui::Element {
     panel = panel.child(toggle_button);
 
     // HTTP-2: Windows IPv4 输入与手环绑定
-    if status.port.is_some() {
+    {
         let ip_label = ui::Element::new(ui::ElementType::P, Some("设备访问 Windows IPv4 地址："))
             .size(13).text_color("#AAAAAA").margin_top(12).margin_bottom(4);
         let ip_input = ui::Element::new(ui::ElementType::Input, Some(&status.advertised_ip))
@@ -94,7 +90,7 @@ fn build_http_probe_ui() -> ui::Element {
             panel = panel.child(ui::Element::new(ui::ElementType::P, Some(&endpoint_text))
                 .size(12).text_color("#1890ff").margin_top(6));
 
-            let mut bind_button = ui::Element::new(ui::ElementType::Button, Some("绑定到手环并测试原生 fetch 探针"))
+            let mut bind_button = ui::Element::new(ui::ElementType::Button, Some("测试设备连接"))
                 .on(ui::Event::Click, crate::http_server::BIND_EVENT)
                 .bg("#0090FF26")
                 .text_color("#0090FF")
@@ -683,6 +679,7 @@ fn build_upload_ui(state: &UiState) -> ui::Element {
         .flex_direction(ui::FlexDirection::Column)
         .width_full()
         .gap(8)
+        .child(build_http_probe_ui())
         .child(comic_name_title)
         .child(name_input)
         .child(mode_title)

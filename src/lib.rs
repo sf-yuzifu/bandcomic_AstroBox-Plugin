@@ -86,7 +86,11 @@ impl event::Guest for MyPlugin {
                     })
                     .unwrap_or_else(|| event_payload.to_string());
 
-                if timer_payload == ui::state::HIDE_STATUS_EVENT {
+                if let Some(session) = timer_payload.strip_prefix("http_bind_timeout:") {
+                    if http_server::expire_binding(session) {
+                        ui::event_handler::http_bind_timeout().await;
+                    }
+                } else if timer_payload == ui::state::HIDE_STATUS_EVENT {
                     ui::hide_status();
                 } else if timer_payload == ui::state::HIDE_APP_DATA_STATUS_EVENT {
                     ui::hide_app_data_status();

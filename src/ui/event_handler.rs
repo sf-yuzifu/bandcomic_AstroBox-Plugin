@@ -639,6 +639,7 @@ fn handle_chapter_del_file(chapter_index: usize, file_index: usize) {
 }
 
 async fn handle_chapter_upload(chapter_index: usize) {
+    if crate::jobs::is_busy() || PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return; }
     // Reuse the same connection flow
     let comic_name;
     let chapter_data;
@@ -694,8 +695,8 @@ async fn handle_chapter_upload(chapter_index: usize) {
                     let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
                     state.watch_http_import
                 };
-                if crate::http_server::status().bound && http_capable {
-                    start_http_import_task(device_addr, settings_opt).await;
+                if http_capable {
+                    prepare_http_import(device_addr, settings_opt, Some(chapter_index)).await;
                 } else {
                     chapter_upload_continue(
                         comic_name,
@@ -708,7 +709,27 @@ async fn handle_chapter_upload(chapter_index: usize) {
     );
 }
 
-async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchSettings>) {
+type PendingHttpImport = (String, Option<WatchSettings>, Option<usize>);
+static PENDING_HTTP_IMPORT: std::sync::Mutex<Option<PendingHttpImport>> = std::sync::Mutex::new(None);
+
+pub async fn http_bind_timeout() {
+    let had_pending = PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take().is_some();
+    if had_pending {
+        show_upload_status(StatusState::Error("设备连接超时，请检查地址后重试".into())).await;
+    }
+}
+
+async fn prepare_http_import(device_addr: String, settings: Option<WatchSettings>, chapter: Option<usize>) {
+    if crate::http_server::status().advertised_ip.is_empty() {
+        show_upload_status(StatusState::Error("请在上传页填写本机 IPv4 地址后重试".into())).await;
+        return;
+    }
+    *PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()) = Some((device_addr, settings, chapter));
+    crate::http_server::start().await;
+    crate::http_server::bind_device().await;
+}
+
+async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchSettings>, chapter_index: Option<usize>) {
     let watch_settings = settings_opt.unwrap_or_else(current_watch_settings);
     let catalog = crate::local_source::get_catalog();
     if catalog.is_empty() {
@@ -716,7 +737,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         return;
     }
 
-    let comic = &catalog[0];
+    let comic = crate::local_source::publish(catalog.into_iter().next().unwrap());
     let endpoint = crate::http_server::status().url.unwrap_or_default();
     let advertised_ip = crate::http_server::status().advertised_ip;
     let port = crate::http_server::status().port.unwrap_or(0);
@@ -729,6 +750,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
     let chapters = comic
         .chapters
         .iter()
+        .filter(|c| chapter_index.map(|i| c.chapter_number == i + 1).unwrap_or(true))
         .map(|c| crate::jobs::TaskChapter {
             chapter_num: c.chapter_number,
             title: c.title.clone(),
@@ -756,6 +778,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         chapters,
         cover_url,
         image_profile,
+        comic.chapters.iter().map(|c| c.chapter_number).max().unwrap_or(1),
     );
 
     let session = crate::http_server::status()
@@ -897,6 +920,7 @@ fn reset_upload_progress() {
 }
 
 async fn handle_upload_start() {
+    if crate::jobs::is_busy() || PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return; }
     reset_upload_progress();
 
     let upload_mode;
@@ -955,8 +979,8 @@ async fn handle_upload_start() {
                     let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
                     state.watch_http_import
                 };
-                if crate::http_server::status().bound && http_capable {
-                    start_http_import_task(device_addr, settings_opt).await;
+                if http_capable {
+                    prepare_http_import(device_addr, settings_opt, None).await;
                 } else {
                     upload_start_continue(device_addr).await;
                 }
@@ -3190,7 +3214,15 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             }
         }
         Some("gateway_bind_result") => {
-            crate::http_server::handle_bind_result(&parsed);
+            if !crate::http_server::handle_bind_result(&parsed) { return; }
+            let pending = PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some((addr, settings, chapter)) = pending {
+                if crate::http_server::status().bound {
+                    start_http_import_task(addr, settings, chapter).await;
+                } else {
+                    show_upload_status(StatusState::Error("本地连接失败，请检查地址后重新上传".into())).await;
+                }
+            }
         }
         _ => {
             tracing::info!("收到未处理的消息类型: {:?}", msg_type);

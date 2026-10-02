@@ -84,18 +84,48 @@ impl QueryParams {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalChapterData {
     pub chapter_number: usize,
     pub title: String,
-    pub pages: Vec<Vec<u8>>,
+    pub pages: Vec<LocalAsset>,
 }
 
+#[derive(Clone)]
+pub enum LocalAsset { Disk(String), Memory(Vec<u8>) }
+impl LocalAsset {
+    fn read(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Disk(path) => crate::assets::read_master(path),
+            Self::Memory(bytes) => Ok(bytes.clone()),
+        }
+    }
+    fn from_upload(file: &crate::ui::state::UploadFile) -> Self {
+        match &file.disk_path {
+            Some(path) => Self::Disk(path.clone()),
+            None => Self::Memory(file.data.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct LocalComicData {
     pub id: String,
     pub name: String,
-    pub cover: Option<Vec<u8>>,
+    pub cover: Option<LocalAsset>,
     pub chapters: Vec<LocalChapterData>,
     pub revision: String,
+}
+
+static PUBLISHED: std::sync::Mutex<Vec<LocalComicData>> = std::sync::Mutex::new(Vec::new());
+
+pub fn publish(mut comic: LocalComicData) -> LocalComicData {
+    comic.id = format!("book_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    comic.revision = comic.id.clone();
+    let mut published = PUBLISHED.lock().unwrap_or_else(|p| p.into_inner());
+    if published.len() >= 32 { published.remove(0); }
+    published.push(comic.clone());
+    comic
 }
 
 impl LocalComicData {
@@ -116,21 +146,23 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                 if item.files.is_empty() {
                     continue;
                 }
-                let name = if item.comic_name.trim().is_empty() {
+                let name = if !state.upload_comic_name_input.trim().is_empty() {
+                    state.upload_comic_name_input.trim().to_string()
+                } else if item.comic_name.trim().is_empty() {
                     format!("本地漫画 {}", i + 1)
                 } else {
                     item.comic_name.clone()
                 };
                 let id = format!("single_{}", i + 1);
-                let pages: Vec<Vec<u8>> = item
+                let pages: Vec<LocalAsset> = item
                     .files
                     .iter()
-                    .filter_map(|f| f.get_master_data().ok())
+                    .map(LocalAsset::from_upload)
                     .collect();
                 let cover = item
                     .cover
                     .as_ref()
-                    .and_then(|c| c.get_master_data().ok());
+                    .map(LocalAsset::from_upload);
                 comics.push(LocalComicData {
                     id,
                     name,
@@ -162,10 +194,10 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                     } else {
                         chapter.name.clone()
                     };
-                    let pages: Vec<Vec<u8>> = chapter
+                    let pages: Vec<LocalAsset> = chapter
                         .files
                         .iter()
-                        .filter_map(|f| f.get_master_data().ok())
+                        .map(LocalAsset::from_upload)
                         .collect();
                     chapters.push(LocalChapterData {
                         chapter_number: ci + 1,
@@ -176,7 +208,7 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                 let cover = state
                     .multi_cover
                     .as_ref()
-                    .and_then(|c| c.get_master_data().ok());
+                    .map(LocalAsset::from_upload);
                 comics.push(LocalComicData {
                     id: "multi_1".to_string(),
                     name,
@@ -194,17 +226,17 @@ pub fn get_catalog() -> Vec<LocalComicData> {
             comics.push(LocalComicData {
                 id: "sample_book".to_string(),
                 name: "本地示例漫画".to_string(),
-                cover: Some(samples.png.clone()),
+                cover: Some(LocalAsset::Memory(samples.png.clone())),
                 chapters: vec![
                     LocalChapterData {
                         chapter_number: 1,
                         title: "第一章 探针".to_string(),
-                        pages: vec![samples.png.clone(), samples.jpeg.clone()],
+                        pages: vec![LocalAsset::Memory(samples.png.clone()), LocalAsset::Memory(samples.jpeg.clone())],
                     },
                     LocalChapterData {
                         chapter_number: 2,
                         title: "第二章 彩页".to_string(),
-                        pages: vec![samples.jpeg.clone()],
+                        pages: vec![LocalAsset::Memory(samples.jpeg.clone())],
                     },
                 ],
                 revision: "rev_sample_01".to_string(),
@@ -343,7 +375,11 @@ pub fn route_local(
         ));
     }
 
-    let catalog = get_catalog();
+    let published = PUBLISHED.lock().unwrap_or_else(|p| p.into_inner());
+    let requested_id = path.split('/').nth(3).unwrap_or("");
+    let found = published.iter().find(|c| c.id == requested_id).cloned();
+    drop(published);
+    let catalog = if let Some(comic) = found { vec![comic] } else { get_catalog() };
 
     // 2. GET /local/search/<text>/<page>
     if let Some(rest) = path.strip_prefix("/local/search/") {
@@ -406,7 +442,7 @@ pub fn route_local(
             };
             let params = QueryParams::parse(query);
             // 封面不生成 LVGL indexed-8，保持普通图片格式
-            return match process_image(cover_bytes, &params, false) {
+            return match cover_bytes.read().and_then(|bytes| process_image(&bytes, &params, false)) {
                 Ok((body, content_type)) => Some(ProbeResponse {
                     status: 200,
                     headers: vec![
@@ -441,7 +477,7 @@ pub fn route_local(
                 "page_count": comic.total_pages(),
                 "cover": cover_url,
                 "tags": ["本地漫画"],
-                "total_chapters": comic.chapters.len().max(1)
+                "total_chapters": comic.chapters.iter().map(|ch| ch.chapter_number).max().unwrap_or(1)
             }),
         ));
     }
@@ -478,7 +514,7 @@ pub fn route_local(
             let page_bytes = &chapter.pages[page_idx - 1];
             let params = QueryParams::parse(query);
 
-            return match process_image(page_bytes, &params, true) {
+            return match page_bytes.read().and_then(|bytes| process_image(&bytes, &params, true)) {
                 Ok((body, content_type)) => Some(ProbeResponse {
                     status: 200,
                     headers: vec![
@@ -535,6 +571,66 @@ pub fn route_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_cover_is_independent_of_pages_and_later_uploads() {
+        fn png(color: [u8; 3]) -> Vec<u8> {
+            let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(96, 128, image::Rgb(color)));
+            let mut buffer = Cursor::new(Vec::new());
+            image.write_to(&mut buffer, ImageFormat::Png).unwrap();
+            buffer.into_inner()
+        }
+        let red = png([255, 0, 0]);
+        let blue = png([0, 0, 255]);
+        let mut draft = LocalComicData {
+            id: "cover_test".into(),
+            name: "Same name".into(),
+            cover: Some(LocalAsset::Memory(red)),
+            chapters: vec![LocalChapterData {
+                chapter_number: 1,
+                title: "Chapter".into(),
+                pages: vec![LocalAsset::Memory(blue.clone())],
+            }],
+            revision: "draft".into(),
+        };
+        let first = publish(draft.clone());
+        draft.cover = Some(LocalAsset::Memory(blue));
+        let second = publish(draft);
+        let base = "http://192.168.1.100:51963";
+        for (comic, expected) in [(&first, [255, 0, 0]), (&second, [0, 0, 255])] {
+            let response = route_local("GET", &format!("/local/album/{}/cover", comic.id),
+                "width=80&ifPNG=1&ifLVGL=1", base).unwrap();
+            assert_eq!(response.status, 200);
+            assert!(response.headers.contains(&("Content-Type".into(), "image/png".into())));
+            let image = image::load_from_memory(&response.body).unwrap().to_rgb8();
+            assert_eq!(image.width(), 80);
+            assert_eq!(image.get_pixel(0, 0).0, expected);
+        }
+        let response = route_local("GET", &format!("/local/photo/{}/chapter/1/1.jpg", first.id),
+            "width=80&ifPNG=1", base).unwrap();
+        assert_eq!(response.status, 200);
+        let image = image::load_from_memory(&response.body).unwrap().to_rgb8();
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+    }
+
+    #[test]
+    fn sparse_chapter_detail_keeps_real_chapter_numbers_and_optional_cover() {
+        let comic = publish(LocalComicData {
+            id: "sparse_test".into(), name: "Sparse".into(), cover: None,
+            revision: "draft".into(),
+            chapters: vec![LocalChapterData {
+                chapter_number: 5, title: "Fifth".into(),
+                pages: vec![LocalAsset::Memory(samples().unwrap().png.clone())],
+            }],
+        });
+        let response = route_local("GET", &format!("/local/album/{}", comic.id), "", "http://host:1234").unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(detail["total_chapters"], 5);
+        assert_eq!(detail["page_count"], 1);
+        assert_eq!(detail["cover"], "");
+        let chapter = route_local("GET", &format!("/local/photo/{}/chapter/5", comic.id), "", "http://host:1234").unwrap();
+        assert_eq!(chapter.status, 200);
+    }
 
     #[test]
     fn query_params_parsing_handles_defaults_and_clamps() {
