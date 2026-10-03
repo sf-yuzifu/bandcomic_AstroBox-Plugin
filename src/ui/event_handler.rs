@@ -24,7 +24,73 @@ pub async fn ui_event_processor(
         event_payload
     );
 
+    // Pending picks and active uploads own the draft until they finish.
+    // Navigation stays available to return to the result overview.
+    let edits_upload = matches!(event_id,
+        UPLOAD_NAME_INPUT_EVENT | UPLOAD_MODE_SINGLE_EVENT | UPLOAD_MODE_MULTI_EVENT |
+        UPLOAD_PICK_FILES_EVENT | UPLOAD_PICK_COVER_EVENT | UPLOAD_PICK_MULTI_COVER_EVENT |
+        UPLOAD_START_EVENT | UPLOAD_CLEAR_EVENT | UPLOAD_ADD_CHAPTER_EVENT |
+        UPLOAD_COVER_FIRST_EVENT | UPLOAD_COVER_NONE_EVENT)
+        || [UPLOAD_MOVE_UP_PREFIX, UPLOAD_MOVE_DOWN_PREFIX, UPLOAD_DELETE_PREFIX,
+            CHAPTER_PICK_FILES_PREFIX, CHAPTER_UPLOAD_PREFIX, CHAPTER_CLEAR_PREFIX,
+            CHAPTER_DELETE_PREFIX, CHAPTER_MOVE_UP_PREFIX, CHAPTER_MOVE_DOWN_PREFIX,
+            CHAPTER_DEL_FILE_PREFIX, CHAPTER_NAME_INPUT_PREFIX]
+            .iter().any(|prefix| event_id.starts_with(prefix));
+    if edits_upload && ui_state().read().unwrap_or_else(|p| p.into_inner()).upload_locked() {
+        return;
+    }
+
     match event_id {
+        UPLOAD_OVERVIEW_EVENT => open_upload_view(UploadView::Overview),
+        UPLOAD_INFO_EVENT => open_upload_view(UploadView::Info),
+        UPLOAD_PAGES_EVENT => open_upload_view(UploadView::Pages(None)),
+        UPLOAD_COVER_EVENT => open_upload_view(UploadView::Cover),
+        UPLOAD_CONNECTION_EVENT => open_upload_view(UploadView::Connection),
+        UPLOAD_COVER_FIRST_EVENT | UPLOAD_COVER_NONE_EVENT => {
+            let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+            let follows = event_id == UPLOAD_COVER_FIRST_EVENT;
+            if state.upload_mode == UploadMode::Single {
+                state.single_cover_follows_first = follows;
+                if !follows {
+                    if let Some(item) = state.upload_items.first_mut() { item.cover = None; }
+                }
+            } else {
+                state.multi_cover_follows_first = follows;
+                if !follows { state.multi_cover = None; }
+            }
+            state.refresh_auto_covers();
+            drop(state);
+            rerender_upload_ui();
+        }
+        UPLOAD_PAGE_PREV_EVENT | UPLOAD_PAGE_NEXT_EVENT |
+        COMIC_PAGE_PREV_EVENT | COMIC_PAGE_NEXT_EVENT |
+        SOURCE_PAGE_PREV_EVENT | SOURCE_PAGE_NEXT_EVENT => {
+            let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+            let (cursor, total, forward) = match event_id {
+                COMIC_PAGE_PREV_EVENT | COMIC_PAGE_NEXT_EVENT =>
+                    (state.comic_page_cursor, state.app_comics.len(), event_id == COMIC_PAGE_NEXT_EVENT),
+                SOURCE_PAGE_PREV_EVENT | SOURCE_PAGE_NEXT_EVENT =>
+                    (state.source_page_cursor, state.app_sources.len(), event_id == SOURCE_PAGE_NEXT_EVENT),
+                _ => {
+                    let total = match state.upload_view {
+                        UploadView::Overview if state.upload_mode == UploadMode::Multi => state.upload_chapters.len(),
+                        UploadView::Pages(Some(index)) => state.upload_chapters.get(index).map(|c| c.files.len()).unwrap_or(0),
+                        _ => state.upload_items.iter().map(|i| i.files.len()).sum(),
+                    };
+                    (state.upload_page_cursor, total, event_id == UPLOAD_PAGE_NEXT_EVENT)
+                }
+            };
+            let current = page_window(cursor, total).0 / PAGE_WINDOW;
+            let next = if forward { (current + 1).min(total.saturating_sub(1) / PAGE_WINDOW) }
+                else { current.saturating_sub(1) };
+            match event_id {
+                COMIC_PAGE_PREV_EVENT | COMIC_PAGE_NEXT_EVENT => state.comic_page_cursor = next,
+                SOURCE_PAGE_PREV_EVENT | SOURCE_PAGE_NEXT_EVENT => state.source_page_cursor = next,
+                _ => state.upload_page_cursor = next,
+            }
+            drop(state);
+            rerender_upload_ui();
+        }
         crate::http_server::START_EVENT => crate::http_server::start().await,
         crate::http_server::STOP_EVENT => crate::http_server::stop().await,
         crate::http_server::IP_INPUT_EVENT => {
@@ -98,7 +164,8 @@ pub async fn ui_event_processor(
                 let mut state = ui_state()
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.upload_mode = UploadMode::Single;
+                    state.upload_mode = UploadMode::Single;
+                    state.upload_page_cursor = 0;
             }
             switch_tab(TabPage::Upload);
         }
@@ -107,7 +174,8 @@ pub async fn ui_event_processor(
                 let mut state = ui_state()
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.upload_mode = UploadMode::Multi;
+                    state.upload_mode = UploadMode::Multi;
+                    state.upload_page_cursor = 0;
             }
             switch_tab(TabPage::Upload);
         }
@@ -121,7 +189,9 @@ pub async fn ui_event_processor(
         }
         UPLOAD_CLEAR_EVENT => {
             tracing::info!("清空列表按钮被点击");
-            handle_upload_clear();
+            if confirm_clear("清空整理内容", "清空当前书名、封面和图片列表。设备上已保存的漫画不受影响。").await {
+                handle_upload_clear();
+            }
         }
         UPLOAD_ADD_CHAPTER_EVENT => {
             tracing::info!("添加章节按钮被点击");
@@ -149,7 +219,11 @@ pub async fn ui_event_processor(
             handle_fetch_app_data().await;
         }
         _ => {
-            if let Some(index_str) = event_id.strip_prefix(UPLOAD_MOVE_UP_PREFIX) {
+            if let Some(index_str) = event_id.strip_prefix(CHAPTER_EDIT_PREFIX) {
+                if let Ok(index) = index_str.parse::<usize>() {
+                    open_upload_view(UploadView::Pages(Some(index)));
+                }
+            } else if let Some(index_str) = event_id.strip_prefix(UPLOAD_MOVE_UP_PREFIX) {
                 if let Ok(index) = index_str.parse::<usize>() {
                     handle_upload_move(index, -1);
                 }
@@ -177,7 +251,9 @@ pub async fn ui_event_processor(
                 }
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_DELETE_PREFIX) {
                 if let Ok(chapter_index) = index_str.parse::<usize>() {
-                    handle_chapter_delete_chapter(chapter_index);
+                    if confirm_clear("删除章节", "移除这一章的整理内容，其他章节和设备上已保存的内容保留。").await {
+                        handle_chapter_delete_chapter(chapter_index);
+                    }
                 }
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_MOVE_UP_PREFIX) {
                 // format: chapter_move_up_{chapter_index}_{file_index}
@@ -219,6 +295,23 @@ pub async fn ui_event_processor(
             }
         }
     }
+}
+
+fn open_upload_view(view: UploadView) {
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    state.upload_view = view;
+    state.upload_page_cursor = 0;
+    drop(state);
+    rerender_upload_ui();
+}
+
+async fn confirm_clear(title: &str, content: &str) -> bool {
+    dialog::show_dialog(dialog::DialogType::Alert, dialog::DialogStyle::Website, dialog::DialogInfo {
+        title: title.into(), content: content.into(), buttons: vec![
+            dialog::DialogButton { id: "cancel".into(), primary: false, content: "取消".into() },
+            dialog::DialogButton { id: "confirm".into(), primary: true, content: "确认".into() },
+        ],
+    }).await.clicked_btn_id == "confirm"
 }
 
 fn switch_tab(tab: TabPage) {
@@ -265,10 +358,8 @@ async fn show_upload_status(status: StatusState) {
 
         state.upload_status = status.clone();
 
-        if matches!(&status, StatusState::Success(_) | StatusState::Error(_)) {
-            let timer_id = timer::set_timeout(5000, HIDE_UPLOAD_STATUS_EVENT);
-            state.upload_status_timer_id = Some(timer_id);
-        }
+        // Keep results visible until the next action.
+        state.upload_status_timer_id = None;
 
         root_id = state.root_element_id.clone();
     }
@@ -335,6 +426,7 @@ async fn pick_and_stash(target: PickTarget, multiple: bool) {
         return;
     }
 
+    show_upload_status(StatusState::Processing("正在整理选中的图片…".into())).await;
     {
         let mut state = ui_state()
             .write()
@@ -391,7 +483,7 @@ pub fn handle_pick_process() {
         match pick.target {
             PickTarget::UploadItem => {
                 let comic_name = if state.upload_comic_name_input.trim().is_empty() {
-                    pick.name.rsplit('.').nth(1).unwrap_or(&pick.name).to_string()
+                    pick.name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&pick.name).to_string()
                 } else {
                     state.upload_comic_name_input.trim().to_string()
                 };
@@ -400,32 +492,12 @@ pub fn handle_pick_process() {
                         if state.upload_comic_name_input.trim().is_empty() {
                             state.upload_comic_name_input = comic_name.clone();
                         }
-                        let mut found = false;
-                        let file_name = file.name.clone();
-                        for item in state.upload_items.iter_mut() {
-                            if item.comic_name == comic_name {
-                                item.files.push(file.clone());
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            let display_name =
-                                if state.upload_comic_name_input.trim().is_empty() {
-                                    file_name
-                                } else {
-                                    state.upload_comic_name_input.trim().to_string()
-                                };
-                            let mut item = UploadItem {
-                                comic_name: display_name,
-                                cover: None,
-                                files: vec![file],
-                            };
-                            // first file becomes cover
-                            if !item.files.is_empty() {
-                                item.cover = Some(item.files.remove(0));
-                            }
-                            state.upload_items.push(item);
+                        // Keep one editable book even after changing its name.
+                        // An automatic cover references the first body page.
+                        if let Some(item) = state.upload_items.first_mut() {
+                            item.files.push(file);
+                        } else {
+                            state.upload_items.push(UploadItem { comic_name, cover: None, files: vec![file] });
                         }
                     }
                     UploadMode::Multi => {
@@ -449,14 +521,21 @@ pub fn handle_pick_process() {
                 }
             }
             PickTarget::CoverSingle => {
+                state.single_cover_follows_first = false;
                 if let Some(first) = state.upload_items.first_mut() {
                     first.cover = Some(file);
+                } else {
+                    let name = state.upload_comic_name_input.clone();
+                    state.upload_items.push(UploadItem { comic_name: name, cover: Some(file), files: vec![] });
                 }
             }
             PickTarget::CoverMulti => {
+                state.multi_cover_follows_first = false;
                 state.multi_cover = Some(file);
             }
         }
+        state.refresh_auto_covers();
+        state.upload_status = StatusState::Default;
     }
 
     rerender_upload_ui();
@@ -521,12 +600,7 @@ fn handle_upload_move(index: usize, direction: i32) {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let new_index = (index as i32 + direction) as usize;
-        if new_index >= state.upload_items.len() {
-            return;
-        }
-
-        state.upload_items.swap(index, new_index);
+        state.move_single_page(index, direction);
     }
 
     rerender_upload_ui();
@@ -538,11 +612,7 @@ fn handle_upload_delete(index: usize) {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if index >= state.upload_items.len() {
-            return;
-        }
-
-        state.upload_items.remove(index);
+        state.delete_single_page(index);
     }
 
     rerender_upload_ui();
@@ -559,6 +629,11 @@ fn handle_upload_clear() {
         state.upload_progress = 0.0;
         state.upload_current_file = String::new();
         state.upload_status = StatusState::Default;
+        state.upload_comic_name_input.clear();
+        state.single_cover_follows_first = true;
+        state.multi_cover_follows_first = true;
+        state.upload_view = UploadView::Overview;
+        state.upload_page_cursor = 0;
     }
 
     rerender_upload_ui();
@@ -570,6 +645,8 @@ fn handle_add_chapter() {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.upload_chapters.push(ChapterItem::default());
+        state.upload_view = UploadView::Pages(Some(state.upload_chapters.len() - 1));
+        state.upload_page_cursor = 0;
     }
     rerender_upload_ui();
 }
@@ -592,6 +669,7 @@ fn handle_chapter_clear(chapter_index: usize) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if chapter_index < state.upload_chapters.len() {
             state.upload_chapters[chapter_index].files.clear();
+            state.refresh_auto_covers();
         }
     }
     rerender_upload_ui();
@@ -604,6 +682,9 @@ fn handle_chapter_delete_chapter(chapter_index: usize) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if chapter_index < state.upload_chapters.len() {
             state.upload_chapters.remove(chapter_index);
+            state.refresh_auto_covers();
+            state.upload_view = UploadView::Overview;
+            state.upload_page_cursor = 0;
         }
     }
     rerender_upload_ui();
@@ -626,6 +707,7 @@ fn handle_chapter_move_file(chapter_index: usize, file_index: usize, direction: 
         }
 
         chapter.files.swap(file_index, new_index);
+        state.refresh_auto_covers();
     }
     rerender_upload_ui();
 }
@@ -645,6 +727,7 @@ fn handle_chapter_del_file(chapter_index: usize, file_index: usize) {
             return;
         }
         chapter.files.remove(file_index);
+        state.refresh_auto_covers();
     }
     rerender_upload_ui();
 }
@@ -682,7 +765,8 @@ async fn handle_chapter_upload(chapter_index: usize) {
         chapter_data = (ch_name, chapter.files.clone());
     }
 
-    show_upload_status(StatusState::Processing("正在连接快应用...".to_string())).await;
+    open_upload_view(UploadView::Overview);
+    show_upload_status(StatusState::Processing("正在连接设备上的腕上漫画…".to_string())).await;
 
     let progress = upload_progress();
     let device_addr = match handshake::prepare_launch(handshake::MIN_UPLOAD_VERSION, &progress).await {
@@ -804,7 +888,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
     .to_string();
 
     show_upload_status(StatusState::Processing(format!(
-        "已派发 HTTP 导入任务，手环正在原生下载《{}》...",
+        "任务已发送，等待设备保存《{}》…",
         comic.name
     )))
     .await;
@@ -932,6 +1016,12 @@ fn reset_upload_progress() {
 async fn handle_upload_start() {
     if crate::jobs::is_busy() || PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return; }
     reset_upload_progress();
+    let empty = ui_state().read().unwrap_or_else(|p| p.into_inner()).page_count() == 0;
+    if empty {
+        show_upload_status(StatusState::Error("请先添加至少一页正文，封面不计入正文。".into())).await;
+        return;
+    }
+    open_upload_view(UploadView::Overview);
 
     let upload_mode;
     let (is_single, items, chapters);
@@ -1327,7 +1417,7 @@ async fn send_next_chunk() {
     }
 }
 
-/// 全部确认完成：清会话、发 import_comic_done、报成功（逐片/窗口两种模式共用）
+/// 传输完成：清会话、发送 done，并明确设备保存结果尚待核实。
 async fn complete_upload(device_addr: String, comic_name: String) {
     {
         let mut state = ui_state()
@@ -1356,8 +1446,10 @@ async fn complete_upload(device_addr: String, comic_name: String) {
         interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), done_str).await
     {
         tracing::error!("发送完成消息失败: {:?}", e);
+        show_upload_status(StatusState::Error("图片已传输，但收尾消息发送失败，请在设备书架核实后重试。".into())).await;
+        return;
     }
-    show_upload_status(StatusState::Success("上传完成！".to_string())).await;
+    show_upload_status(StatusState::Success("图片已发送，设备保存结果待核实。请在设备书架查看。".to_string())).await;
 }
 
 /// 依据快应用握手协商的导入窗口能力构建窗口会话；

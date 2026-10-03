@@ -115,7 +115,7 @@ pub fn update_progress(task_id: &str, page: usize, total: usize) {
         task.saved_pages = task.saved_pages.max(page.min(task.total_pages));
         task.status = "downloading".to_string();
 
-        let progress_str = format!("手环正在原生下载: {}/{} 页", page, total);
+        let progress_str = format!("设备正在保存: {}/{} 页", page, total);
         let mut ustate = ui_state().write().unwrap_or_else(|p| p.into_inner());
         ustate.upload_progress = if total > 0 {
             page as f32 / total as f32

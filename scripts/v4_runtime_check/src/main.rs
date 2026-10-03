@@ -604,7 +604,7 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(task_detail["taskId"], task_id);
         let book_id = task_detail["comicId"].as_str().unwrap();
         assert!(book_id.starts_with("book_"));
-        assert_eq!(task_detail["totalPages"], 4);
+        assert_eq!(task_detail["totalPages"], 5);
         assert_eq!(task_detail["coverUrl"], format!("http://127.0.0.1:{}/local/album/{book_id}/cover", identity["port"]));
         let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
         let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
@@ -621,11 +621,13 @@ async fn main() -> wasmtime::Result<()> {
         let cover_before = http.call_handle(accessor, 1, req_query(&cover_path, "width=80&ifPNG=1")).await?;
         assert_eq!(cover_before.status, 200);
         let mut image_bodies = vec![cover_before.body.clone()];
-        for page in 1..=4 {
+        for page in 1..=5 {
             let image = http.call_handle(accessor, 1,
                 req_query(&format!("/local/photo/{book_id}/chapter/1/{page}.jpg"), "width=80&ifPNG=1")).await?;
             assert_eq!(image.status, 200);
-            assert!(!image_bodies.contains(&image.body), "cover/page {page} content must remain distinct");
+            if page > 1 {
+                assert!(!image_bodies.contains(&image.body), "distinct pages must have distinct content");
+            }
             image_bodies.push(image.body);
         }
         let cover_after = http.call_handle(accessor, 1, req_query(&cover_path, "width=80&ifPNG=1")).await?;
@@ -637,7 +639,7 @@ async fn main() -> wasmtime::Result<()> {
             path: format!("/control/tasks/{}/progress", task_id),
             query: "".into(),
             headers: vec![],
-            body: serde_json::json!({ "page": 1, "total": 4 }).to_string().into_bytes(),
+            body: serde_json::json!({ "page": 1, "total": 5 }).to_string().into_bytes(),
         };
         let prog_resp = http.call_handle(accessor, 1, prog_req).await?;
         assert_eq!(prog_resp.status, 200);
@@ -648,7 +650,7 @@ async fn main() -> wasmtime::Result<()> {
             path: format!("/control/tasks/{}/result", task_id),
             query: "".into(),
             headers: vec![],
-            body: serde_json::json!({ "success": true, "savedPages": 4, "totalPages": 4 }).to_string().into_bytes(),
+            body: serde_json::json!({ "success": true, "savedPages": 5, "totalPages": 5 }).to_string().into_bytes(),
         };
         let res_resp = http.call_handle(accessor, 1, res_req).await?;
         assert_eq!(res_resp.status, 200);

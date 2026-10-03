@@ -3,6 +3,8 @@ pub mod message;
 pub mod build;
 pub mod event_handler;
 pub mod handshake;
+pub mod theme;
+pub mod upload;
 
 use tracing;
 

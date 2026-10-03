@@ -155,6 +155,23 @@ pub enum UploadMode {
     Multi,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadView {
+    Overview,
+    Info,
+    Pages(Option<usize>),
+    Cover,
+    Connection,
+}
+
+pub const PAGE_WINDOW: usize = 8;
+
+pub fn page_window(cursor: usize, total: usize) -> (usize, usize) {
+    let last = total.saturating_sub(1) / PAGE_WINDOW;
+    let start = cursor.min(last) * PAGE_WINDOW;
+    (start, (start + PAGE_WINDOW).min(total))
+}
+
 /// 图片选择目标（对话框返回后暂存，处理推迟到定时器事件）
 #[derive(Debug, Clone, Copy)]
 pub enum PickTarget {
@@ -248,6 +265,12 @@ pub struct UiState {
     pub upload_chapters: Vec<ChapterItem>,
     pub upload_comic_name_input: String,
     pub upload_mode: UploadMode,
+    pub upload_view: UploadView,
+    pub upload_page_cursor: usize,
+    pub comic_page_cursor: usize,
+    pub source_page_cursor: usize,
+    pub single_cover_follows_first: bool,
+    pub multi_cover_follows_first: bool,
     pub multi_cover: Option<UploadFile>,
     pub upload_progress: f32,
     pub upload_current_file: String,
@@ -279,8 +302,12 @@ pub struct UiState {
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
 
 pub fn ui_state() -> &'static RwLock<UiState> {
-    UI_STATE.get_or_init(|| {
-        RwLock::new(UiState {
+    UI_STATE.get_or_init(|| RwLock::new(UiState::default()))
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
             root_element_id: None,
             config: PluginConfig::default(),
             fetched_source_name: None,
@@ -288,7 +315,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             current_status: StatusState::Default,
             status_timer_id: None,
             pending_domain_fetch: None,
-            current_tab: TabPage::Sync,
+            current_tab: TabPage::Upload,
             app_comic_count: None,
             app_source_count: None,
             app_comics: Vec::new(),
@@ -306,6 +333,12 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             upload_chapters: Vec::new(),
             upload_comic_name_input: String::new(),
             upload_mode: UploadMode::Single,
+            upload_view: UploadView::Overview,
+            upload_page_cursor: 0,
+            comic_page_cursor: 0,
+            source_page_cursor: 0,
+            single_cover_follows_first: true,
+            multi_cover_follows_first: true,
             multi_cover: None,
             upload_progress: 0.0,
             upload_current_file: String::new(),
@@ -322,8 +355,8 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             pending_pick: None,
             watch_http_import: false,
             watch_http_data_sync: false,
-        })
-    })
+        }
+    }
 }
 
 pub const DOMAIN_INPUT_CHANGE_EVENT: &str = "domain_input_change";
@@ -387,3 +420,112 @@ pub const CHAPTER_DEL_FILE_PREFIX: &str = "chapter_del_file_";
 
 // 多章节封面（整本书一个）
 pub const UPLOAD_PICK_MULTI_COVER_EVENT: &str = "upload_pick_multi_cover";
+
+pub const UPLOAD_OVERVIEW_EVENT: &str = "upload_overview";
+pub const UPLOAD_INFO_EVENT: &str = "upload_info";
+pub const UPLOAD_PAGES_EVENT: &str = "upload_pages";
+pub const UPLOAD_COVER_EVENT: &str = "upload_cover";
+pub const UPLOAD_CONNECTION_EVENT: &str = "upload_connection";
+pub const UPLOAD_COVER_FIRST_EVENT: &str = "upload_cover_first";
+pub const UPLOAD_COVER_NONE_EVENT: &str = "upload_cover_none";
+pub const UPLOAD_PAGE_PREV_EVENT: &str = "upload_page_prev";
+pub const UPLOAD_PAGE_NEXT_EVENT: &str = "upload_page_next";
+pub const CHAPTER_EDIT_PREFIX: &str = "chapter_edit_";
+pub const COMIC_PAGE_PREV_EVENT: &str = "comic_page_prev";
+pub const COMIC_PAGE_NEXT_EVENT: &str = "comic_page_next";
+pub const SOURCE_PAGE_PREV_EVENT: &str = "source_page_prev";
+pub const SOURCE_PAGE_NEXT_EVENT: &str = "source_page_next";
+
+impl UiState {
+    pub fn upload_locked(&self) -> bool {
+        self.pending_pick.is_some() || matches!(self.upload_status, StatusState::Processing(_))
+    }
+
+    pub fn page_count(&self) -> usize {
+        match self.upload_mode {
+            UploadMode::Single => self.upload_items.iter().map(|i| i.files.len()).sum(),
+            UploadMode::Multi => self.upload_chapters.iter().map(|c| c.files.len()).sum(),
+        }
+    }
+
+    pub fn single_page_location(&self, mut index: usize) -> Option<(usize, usize)> {
+        for (item, entry) in self.upload_items.iter().enumerate() {
+            if index < entry.files.len() { return Some((item, index)); }
+            index -= entry.files.len();
+        }
+        None
+    }
+
+    pub fn move_single_page(&mut self, index: usize, direction: i32) {
+        let Some(next) = index.checked_add_signed(direction as isize) else { return; };
+        let (Some((item, page)), Some((other, next_page))) =
+            (self.single_page_location(index), self.single_page_location(next)) else { return; };
+        if item == other {
+            self.upload_items[item].files.swap(page, next_page);
+        } else {
+            let replacement = self.upload_items[other].files[next_page].clone();
+            let previous = std::mem::replace(&mut self.upload_items[item].files[page], replacement);
+            self.upload_items[other].files[next_page] = previous;
+        }
+        self.refresh_auto_covers();
+    }
+
+    pub fn delete_single_page(&mut self, index: usize) {
+        if let Some((item, page)) = self.single_page_location(index) {
+            self.upload_items[item].files.remove(page);
+            self.refresh_auto_covers();
+        }
+    }
+
+    pub fn refresh_auto_covers(&mut self) {
+        if self.single_cover_follows_first {
+            let first = self.upload_items.iter().flat_map(|i| &i.files).next().cloned();
+            if let Some(item) = self.upload_items.first_mut() { item.cover = first; }
+        }
+        if self.multi_cover_follows_first {
+            self.multi_cover = self.upload_chapters.iter().flat_map(|c| &c.files).next().cloned();
+        }
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    fn file(name: &str) -> UploadFile {
+        UploadFile { name: name.into(), disk_path: None, data: vec![1], size: 1,
+            original_size: 1, thumbnail: vec![] }
+    }
+
+    #[test]
+    fn page_edit_preserves_book_and_tracks_cover_without_removing_body() {
+        let mut state = UiState::default();
+        state.upload_items = vec![UploadItem { comic_name: "测试书".into(), cover: None,
+            files: vec![file("1"), file("2"), file("3")] }];
+        state.single_cover_follows_first = true;
+        state.refresh_auto_covers();
+        assert_eq!(state.upload_items[0].files.len(), 3);
+        assert_eq!(state.upload_items[0].cover.as_ref().unwrap().name, "1");
+        state.move_single_page(1, -1);
+        assert_eq!(state.upload_items[0].cover.as_ref().unwrap().name, "2");
+        state.delete_single_page(0);
+        assert_eq!(state.upload_items[0].comic_name, "测试书");
+        assert_eq!(state.upload_items[0].files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["1", "3"]);
+        state.single_cover_follows_first = false;
+        state.upload_items[0].cover = Some(file("独立封面"));
+        state.delete_single_page(0);
+        assert_eq!(state.upload_items[0].cover.as_ref().unwrap().name, "独立封面");
+        state.move_single_page(0, -1);
+        state.move_single_page(0, 1);
+        assert_eq!(state.upload_items[0].files[0].name, "3");
+        state.upload_items.clear();
+        state.single_cover_follows_first = true;
+    }
+
+    #[test]
+    fn pagination_clamps_after_last_page_removal() {
+        assert_eq!(page_window(12, 0), (0, 0));
+        assert_eq!(page_window(12, 17), (16, 17));
+        assert_eq!(page_window(2, 16), (8, 16));
+    }
+}
