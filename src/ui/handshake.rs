@@ -301,7 +301,7 @@ pub fn begin_wait<F, Fut>(
     let ping_str = json!({
         "type": "hs_ping",
         "session": session,
-        "caps": { "syncWindow": SYNC_WINDOW, "syncSession": true },
+        "caps": { "syncWindow": SYNC_WINDOW, "syncSession": true, "httpDataSync": 1 },
     })
     .to_string();
 

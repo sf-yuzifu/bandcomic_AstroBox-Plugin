@@ -238,9 +238,10 @@ fn stub_unused_astrobox_imports(linker: &mut Linker<Context>, engine: &Engine, c
 }
 
 // Exercise the actual guest deadline, including early delivery and stale timers.
-async fn complete_startup(
+async fn complete_startup_with_caps(
     world: &bindings::PsysWorldV4Http,
     accessor: &wasmtime::component::Accessor<Context>,
+    caps: serde_json::Value,
 ) -> wasmtime::Result<()> {
     use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
     let events = world.astrobox_psys_plugin_v4_event();
@@ -269,9 +270,13 @@ async fn complete_startup(
     events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
         "type": "hs_pong", "session": ping["session"],
         "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false },
-        "caps": { "httpImport": true }
+        "caps": caps
     }).to_string()).await?;
     Ok(())
+}
+
+async fn complete_startup(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    complete_startup_with_caps(world, accessor, serde_json::json!({"httpImport": true})).await
 }
 
 #[tokio::main]
@@ -291,7 +296,8 @@ async fn main() -> wasmtime::Result<()> {
     add_test_hosts(&mut linker)?;
     let directory = tempfile::tempdir_in(std::env::temp_dir().join("opencode")).unwrap();
     let mut wasi = WasiCtxBuilder::new();
-    wasi.inherit_stdout().inherit_stderr().preopened_dir(directory.path(), ".", FsPerms::ReadWrite).unwrap();
+    // Guest debug output is also written to its sandbox log; keep the smoke-check console bounded.
+    wasi.inherit_stderr().preopened_dir(directory.path(), ".", FsPerms::ReadWrite).unwrap();
     let sent_interconnect = Arc::new(Mutex::new(Vec::new()));
     let mut store = Store::new(&engine, Context {
         wasi: wasi.build(),
@@ -361,12 +367,61 @@ async fn main() -> wasmtime::Result<()> {
         complete_startup(&world, accessor).await?;
         let last: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(last["type"], "request_data");
+        assert!(last.get("http").is_none(), "318 without HTTP capability stays on interconnect");
+
+        // New capability is independent of the 382 upload gate. Validate real HTTP callbacks.
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        complete_startup_with_caps(&world, accessor, serde_json::json!({"httpImport": true, "httpDataSync": 1, "syncSession": true})).await?;
+        let sync_request: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(sync_request["type"], "request_data");
+        assert_eq!(sync_request["http"]["protocol"], 1);
+        assert_eq!(sync_request["http"]["instanceId"], identity["instanceId"]);
+        assert_eq!(sync_request["http"]["chunkBytes"], 16384);
+        let sync_root = format!("/control/sync/{}", sync_request["session"].as_str().unwrap());
+        let sync_http = |method: &str, resource: &str, query: &str, body: Vec<u8>| Request {
+            method: method.into(), path: format!("{sync_root}/{resource}"), query: query.into(), headers: vec![], body,
+        };
+        let probe = vec![0, 1, 127, 128, 255, 0, 42, 13, 10];
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "probe", "", probe)).await?.status, 200);
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "probe", "", vec![0, 255])).await?.status, 422);
+        for value in [
+            serde_json::json!({"kind":"header", "comicCount":2, "sourceCount":1}),
+            serde_json::json!({"kind":"comics", "offset":0, "items":[
+                {"id":"first", "name":"Same", "page_count":2, "chapters":0},
+                {"id":"second", "name":"Same", "page_count":3, "chapters":0}]}),
+            serde_json::json!({"kind":"sources", "offset":0, "items":[{"name":"Local", "apiUrl":"http://source"}]}),
+            serde_json::json!({"kind":"done"}),
+        ] {
+            let req = sync_http("POST", "metadata", "", value.to_string().into_bytes());
+            assert_eq!(http.call_handle(accessor, 1, req.clone()).await?.status, 200);
+            assert_eq!(http.call_handle(accessor, 1, req).await?.status, 200, "metadata replay must be idempotent");
+        }
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "complete", "", b"{}".to_vec())).await?.status, 409);
+        let png = http.call_handle(accessor, 1, request("/control/probe.png")).await?.body;
+        for (offset, bytes) in [(0, png[..8].to_vec()), (8, png[8..].to_vec())] {
+            let req = sync_http("PUT", "covers/1", &format!("offset={offset}&total={}", png.len()), bytes);
+            assert_eq!(http.call_handle(accessor, 1, req.clone()).await?.status, 200);
+            assert_eq!(http.call_handle(accessor, 1, req).await?.status, 200, "binary chunk replay must be idempotent");
+        }
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "skip", "", br#"{"id":"first"}"#.to_vec())).await?.status, 200);
+        let complete = http.call_handle(accessor, 1, sync_http("POST", "complete", "", b"{}".to_vec())).await?;
+        assert_eq!(complete.status, 200);
+        let ack: serde_json::Value = serde_json::from_slice(&complete.body).unwrap();
+        assert_eq!(ack["receivedComics"], 2);
+        assert_eq!(ack["receivedSources"], 1);
+        assert_eq!(ack["resolvedCovers"], 2);
+        assert_eq!(ack["skippedCovers"], 1);
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "complete", "", b"{}".to_vec())).await?.status, 200);
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        assert_eq!(http.call_handle(accessor, 1, sync_http("POST", "complete", "", b"{}".to_vec())).await?.status, 409,
+            "old session cannot update a new data request");
+        complete_startup(&world, accessor).await?;
 
         // Upload-tab connection testing also requires 382.
         accessor.with(|mut access| access.get().app_version = 381);
         let sent_count = sent_interconnect.lock().unwrap().len();
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
-        accessor.with(|mut access| assert_eq!(access.get().launches, 2));
+        accessor.with(|mut access| assert_eq!(access.get().launches, 4));
         assert_eq!(sent_interconnect.lock().unwrap().len(), sent_count);
         accessor.with(|mut access| access.get().app_version = 382);
 
@@ -624,6 +679,6 @@ async fn main() -> wasmtime::Result<()> {
         assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
     }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
-    println!("PASS: version gates 317/318 and 381/382, 3-second startup silence, stale/early handshake timers, single launch per HTTP import, loopback/fallback binding, source/task/image endpoints, JPEG/PNG/LVGL, disk masters and start/stop checked on the actual release WASM.");
+    println!("PASS: version gates, startup silence, HTTP data-sync binary probe/metadata/cover callbacks/replays/old-session isolation, single launch per HTTP import, loopback/fallback binding, source/task/image endpoints, JPEG/PNG/LVGL, disk masters and start/stop checked on the actual release WASM.");
     Ok(())
 }

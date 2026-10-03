@@ -208,6 +208,7 @@ pub struct UploadSession {
 
 #[derive(Debug, Clone, Default)]
 pub struct ComicInfo {
+    pub id: String,
     pub name: String,
     pub page_count: usize,
     pub chapters: usize,
@@ -238,6 +239,7 @@ pub struct UiState {
     /// 无进展看门狗：收到有效数据只更新截止时间，不每片调用宿主定时器。
     pub app_data_recv_timer_id: Option<u64>,
     pub sync_receive: SyncReceive,
+    pub http_data_sync: Option<crate::http_data_sync::HttpDataSync>,
     pub watch_sync_session: bool,
     pub sync_comics_seen: HashSet<usize>,
     pub sync_sources_seen: HashSet<usize>,
@@ -271,6 +273,7 @@ pub struct UiState {
     pub pending_pick: Option<PendingPick>,
     /// 手表端是否支持原生 HTTP 导入能力（通过 hs_pong caps 协商）
     pub watch_http_import: bool,
+    pub watch_http_data_sync: bool,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -294,6 +297,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             app_data_timer_id: None,
             app_data_recv_timer_id: None,
             sync_receive: SyncReceive::default(),
+            http_data_sync: None,
             watch_sync_session: false,
             sync_comics_seen: HashSet::new(),
             sync_sources_seen: HashSet::new(),
@@ -317,6 +321,7 @@ pub fn ui_state() -> &'static RwLock<UiState> {
             sync_recv: None,
             pending_pick: None,
             watch_http_import: false,
+            watch_http_data_sync: false,
         })
     })
 }

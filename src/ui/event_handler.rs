@@ -1545,7 +1545,7 @@ const THUMBNAIL_WIDTH: u32 = 100;
 // 43.7K 帧待真机验证——本值对应 33K 帧，若真机不稳回退 16384
 const CHUNK_SIZE: usize = 32768;
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
     let len = data.len();
@@ -2501,6 +2501,7 @@ async fn disarm_app_data_recv_timeout() -> u64 {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.sync_receive.finish();
+        state.http_data_sync = None;
         state.sync_comics_seen.clear();
         state.sync_sources_seen.clear();
         (state.app_data_recv_timer_id.take(), state.sync_receive.generation())
@@ -2616,9 +2617,15 @@ async fn handle_fetch_app_data() {
 
 async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
     if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
+    let use_http = ui_state().read().unwrap_or_else(|p| p.into_inner()).watch_http_data_sync;
+    tracing::info!("获取快应用数据请求: use_http={}, addr={}", use_http, device_addr);
+    let http = if use_http {
+        crate::http_server::start().await;
+        crate::http_server::data_sync_config()
+    } else { None };
     let session = {
         let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
-        state.watch_sync_session.then(|| format!("sync{}", std::time::SystemTime::now()
+        (state.watch_sync_session || http.is_some()).then(|| format!("sync{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)))
     };
     let mut request_msg = json!({
@@ -2626,6 +2633,9 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
     });
     if let Some(ref session) = session {
         request_msg["session"] = json!(session);
+    }
+    if let Some(ref http) = http {
+        request_msg["http"] = http.clone();
     }
 
     let request_str = match serde_json::to_string(&request_msg) {
@@ -2642,6 +2652,7 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
         let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
         if state.sync_receive.generation() != operation { return; }
         state.sync_receive.start(Instant::now(), session);
+        state.http_data_sync = http.as_ref().map(|_| crate::http_data_sync::HttpDataSync::default());
         state.sync_receive.generation()
     };
     schedule_app_data_recv_timeout().await;
@@ -2803,8 +2814,12 @@ fn valid_sync_message(msg: &Value) -> bool {
 async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::cell::OnceCell<Option<String>>) {
     let msg_type = parsed.get("type").and_then(|v| v.as_str());
     if msg_type.is_some_and(sync_message_type) {
+        // 安卓互联可能乱序：首个合法列表头也能确认正式数据前的 HTTP 回退。
+        if msg_type == Some("app_data_header") {
+            crate::http_data_sync::fallback(parsed.get("session").and_then(Value::as_str).unwrap_or(""));
+        }
         let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
-        if !state.sync_receive.active() || !valid_sync_message(parsed)
+        if state.http_data_sync.is_some() || !state.sync_receive.active() || !valid_sync_message(parsed)
             || !state.sync_receive.matches_session(parsed.get("session").and_then(Value::as_str))
             || (!windowed && state.sync_receive.session().is_some()) { return; }
     }
@@ -2858,6 +2873,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
 
             if let Some(comic) = comic {
                 let mut info = ComicInfo {
+                    id: comic.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
                     name: comic
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -3165,6 +3181,8 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         .and_then(Value::as_bool).unwrap_or(false);
                     state.watch_http_import = parsed.get("caps").and_then(|c| c.get("httpImport"))
                         .and_then(Value::as_bool).unwrap_or(false);
+                    state.watch_http_data_sync = parsed.get("caps").and_then(|c| c.get("httpDataSync"))
+                        .and_then(Value::as_u64) == Some(1);
                 }
                 // 完成挂起的握手会话，锁外直接等待业务续体。
                 handshake::handle_hs_pong(addr, &session, &parsed).await;
@@ -3221,6 +3239,26 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                 );
                     disarm_ack_timeout().await;
                     send_next_chunk().await;
+            }
+        }
+        Some("data_sync_transport") => {
+            let reason = parsed.get("reason").and_then(Value::as_str).unwrap_or("未知原因");
+            tracing::warn!("手表回退至互联传输: {}", reason);
+            show_app_data_status(StatusState::Processing(format!("HTTP未通 ({})，回退互联传输...", reason))).await;
+            if parsed.get("transport").and_then(Value::as_str) == Some("interconnect") {
+                crate::http_data_sync::fallback(parsed.get("session").and_then(Value::as_str).unwrap_or(""));
+            }
+        }
+        Some("data_sync_result") => {
+            let current = {
+                let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+                state.http_data_sync.is_some() && state.sync_receive.active() &&
+                    state.sync_receive.matches_session(parsed.get("session").and_then(Value::as_str))
+            };
+            if current && parsed.get("success").and_then(Value::as_bool) == Some(false) {
+                disarm_app_data_recv_timeout().await;
+                show_app_data_status(StatusState::Error(format!("HTTP 数据同步失败：{}",
+                    parsed.get("error").and_then(Value::as_str).unwrap_or("请重试")))).await;
             }
         }
         Some("gateway_bind_result") => {

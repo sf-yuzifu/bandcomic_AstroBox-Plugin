@@ -83,6 +83,17 @@ pub fn status() -> Status {
     }
 }
 
+/// 数据回传仅需服务候选地址，不改变漫画导入的绑定 endpoint 或版本门槛。
+pub fn data_sync_config() -> Option<Value> {
+    let state = state().lock().unwrap_or_else(|p| p.into_inner());
+    let info = state.info.as_ref()?;
+    let identity = state.identity.as_ref()?;
+    let mut endpoints = vec![format!("http://{}:{}", LOOPBACK_IP, info.port)];
+    if !state.fallback_ip.is_empty() { endpoints.push(format!("http://{}:{}", state.fallback_ip, info.port)); }
+    Some(json!({"protocol": 1, "endpoints": endpoints, "instanceId": identity.instance_id,
+        "chunkBytes": crate::http_data_sync::CHUNK_BYTES, "maxCoverBytes": crate::http_data_sync::MAX_COVER_BYTES}))
+}
+
 fn render() {
     crate::ui::build::rerender_main_ui();
 }
@@ -462,6 +473,8 @@ pub fn handle(server_id: u32, request: host::Request) -> host::Response {
         &base_url,
     ) {
         local_resp
+    } else if let Some(sync_resp) = crate::http_data_sync::route(&request.method, &request.path, &request.query, &request.body) {
+        sync_resp
     } else if let Some(task_resp) = crate::jobs::route_task(&request.method, &request.path, &request.body) {
         task_resp
     } else if request.path.starts_with("/control/") {

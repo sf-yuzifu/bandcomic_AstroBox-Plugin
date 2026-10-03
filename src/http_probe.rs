@@ -96,7 +96,7 @@ pub fn route(method: &str, path: &str, identity: &ServiceIdentity) -> ProbeRespo
             "instanceId": identity.instance_id,
             "serverId": identity.server_id,
             "port": identity.port,
-            "capabilities": { "httpProbe": true, "httpImport": false },
+            "capabilities": { "httpProbe": true, "httpImport": false, "httpDataSync": 1 },
             "samples": [
                 { "path": "/control/probe.jpg", "contentType": "image/jpeg", "length": samples.jpeg.len() },
                 { "path": "/control/probe.png", "contentType": "image/png", "length": samples.png.len() },

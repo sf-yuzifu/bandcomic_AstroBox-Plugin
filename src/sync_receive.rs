@@ -47,6 +47,15 @@ impl SyncReceive {
         }
     }
 
+    /// HTTP 回调不通过业务定时器事件重启阶段，沿用当前看门狗的代际。
+    pub fn http_covers(&mut self, now: Instant) {
+        if self.active() {
+            self.phase = Phase::Covers;
+            self.idle = COVER_IDLE;
+            self.progress(now);
+        }
+    }
+
     pub fn finish(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.deadline = None;

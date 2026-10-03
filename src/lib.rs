@@ -10,6 +10,7 @@ pub mod network;
 pub mod lvgl;
 pub mod transfer;
 pub mod sync_receive;
+pub mod http_data_sync;
 pub mod http_server;
 pub mod http_probe;
 pub mod local_source;
