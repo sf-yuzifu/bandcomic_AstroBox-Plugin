@@ -117,14 +117,14 @@ pub fn get_task(task_id: &str) -> Option<TaskInfo> {
 pub fn owns_image_request(comic_id: &str) -> bool {
     let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
     mgr.active_task_id.as_ref().and_then(|id| mgr.tasks.get(id))
-        .is_some_and(|task| task.comic_id == comic_id && matches!(task.status.as_str(), "ready" | "downloading"))
+        .is_some_and(|task| task.comic_id == comic_id && matches!(task.status.as_str(), "ready" | "downloading" | "waiting_result"))
 }
 
 pub fn is_busy() -> bool {
     let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
     if mgr.last_progress.map(|t| t.elapsed().as_secs() > 120).unwrap_or(true) { return false; }
     mgr.active_task_id.as_ref().and_then(|id| mgr.tasks.get(id))
-        .map(|task| task.status == "ready" || task.status == "downloading").unwrap_or(false)
+        .map(|task| matches!(task.status.as_str(), "ready" | "downloading" | "waiting_result")).unwrap_or(false)
 }
 
 pub fn update_progress(task_id: &str, page: usize, total: usize) {
@@ -134,9 +134,18 @@ pub fn update_progress(task_id: &str, page: usize, total: usize) {
     if let Some(task) = mgr.tasks.get_mut(task_id) {
         if task.status == "completed" || task.status == "failed" { return; }
         task.saved_pages = task.saved_pages.max(page.min(task.total_pages));
-        task.status = "downloading".to_string();
+        let is_all_pages = total > 0 && task.saved_pages >= task.total_pages;
+        task.status = if is_all_pages {
+            "waiting_result".to_string()
+        } else {
+            "downloading".to_string()
+        };
 
-        let progress_str = format!("设备正在保存: {}/{} 页", page, total);
+        let progress_str = if is_all_pages {
+            "已传输全部图片，等待结果确认…".to_string()
+        } else {
+            format!("设备正在保存: {}/{} 页", page, total)
+        };
         let mut ustate = ui_state().write().unwrap_or_else(|p| p.into_inner());
         ustate.upload_progress = if total > 0 {
             page as f32 / total as f32
@@ -156,24 +165,32 @@ pub fn finish_task(
     error: Option<String>,
 ) {
     let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
-    if mgr.active_task_id.as_deref() != Some(task_id) { return; }
-    if let Some(task) = mgr.tasks.get_mut(task_id) {
-        if task.status == "completed" || task.status == "failed" { return; }
-        let success = success && saved_pages == task.total_pages && total_pages == task.total_pages;
+    let is_active = mgr.active_task_id.as_deref() == Some(task_id);
+    let (status_updated, is_success, task_name) = {
+        let Some(task) = mgr.tasks.get_mut(task_id) else { return; };
+        if task.status == "completed" || task.status == "failed" {
+            return;
+        }
+        let is_success = success && saved_pages == task.total_pages && total_pages == task.total_pages;
         task.saved_pages = saved_pages;
         task.total_pages = total_pages;
-        task.status = if success {
+        task.status = if is_success {
             "completed".to_string()
         } else {
             "failed".to_string()
         };
+        (true, is_success, task.name.clone())
+    };
+
+    if status_updated && is_active {
+        mgr.active_task_id = None;
 
         let mut ustate = ui_state().write().unwrap_or_else(|p| p.into_inner());
-        if success {
+        if is_success {
             ustate.upload_progress = 1.0;
             ustate.upload_status = StatusState::Success(format!(
                 "🎉 《{}》已成功保存到手环！共 {} 页",
-                task.name, saved_pages
+                task_name, saved_pages
             ));
         } else {
             let err_msg = error.unwrap_or_else(|| "下载异常中断".to_string());
@@ -225,9 +242,114 @@ pub fn route_task(method: &str, path: &str, body: &[u8]) -> Option<crate::http_p
             let total_pages = parsed.get("totalPages").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let error = parsed.get("error").and_then(|v| v.as_str()).map(str::to_string);
             finish_task(task_id, success, saved_pages, total_pages, error);
-            return Some(json_resp(200, &json!({ "code": 200, "message": "OK" })));
+            let task_status = get_task(task_id).map(|t| t.status).unwrap_or_else(|| "unknown".to_string());
+            return Some(json_resp(200, &json!({ "code": 200, "message": "OK", "status": task_status })));
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn dummy_profile() -> TaskImageProfile {
+        TaskImageProfile {
+            width: 100,
+            quality: 75,
+            if_png: false,
+            if_lvgl: false,
+        }
+    }
+
+    #[test]
+    fn progress_updates_to_waiting_result_when_all_pages_reached() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let task_id = create_task(
+            "comic_1".into(),
+            "测试漫画".into(),
+            "rev_1".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 5 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+
+        assert!(is_busy());
+        assert!(owns_image_request("comic_1"));
+
+        update_progress(&task_id, 3, 5);
+        let task = get_task(&task_id).unwrap();
+        assert_eq!(task.status, "downloading");
+        assert_eq!(task.saved_pages, 3);
+
+        update_progress(&task_id, 5, 5);
+        let task = get_task(&task_id).unwrap();
+        assert_eq!(task.status, "waiting_result");
+        assert_eq!(task.saved_pages, 5);
+        assert!(is_busy());
+        assert!(owns_image_request("comic_1"));
+    }
+
+    #[test]
+    fn finish_task_is_idempotent_and_cannot_regress_from_completed_to_failed() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let task_id = create_task(
+            "comic_2".into(),
+            "防倒退漫画".into(),
+            "rev_2".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 2 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+
+        // 首次完成：成功
+        finish_task(&task_id, true, 2, 2, None);
+        let task = get_task(&task_id).unwrap();
+        assert_eq!(task.status, "completed");
+        assert!(!is_busy());
+
+        // 重复回报：迟到的失败请求不能倒退终态
+        finish_task(&task_id, false, 1, 2, Some("迟到的失败".into()));
+        let task_after = get_task(&task_id).unwrap();
+        assert_eq!(task_after.status, "completed");
+
+        // route_task 处理重复回报同样返回 200 OK 且 status 为 completed
+        let payload = json!({ "success": false, "savedPages": 1, "totalPages": 2 }).to_string();
+        let resp = route_task("POST", &format!("/control/tasks/{}/result", task_id), payload.as_bytes()).unwrap();
+        assert_eq!(resp.status, 200);
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(resp_json["status"], "completed");
+    }
+
+    #[test]
+    fn failed_task_stays_failed_and_clears_active() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let task_id = create_task(
+            "comic_3".into(),
+            "失败漫画".into(),
+            "rev_3".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 3 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+
+        finish_task(&task_id, false, 1, 3, Some("网络中断".into()));
+        let task = get_task(&task_id).unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(!is_busy());
+
+        // 重复失败汇报保持幂等
+        finish_task(&task_id, false, 1, 3, Some("再次网络中断".into()));
+        let task_after = get_task(&task_id).unwrap();
+        assert_eq!(task_after.status, "failed");
+    }
 }
