@@ -188,12 +188,12 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                     state.upload_comic_name_input.clone()
                 };
                 let mut chapters = Vec::new();
-                for (ci, chapter) in state.upload_chapters.iter().enumerate() {
+                for chapter in &state.upload_chapters {
                     if chapter.files.is_empty() {
                         continue;
                     }
                     let title = if chapter.name.trim().is_empty() {
-                        format!("第{}章", ci + 1)
+                        format!("第{}章", chapter.number)
                     } else {
                         chapter.name.clone()
                     };
@@ -203,7 +203,7 @@ pub fn get_catalog() -> Vec<LocalComicData> {
                         .map(LocalAsset::from_upload)
                         .collect();
                     chapters.push(LocalChapterData {
-                        chapter_number: ci + 1,
+                        chapter_number: chapter.number,
                         title,
                         pages,
                     });

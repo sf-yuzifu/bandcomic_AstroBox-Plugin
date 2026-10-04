@@ -25,6 +25,17 @@ pub struct TaskImageProfile {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImportPlan {
+    pub import_chapter_protocol: u32,
+    pub book_id: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_comic_id: Option<String>,
+    pub is_serial: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskInfo {
     pub task_id: String,
     pub source_key: String,
@@ -38,6 +49,8 @@ pub struct TaskInfo {
     pub saved_pages: usize,
     pub total_pages: usize,
     pub total_chapters: usize,
+    #[serde(flatten)]
+    pub import: Option<ImportPlan>,
 }
 
 #[derive(Default)]
@@ -61,6 +74,7 @@ pub fn create_task(
     cover_url: String,
     image_profile: TaskImageProfile,
     total_chapters: usize,
+    import: Option<ImportPlan>,
 ) -> String {
     let task_id = format!(
         "task_{}",
@@ -85,6 +99,7 @@ pub fn create_task(
         saved_pages: 0,
         total_pages,
         total_chapters,
+        import,
     };
 
     let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());

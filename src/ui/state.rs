@@ -128,6 +128,7 @@ pub struct UploadItem {
 
 #[derive(Debug, Clone)]
 pub struct ChapterItem {
+    pub number: usize,
     pub name: String,
     pub files: Vec<UploadFile>,
 }
@@ -135,6 +136,7 @@ pub struct ChapterItem {
 impl Default for ChapterItem {
     fn default() -> Self {
         ChapterItem {
+            number: 1,
             name: String::new(),
             files: Vec::new(),
         }
@@ -261,6 +263,8 @@ pub struct UiState {
     pub sync_sources_seen: HashSet<usize>,
     pub cover_chunk_buffers: HashMap<String, CoverChunks>,
     pub upload_items: Vec<UploadItem>,
+    pub upload_book_id: String,
+    pub upload_target: Option<ImportTarget>,
     pub upload_chapters: Vec<ChapterItem>,
     pub upload_comic_name_input: String,
     pub upload_mode: UploadMode,
@@ -299,6 +303,7 @@ pub struct UiState {
     pub watch_http_data_sync: bool,
     /// 手表端是否支持旧互联导入结果回报（通过 hs_pong caps 协商）
     pub watch_import_result: bool,
+    pub watch_chapter_import: bool,
     pub upload_result_session: Option<String>,
     pub upload_result_timer_id: Option<u64>,
 }
@@ -338,6 +343,8 @@ impl Default for UiState {
             sync_sources_seen: HashSet::new(),
             cover_chunk_buffers: HashMap::new(),
             upload_items: Vec::new(),
+            upload_book_id: new_book_id(),
+            upload_target: None,
             upload_chapters: Vec::new(),
             upload_comic_name_input: String::new(),
             upload_mode: UploadMode::Single,
@@ -365,6 +372,7 @@ impl Default for UiState {
             watch_http_import: false,
             watch_http_data_sync: false,
             watch_import_result: false,
+            watch_chapter_import: false,
             upload_result_session: None,
             upload_result_timer_id: None,
         }
@@ -438,6 +446,9 @@ pub const PICK_PROCESS_EVENT: &str = "pick_process";
 // 多章节模式
 pub const UPLOAD_ADD_CHAPTER_EVENT: &str = "upload_add_chapter";
 pub const CHAPTER_NAME_INPUT_PREFIX: &str = "chapter_name_input_";
+pub const CHAPTER_NUMBER_INPUT_PREFIX: &str = "chapter_number_input_";
+pub const IMPORT_TARGET_PREFIX: &str = "import_target_";
+pub const IMPORT_TARGET_CLEAR: &str = "import_target_clear";
 pub const CHAPTER_PICK_FILES_PREFIX: &str = "chapter_pick_files_";
 pub const CHAPTER_UPLOAD_PREFIX: &str = "chapter_upload_";
 pub const CHAPTER_CLEAR_PREFIX: &str = "chapter_clear_";
@@ -465,6 +476,27 @@ pub const SOURCE_PAGE_PREV_EVENT: &str = "source_page_prev";
 pub const SOURCE_PAGE_NEXT_EVENT: &str = "source_page_next";
 
 impl UiState {
+    pub fn add_chapter(&mut self) {
+        let number = self.upload_chapters.iter().map(|c| c.number).max().unwrap_or(0) + 1;
+        self.upload_chapters.push(ChapterItem { number, ..ChapterItem::default() });
+    }
+    pub fn import_plan(&self, device_addr: &str, chapter: Option<usize>) -> Result<Option<crate::jobs::ImportPlan>, String> {
+        if let Some(target) = &self.upload_target {
+            if target.device_addr != device_addr { return Err("导入目标属于另一设备，请重新读取书架选择目标".into()); }
+            if !self.watch_chapter_import { return Err("该快应用不支持按 ID 追加/替换，请更新快应用".into()); }
+            if chapter.is_some() && !target.is_serial { return Err("章节追加目标必须是连载作品".into()); }
+        }
+        let numbers: Vec<_> = self.upload_chapters.iter().filter(|c| !c.files.is_empty()).map(|c| c.number).collect();
+        if self.upload_mode == UploadMode::Multi && (numbers.iter().any(|n| *n == 0 || *n > 100000) ||
+            numbers.iter().copied().collect::<HashSet<_>>().len() != numbers.len()) {
+            return Err("真实章号必须为 1..100000 且不能重复".into());
+        }
+        if !self.watch_chapter_import { return Ok(None); }
+        Ok(Some(crate::jobs::ImportPlan { import_chapter_protocol: 1, book_id: self.upload_book_id.clone(),
+            target_comic_id: self.upload_target.as_ref().map(|t| t.id.clone()),
+            operation: if chapter.is_some() { "upsert_chapters" } else { "replace_book" }.into(),
+            is_serial: self.upload_mode == UploadMode::Multi }))
+    }
     pub fn source_sync_busy(&self) -> bool { self.source_sync.as_ref().is_some_and(|sync| sync.phase.busy()) }
 
     pub fn source_sync_current(&self, id: u64) -> bool {
@@ -611,6 +643,24 @@ impl UiState {
 }
 
 #[derive(Debug, Clone)]
+pub struct ImportTarget {
+    pub device_addr: String,
+    pub id: String,
+    pub name: String,
+    pub is_serial: bool,
+}
+
+pub fn new_book_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("book_{}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn sanitize_import_name(name: &str) -> String {
+    name.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect()
+}
+
+#[derive(Debug, Clone)]
 pub enum DataItem {
     Comic { id: String, name: String },
     Source { key: String, name: String, api_url: String },
@@ -675,6 +725,41 @@ mod upload_tests {
         assert_eq!(page_window(12, 0), (0, 0));
         assert_eq!(page_window(12, 17), (16, 17));
         assert_eq!(page_window(2, 16), (8, 16));
+    }
+
+    #[test]
+    fn chapter_identity_survives_removal_and_book_identity_survives_repeated_plans() {
+        let mut state = UiState::default();
+        state.upload_mode = UploadMode::Multi;
+        state.watch_chapter_import = true;
+        state.add_chapter(); state.add_chapter();
+        state.upload_chapters[0].files.push(file("1"));
+        state.upload_chapters[1].files.push(file("2"));
+        let first = state.import_plan("A", Some(0)).unwrap().unwrap();
+        state.upload_chapters.remove(0);
+        assert_eq!(state.upload_chapters[0].number, 2);
+        let next = state.import_plan("A", Some(0)).unwrap().unwrap();
+        assert_eq!(first.book_id, next.book_id);
+        assert_eq!(next.operation, "upsert_chapters");
+        state.add_chapter(); assert_eq!(state.upload_chapters[1].number, 3);
+        assert_eq!(state.import_plan("A", None).unwrap().unwrap().operation, "replace_book");
+        assert!(serde_json::to_value(next).unwrap()["isSerial"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn chapter_import_requires_unique_numbers_capability_and_target_device() {
+        let mut state = UiState::default(); state.upload_mode = UploadMode::Multi;
+        state.add_chapter(); state.add_chapter();
+        for chapter in &mut state.upload_chapters { chapter.files.push(file("page")); }
+        assert!(state.import_plan("A", Some(0)).unwrap().is_none());
+        state.upload_target = Some(ImportTarget { device_addr: "A".into(), id: "local_old".into(), name: "旧书".into(), is_serial: true });
+        assert!(state.import_plan("A", Some(0)).is_err());
+        state.watch_chapter_import = true;
+        assert!(state.import_plan("B", Some(0)).is_err());
+        assert_eq!(state.import_plan("A", Some(0)).unwrap().unwrap().target_comic_id.as_deref(), Some("local_old"));
+        state.upload_chapters[1].number = 1; assert!(state.import_plan("A", None).is_err());
+        state.upload_chapters[1].number = 0; assert!(state.import_plan("A", None).is_err());
+        assert_eq!(sanitize_import_name("章:/?名"), "章___名");
     }
 
     #[test]

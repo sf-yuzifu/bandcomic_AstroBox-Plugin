@@ -31,12 +31,12 @@ pub async fn ui_event_processor(
     let edits_upload = matches!(event_id,
         UPLOAD_NAME_INPUT_EVENT | UPLOAD_MODE_SINGLE_EVENT | UPLOAD_MODE_MULTI_EVENT |
         UPLOAD_PICK_FILES_EVENT | UPLOAD_PICK_COVER_EVENT | UPLOAD_PICK_MULTI_COVER_EVENT |
-        UPLOAD_START_EVENT | UPLOAD_CLEAR_EVENT | UPLOAD_ADD_CHAPTER_EVENT |
+        UPLOAD_START_EVENT | UPLOAD_CLEAR_EVENT | UPLOAD_ADD_CHAPTER_EVENT | IMPORT_TARGET_CLEAR |
         UPLOAD_COVER_FIRST_EVENT | UPLOAD_COVER_NONE_EVENT)
         || [UPLOAD_MOVE_UP_PREFIX, UPLOAD_MOVE_DOWN_PREFIX, UPLOAD_DELETE_PREFIX,
             CHAPTER_PICK_FILES_PREFIX, CHAPTER_UPLOAD_PREFIX, CHAPTER_CLEAR_PREFIX,
             CHAPTER_DELETE_PREFIX, CHAPTER_MOVE_UP_PREFIX, CHAPTER_MOVE_DOWN_PREFIX,
-            CHAPTER_DEL_FILE_PREFIX, CHAPTER_NAME_INPUT_PREFIX]
+            CHAPTER_DEL_FILE_PREFIX, CHAPTER_NAME_INPUT_PREFIX, CHAPTER_NUMBER_INPUT_PREFIX, IMPORT_TARGET_PREFIX]
             .iter().any(|prefix| event_id.starts_with(prefix));
     if edits_upload && ui_state().read().unwrap_or_else(|p| p.into_inner()).upload_locked() {
         return;
@@ -49,6 +49,10 @@ pub async fn ui_event_processor(
             .any(|r| matches!(r.phase, DeletePhase::Preparing | DeletePhase::Querying)) { return; }
 
     match event_id {
+        IMPORT_TARGET_CLEAR => {
+            ui_state().write().unwrap_or_else(|p| p.into_inner()).upload_target = None;
+            rerender_upload_ui();
+        }
         COMIC_SEARCH_EVENT | SOURCE_SEARCH_EVENT | COMIC_SEARCH_CLEAR_EVENT | SOURCE_SEARCH_CLEAR_EVENT => {
             let clear = matches!(event_id, COMIC_SEARCH_CLEAR_EVENT | SOURCE_SEARCH_CLEAR_EVENT);
             let value = if clear { Some(String::new()) } else {
@@ -236,7 +240,22 @@ pub async fn ui_event_processor(
             handle_fetch_app_data().await;
         }
         _ => {
-            if let Some(generation) = event_id.strip_prefix(SOURCE_SYNC_PREFIX).and_then(|s|s.parse::<u64>().ok()) {
+            if let Some((revision, index)) = event_id.strip_prefix(IMPORT_TARGET_PREFIX).and_then(parse_data_action) {
+                refresh_data_connection().await;
+                let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+                if state.data_browser.owner_matches_connection() && let Some(target) = state.capture_data_target(revision, index, false)
+                    && let DataItem::Comic { id, name } = target.item && id.starts_with("local_") {
+                    state.upload_target = Some(ImportTarget { device_addr: target.owner.addr, id, name,
+                        is_serial: state.app_comics[index].chapters > 0 });
+                    state.current_tab = TabPage::Upload;
+                    state.upload_view = UploadView::Overview;
+                }
+                drop(state); rerender_upload_ui();
+            } else if let Some(index) = event_id.strip_prefix(CHAPTER_NUMBER_INPUT_PREFIX).and_then(|s| s.parse::<usize>().ok()) {
+                let number = serde_json::from_str::<Value>(event_payload).ok().and_then(|v| v.get("value").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()));
+                let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+                if let Some(chapter) = state.upload_chapters.get_mut(index) { chapter.number = number.unwrap_or(0); }
+            } else if let Some(generation) = event_id.strip_prefix(SOURCE_SYNC_PREFIX).and_then(|s|s.parse::<u64>().ok()) {
                 let current = ui_state().read().unwrap_or_else(|p|p.into_inner()).source_form.generation == generation;
                 if current { handle_sync().await; }
                 else { build::rerender_main_ui(); }
@@ -604,6 +623,8 @@ fn handle_upload_clear() {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.upload_items.clear();
+        state.upload_book_id = new_book_id();
+        state.upload_target = None;
         state.upload_chapters.clear();
         state.multi_cover = None;
         state.upload_progress = 0.0;
@@ -625,7 +646,7 @@ fn handle_add_chapter() {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.upload_chapters.push(ChapterItem::default());
+        state.add_chapter();
         state.upload_view = UploadView::Pages(Some(state.upload_chapters.len() - 1));
         state.upload_page_cursor = 0;
     }
@@ -738,7 +759,7 @@ async fn handle_chapter_upload(chapter_index: usize) {
             state.upload_comic_name_input.trim().to_string()
         };
         let ch_name = if chapter.name.trim().is_empty() {
-            format!("第{}章", chapter_index + 1)
+            format!("第{}章", chapter.number)
         } else {
             chapter.name.clone()
         };
@@ -771,8 +792,13 @@ async fn handle_chapter_upload(chapter_index: usize) {
                     let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
                     state.watch_http_import
                 };
-                if http_capable {
+                let chapter_capable = ui_state().read().unwrap_or_else(|p| p.into_inner()).watch_chapter_import;
+                let plan = ui_state().read().unwrap_or_else(|p| p.into_inner()).import_plan(&device_addr, Some(chapter_index));
+                if let Err(message) = plan { show_upload_status(StatusState::Error(message)).await; return; }
+                if http_capable && chapter_capable {
                     prepare_http_import(device_addr, settings_opt, Some(chapter_index)).await;
+                } else if chapter_capable {
+                    upload_start_continue(device_addr, Some(chapter_index)).await;
                 } else {
                     chapter_upload_continue(
                         comic_name,
@@ -821,11 +847,16 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         }
     };
     let comic = crate::local_source::publish(catalog.into_iter().next().unwrap());
+    let (import, selected_number) = {
+        let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+        (state.import_plan(&device_addr, chapter_index), chapter_index.and_then(|i| state.upload_chapters.get(i).map(|c| c.number)))
+    };
+    let import = match import { Ok(plan) => plan, Err(error) => { show_upload_status(StatusState::Error(error)).await; return; } };
 
     let chapters = comic
         .chapters
         .iter()
-        .filter(|c| chapter_index.map(|i| c.chapter_number == i + 1).unwrap_or(true))
+        .filter(|c| selected_number.map(|n| c.chapter_number == n).unwrap_or(true))
         .map(|c| crate::jobs::TaskChapter {
             chapter_num: c.chapter_number,
             title: c.title.clone(),
@@ -854,6 +885,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         cover_url,
         image_profile,
         comic.chapters.iter().map(|c| c.chapter_number).max().unwrap_or(1),
+        import,
     );
 
     let session = crate::http_server::status()
@@ -1075,27 +1107,30 @@ async fn handle_upload_start() {
                 if http_capable {
                     prepare_http_import(device_addr, settings_opt, None).await;
                 } else {
-                    upload_start_continue(device_addr).await;
+                    upload_start_continue(device_addr, None).await;
                 }
             }
         } },
     );
 }
 
-async fn upload_start_continue(device_addr: String) {
+async fn upload_start_continue(device_addr: String, chapter_index: Option<usize>) {
     let watch_settings = current_watch_settings();
 
-    let (upload_mode, items, chapters, multi_cover) = {
+    let (upload_mode, items, chapters, multi_cover, import) = {
         let state = ui_state()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             state.upload_mode.clone(),
             state.upload_items.clone(),
-            state.upload_chapters.clone(),
+            state.upload_chapters.iter().enumerate().filter(|(i, _)| chapter_index.is_none_or(|n| n == *i)).map(|(_, c)| c.clone()).collect::<Vec<_>>(),
             state.multi_cover.clone(),
+            state.import_plan(&device_addr, chapter_index),
         )
     };
+
+    let import = match import { Ok(plan) => plan, Err(error) => { show_upload_status(StatusState::Error(error)).await; return; } };
 
     let comic_name = {
         let state = ui_state()
@@ -1106,7 +1141,7 @@ async fn upload_start_continue(device_addr: String) {
             items
                 .first()
                 .map(|i| i.comic_name.clone())
-                .unwrap_or_default()
+                .unwrap_or_else(|| "本地多章节漫画".into())
         } else {
             raw
         }
@@ -1183,7 +1218,7 @@ async fn upload_start_continue(device_addr: String) {
             all_files.push(("cover".to_string(), b64));
         }
 
-        for (ci, chapter) in chapters.iter().enumerate() {
+        for chapter in &chapters {
             if chapter.files.is_empty() {
                 continue;
             }
@@ -1195,25 +1230,26 @@ async fn upload_start_continue(device_addr: String) {
             // 下载链路建目录（download.ux）与书架扫描（offline.ux）同此约定；
             // 元数据剥离前缀由手表端 updateComicsIndex 负责
             let ch_name_raw = if chapter.name.trim().is_empty() {
-                format!("第{}章", ci + 1)
+                format!("第{}章", chapter.number)
             } else {
                 chapter.name.trim().to_string()
             };
-            let ch_name_val = format!("{}　{}", ci + 1, ch_name_raw);
+            let wire_title = if import.is_some() { sanitize_import_name(&ch_name_raw) } else { ch_name_raw.clone() };
+            let ch_name_val = format!("{}　{}", chapter.number, wire_title);
 
             // Process pages
             for (fi, file) in chapter.files.iter().enumerate() {
                 page_num += 1;
                 show_upload_status(StatusState::Processing(format!(
                     "正在处理 章节{} ({}/{})",
-                    ci + 1,
+                    chapter.number,
                     fi + 1,
                     chapter.files.len()
                 )))
                 .await;
 
                 let Some(product) = prepare_upload_image(file, &watch_settings, ImageRole::Page,
-                    &format!("第{}章第{}页", ci + 1, page_num)).await else { return; };
+                    &format!("第{}章第{}页", chapter.number, page_num)).await else { return; };
                 let name = product.format.page_name(page_num);
                 let file_key = format!("{}/{}", ch_name_val, name);
                 let b64 = base64_encode(&product.bytes);
@@ -1223,6 +1259,9 @@ async fn upload_start_continue(device_addr: String) {
 
             chap_list.push(json!({
                 "name": ch_name_val,
+                "chapterNum": chapter.number,
+                "title": ch_name_raw,
+                "pageCount": chapter.files.len(),
                 "files": chap_names,
             }));
         }
@@ -1236,6 +1275,13 @@ async fn upload_start_continue(device_addr: String) {
         });
     }
 
+    if let Some(plan) = import {
+        header["totalChapters"] = json!(ui_state().read().unwrap_or_else(|p| p.into_inner()).upload_chapters.iter()
+            .filter(|c| !c.files.is_empty()).map(|c| c.number).max().unwrap_or(1));
+        if let Ok(Value::Object(fields)) = serde_json::to_value(plan) {
+            for (key, value) in fields { header[&key] = value; }
+        }
+    }
     let total = all_files.len();
 
     let mut chunked_files: Vec<(String, Vec<String>)> = Vec::with_capacity(total);
@@ -1906,6 +1952,7 @@ pub async fn handle_upload_header_timeout() {
             Nothing,
             Resend,
             LegacyStart,
+            Abort,
         }
 
         let (action, device_addr, header_str) = {
@@ -1916,10 +1963,14 @@ pub async fn handle_upload_header_timeout() {
                 Some(s) if !s.header_acked => {
                     s.header_retry += 1;
                     if s.header_retry > 3 {
-                        s.header_acked = true;
-                        // 旧版兼容模式：退化为逐片会话（窗口帧依赖对端累计 ACK 能力）
-                        s.windowed = None;
-                        (Action::LegacyStart, s.device_addr.clone(), String::new())
+                        if s.header_str.contains("importChapterProtocol") {
+                            (Action::Abort, s.device_addr.clone(), String::new())
+                        } else {
+                            s.header_acked = true;
+                            // 旧版兼容模式：退化为逐片会话（窗口帧依赖对端累计 ACK 能力）
+                            s.windowed = None;
+                            (Action::LegacyStart, s.device_addr.clone(), String::new())
+                        }
                     } else {
                         (Action::Resend, s.device_addr.clone(), s.header_str.clone())
                     }
@@ -1956,6 +2007,11 @@ pub async fn handle_upload_header_timeout() {
             Action::LegacyStart => {
                 tracing::warn!("未收到头部确认，按旧版兼容模式直接发送分片");
                 send_next_chunk().await;
+            }
+            Action::Abort => {
+                ui_state().write().unwrap_or_else(|p| p.into_inner()).upload_session = None;
+                disarm_header_timeout().await;
+                show_upload_status(StatusState::Error("设备未确认章节导入，请重新连接后重试；旧内容保留".into())).await;
             }
         }
 }
@@ -3197,6 +3253,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
         }
         Some("import_header_ack") => {
             let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let session = parsed.get("sessionId").or_else(|| parsed.get("session")).and_then(Value::as_str);
 
             // 快应用确认收到头部：开始发分片。重复 ACK（如重发头部导致）直接忽略
             let start = {
@@ -3204,7 +3261,8 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match state.upload_session.as_mut() {
-                    Some(s) if s.comic_name == name && !s.header_acked => {
+                    Some(s) if s.comic_name == name && !s.header_acked &&
+                        (session == Some(s.session_id.as_str()) || (session.is_none() && !s.header_str.contains("importChapterProtocol"))) => {
                         s.header_acked = true;
                         true
                     }
@@ -3266,6 +3324,8 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         .and_then(Value::as_u64) == Some(1);
                     state.watch_import_result = parsed.get("caps")
                         .and_then(|c| c.get("importResultProtocol").or_else(|| c.get("importResult")))
+                        .and_then(Value::as_u64) == Some(1);
+                    state.watch_chapter_import = parsed.get("caps").and_then(|c| c.get("importChapterProtocol"))
                         .and_then(Value::as_u64) == Some(1);
                     state.watch_delete = (parsed.get("caps").and_then(|c| c.get("deleteProtocol"))
                         .and_then(Value::as_u64) == Some(1) && !session.is_empty())
@@ -3370,6 +3430,16 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             let index_success = parsed.get("indexSuccess").and_then(Value::as_bool).unwrap_or(true);
             let error = parsed.get("error").and_then(Value::as_str);
 
+            let rejected_header = {
+                let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+                if !success && state.upload_session.as_ref().is_some_and(|s| s.session_id == session_id && !s.header_acked) {
+                    state.upload_session = None;
+                    state.upload_result_session = Some(session_id.into());
+                    true
+                } else { false }
+            };
+            if rejected_header { disarm_header_timeout().await; disarm_ack_timeout().await; }
+
             handle_import_comic_result(session_id, name, success, saved_pages, total_pages, failed_files, index_success, error);
         }
         Some("import_comic_result_status") => {
@@ -3407,10 +3477,12 @@ fn handle_import_comic_result(
                 "🎉 《{}》已成功保存到手环！共 {} 页",
                 comic_name, saved_pages
             ));
+        } else if !index_success && saved_pages == 0 && error.is_some() {
+            state.upload_status = StatusState::Error(format!("《{}》导入失败：{}", comic_name, error.unwrap()));
         } else if !index_success {
             state.upload_status = StatusState::Error(format!(
-                "《{}》图片已保存，但设备索引写入失败",
-                comic_name
+                "《{}》图片已暂存，但设备索引写入失败{}",
+                comic_name, error.map(|e| format!("：{e}")).unwrap_or_default()
             ));
         } else {
             let err_desc = error.unwrap_or("部分文件保存失败");

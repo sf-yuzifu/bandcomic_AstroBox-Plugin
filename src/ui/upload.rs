@@ -76,6 +76,11 @@ fn overview(state: &UiState) -> ui::Element {
         .child(t::icon("chevron", t::MUTED));
 
     root = root.child(book_card);
+    let target = state.upload_target.as_ref().map(|t| format!("目标：{} · {}", t.name, t.id))
+        .unwrap_or_else(|| "目标：当前作品身份（首次新建，再次发送更新同一作品）".into());
+    root = root.child(t::panel().gap(6).child(t::hint(&target))
+        .child(t::hint("发送整本将替换该作品；仅发送本章追加/更新指定章，保留其他章。可在设备书架选择已有本地作品。"))
+        .child(t::button("清除已有目标，使用当前作品身份", IMPORT_TARGET_CLEAR, B::Quiet, !locked && state.upload_target.is_some())));
 
     // 4. 内容与操作分区
     if state.upload_mode == UploadMode::Single {
@@ -123,9 +128,9 @@ fn overview(state: &UiState) -> ui::Element {
             let (start, end) = page_window(state.upload_page_cursor, state.upload_chapters.len());
             for (index, chapter) in state.upload_chapters.iter().enumerate().take(end).skip(start) {
                 let title = if chapter.name.trim().is_empty() {
-                    format!("第 {} 章", index + 1)
+                    format!("第 {} 章", chapter.number)
                 } else {
-                    format!("第 {} 章 · {}", index + 1, chapter.name)
+                    format!("第 {} 章 · {}", chapter.number, chapter.name)
                 };
                 let desc = format!("{} 页正文 · 点击进入整理", chapter.files.len());
                 root = root.child(t::card(&title, &desc, "pages", Some(&format!("{CHAPTER_EDIT_PREFIX}{index}"))));
@@ -148,7 +153,7 @@ fn overview(state: &UiState) -> ui::Element {
     root = root.child(t::card("设备连接", connection_text, "device", Some(UPLOAD_CONNECTION_EVENT)));
 
     // 6. 底部主操作区
-    let send_label = if locked { "正在处理中…" } else { "发送到设备" };
+    let send_label = if locked { "正在处理中…" } else { "发送整本到设备" };
     root = root.child(t::button(send_label, UPLOAD_START_EVENT, B::Primary, count > 0 && !locked).width_full());
 
     if count == 0 {
@@ -206,12 +211,16 @@ fn pages(state: &UiState, chapter_index: Option<usize>) -> ui::Element {
 
     if let Some(index) = chapter_index {
         if let Some(chapter) = state.upload_chapters.get(index) {
-            let mut input = t::input(&chapter.name, &format!("第 {} 章（可选标题）", index + 1),
+            let mut input = t::input(&chapter.name, &format!("第 {} 章（可选标题）", chapter.number),
                 &format!("{CHAPTER_NAME_INPUT_PREFIX}{index}"));
             if locked { input = input.disabled().opacity(0.5); }
             root = root.child(t::panel().gap(8)
                 .child(t::text("章节名称", 14, t::TEXT))
                 .child(input));
+            let mut number = t::input(&chapter.number.to_string(), "真实章号（1..100000）", &format!("{CHAPTER_NUMBER_INPUT_PREFIX}{index}"));
+            if locked { number = number.disabled(); }
+            root = root.child(t::panel().gap(6).child(t::text("真实章号", 14, t::TEXT)).child(number)
+                .child(t::hint("追加/更新按此章号定位，删除其他编辑项不会改变本章章号。")));
         } else {
             return root.child(t::hint("该章节已被移除，请点击上方返回按钮返回。"));
         }
@@ -270,6 +279,7 @@ fn pages(state: &UiState, chapter_index: Option<usize>) -> ui::Element {
 
     if let Some(index) = chapter_index {
         root = root.child(t::button("仅发送本章到设备", &format!("{CHAPTER_UPLOAD_PREFIX}{index}"), B::Secondary, !locked && !files.is_empty()).width_full())
+            .child(t::hint("新版追加/更新原作品；未声明章节导入能力的旧端发送为独立单本。"))
             .child(t::button("删除本章节", &format!("{CHAPTER_DELETE_PREFIX}{index}"), B::Danger, !locked).width_full());
     }
 

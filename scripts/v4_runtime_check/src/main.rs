@@ -781,7 +781,8 @@ async fn receive_legacy_import(world: &bindings::PsysWorldV4Http, accessor: &was
     let events = world.astrobox_psys_plugin_v4_event();
     let name = header["name"].as_str().unwrap();
     let mut cursor = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
-    events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"type":"import_header_ack","name":name}).to_string()).await?;
+    events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"type":"import_header_ack","name":name,
+        "sessionId":header["sessionId"]}).to_string()).await?;
     let mut files: HashMap<String, (usize, std::collections::BTreeMap<usize, String>)> = HashMap::new();
     for _ in 0..10000 {
         let messages: Vec<serde_json::Value> = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap()[cursor..]
@@ -927,6 +928,101 @@ async fn check_images(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::co
     events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
     pick_test_image(world,accessor,"upload_pick_files","repaired.bmp",rgba_bmp(240,480,true)).await?;
     assert_eq!(world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,request()).await?.status,200);
+    Ok(())
+}
+
+async fn check_chapter_import(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::{ui::Event, http_server::Request};
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    let events = world.astrobox_psys_plugin_v4_event();
+    let caps = serde_json::json!({"importWindow":4,"importResultProtocol":1,"importChapterProtocol":1});
+    let last_message = || accessor.with(|mut access| serde_json::from_str::<serde_json::Value>(access.get().sent_interconnect.lock().unwrap().last().unwrap()).unwrap());
+    let result = |header: &serde_json::Value| serde_json::json!({"type":"import_comic_result","sessionId":header["sessionId"],
+        "name":header["name"],"success":true,"savedPages":1,"totalPages":1,"failedFiles":0,"indexSuccess":true});
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_mode_multi".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_name_input".into(),Event::Change,serde_json::json!({"value":"章节追加测试"}).to_string()).await?;
+    for index in 0..2 {
+        events.call_on_ui_event(accessor,"upload_add_chapter".into(),Event::Click,"{}".into()).await?;
+        pick_test_image(world,accessor,&format!("chapter_pick_files_{index}"),&format!("p{index}.bmp"),picked_image(index)).await?;
+    }
+    events.call_on_ui_event(accessor,"chapter_number_input_1".into(),Event::Change,serde_json::json!({"value":"5"}).to_string()).await?;
+    events.call_on_ui_event(accessor,"chapter_name_input_1".into(),Event::Change,serde_json::json!({"value":"第五/章"}).to_string()).await?;
+    let mut book_id = String::new();
+    for index in 0..2 {
+        events.call_on_ui_event(accessor,format!("chapter_upload_{index}"),Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(world,accessor,caps.clone()).await?;
+        let header = last_message();
+        assert_eq!(header["type"],"import_comic_header");
+        assert_eq!(header["operation"],"upsert_chapters");
+        assert_eq!(header["mode"],"multi");
+        assert_eq!(header["chapters"].as_array().unwrap().len(),1);
+        assert_eq!(header["chapters"][0]["chapterNum"],if index == 0 { 1 } else { 5 });
+        if index == 0 { book_id = header["bookId"].as_str().unwrap().into(); }
+        assert_eq!(header["bookId"],book_id);
+        if index == 1 { assert_eq!(header["chapters"][0]["name"],"5　第五_章"); }
+        receive_legacy_import(world,accessor,&header).await?;
+        events.call_on_event(accessor,EventType::InterconnectMessage,result(&header).to_string()).await?;
+    }
+    // Resolve a legacy imported book through the real complete device snapshot/UI.
+    events.call_on_ui_event(accessor,"tab_data".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"comic_search_clear".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"fetch_app_data".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({"syncSession":true})).await?;
+    let session = last_message()["session"].clone();
+    for (gseq, mut frame) in [serde_json::json!({"type":"app_data_header","comic_count":1,"source_count":0}),
+        serde_json::json!({"type":"app_data_comic","index":0,"comic":{"id":"local_existing","name":"已有漫画","page_count":2,"chapters":2}}),
+        serde_json::json!({"type":"app_data_done"}),serde_json::json!({"type":"cover_done"})].into_iter().enumerate() {
+        frame["session"] = session.clone();
+        frame["gseq"] = serde_json::json!(gseq);
+        events.call_on_event(accessor,EventType::InterconnectMessage,frame.to_string()).await?;
+    }
+    let targets = rendered_delete(accessor,"import_target_");
+    assert_eq!(targets.len(),1,"{}",rendered_text(accessor));
+    let target = targets[0].clone();
+    events.call_on_ui_event(accessor,target,Event::Click,"{}".into()).await?;
+    assert!(rendered_text(accessor).contains("local_existing"));
+    // HTTP task carries the same logical identity, explicit target, and sparse real number.
+    events.call_on_ui_event(accessor,"chapter_upload_1".into(),Event::Click,"{}".into()).await?;
+    let mut http_caps = caps.clone(); http_caps["httpImport"] = serde_json::json!(true);
+    complete_startup_with_caps(world,accessor,http_caps).await?;
+    let bind = last_message(); assert_eq!(bind["type"],"gateway_bind");
+    events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"type":"gateway_bind_result",
+        "session":bind["session"],"success":true,"nativeFetch":true,"probeLength":689}).to_string()).await?;
+    let message = last_message(); assert_eq!(message["type"],"import_http_task");
+    let task_id = message["taskId"].as_str().unwrap();
+    let response = world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,Request { method:"GET".into(),
+        path:format!("/control/tasks/{task_id}"),query:String::new(),headers:vec![],body:vec![] }).await?;
+    let task: serde_json::Value = serde_json::from_slice(&response.body)?;
+    assert_eq!(task["bookId"],book_id); assert_eq!(task["targetComicId"],"local_existing");
+    assert_eq!(task["importChapterProtocol"],1); assert_eq!(task["operation"],"upsert_chapters");
+    assert_eq!(task["chapters"][0]["chapterNum"],5);
+    assert_eq!(task["chapters"].as_array().unwrap().len(),1);
+    world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,Request { method:"POST".into(),path:format!("/control/tasks/{task_id}/result"),
+        query:String::new(),headers:vec![],body:serde_json::json!({"success":true,"savedPages":1,"totalPages":1}).to_string().into_bytes() }).await?;
+    // Device rejects before ACK: stop immediately instead of timing out into legacy chunks.
+    events.call_on_ui_event(accessor,"chapter_upload_0".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_caps(world,accessor,caps).await?;
+    let header = last_message();
+    events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"type":"import_comic_result",
+        "sessionId":header["sessionId"],"name":header["name"],"success":false,"savedPages":0,"totalPages":1,
+        "failedFiles":0,"indexSuccess":false,"error":"导入目标已失效"}).to_string()).await?;
+    assert!(rendered_text(accessor).contains("导入目标已失效"));
+    events.call_on_ui_event(accessor,"import_target_clear".into(),Event::Click,"{}".into()).await?;
+    // Removing a preceding draft chapter never renumbers the surviving fifth chapter.
+    events.call_on_ui_event(accessor,"chapter_delete_0".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_start".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({"importChapterProtocol":1,"importResultProtocol":1})).await?;
+    let header = last_message(); assert_eq!(header["operation"],"replace_book"); assert_eq!(header["chapters"][0]["chapterNum"],5);
+    receive_legacy_import(world,accessor,&header).await?;
+    events.call_on_event(accessor,EventType::InterconnectMessage,result(&header).to_string()).await?;
+    // Old HTTP-capable clients still use the explicit independent-single fallback for a chapter.
+    events.call_on_ui_event(accessor,"chapter_upload_0".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({"httpImport":true})).await?;
+    let header = last_message(); assert_eq!(header["mode"],"single"); assert!(header["importChapterProtocol"].is_null());
+    assert!(header["name"].as_str().unwrap().contains(" - "));
+    receive_legacy_import(world,accessor,&header).await?;
+    println!("PASS: HTTP-9-A actual WASM stable book identity, true/sparse chapter numbers, ID target selection, HTTP/QAIC operation parity, rejected-header stop and old-client fallback.");
     Ok(())
 }
 
@@ -1092,6 +1188,7 @@ async fn main() -> wasmtime::Result<()> {
     let sources_only = std::env::args().any(|a|a == "--sources-only");
     let images_only = std::env::args().any(|a|a == "--images-only");
     let import_results_only = std::env::args().any(|a|a == "--import-results-only");
+    let chapters_only = std::env::args().any(|a|a == "--chapters-only");
     let mut config = Config::new();
     config.wasm_component_model(true).wasm_component_model_async(true).wasm_memory64(false);
     let engine = Engine::new(&config)?;
@@ -1174,6 +1271,7 @@ async fn main() -> wasmtime::Result<()> {
         events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one outgoing /config fetch produces the complete snapshot");
         if import_results_only { check_import_result_protocol(&world,accessor).await?; return Ok(()); }
+        if chapters_only { check_chapter_import(&world,accessor).await?; return Ok(()); }
         if images_only { check_images(&world,accessor,directory.path()).await?; return Ok(()); }
         if sources_only {
             check_sources(&world,accessor).await?;
@@ -1723,6 +1821,7 @@ async fn main() -> wasmtime::Result<()> {
         }
         check_images(&world,accessor,directory.path()).await?;
         check_import_result_protocol(&world,accessor).await?;
+        check_chapter_import(&world,accessor).await?;
 
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
@@ -1744,6 +1843,7 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
+    if chapters_only { return Ok(()); }
     if import_results_only {
         println!("PASS: P1-46 actual release WASM importResultProtocol negotiation, header sessionId, saving waiting state, result settlement, 25s timeout, partial/index error reporting and unknown query.");
         return Ok(());

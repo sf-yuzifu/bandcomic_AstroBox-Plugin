@@ -267,6 +267,10 @@ fn build_data_ui(state: &UiState) -> ui::Element {
                     .child(t::hint(&format!("ID：{}", comic.id)))
                     .child(t::hint(&detail))))
                 .child(t::button("从设备删除", &format!("{DELETE_COMIC_PREFIX}{}_{index}", state.data_browser.revision), B::Danger, can_delete).width_full()));
+            if comic.id.starts_with("local_") {
+                root = root.child(t::button("作为本地导入目标", &format!("{IMPORT_TARGET_PREFIX}{}_{index}", state.data_browser.revision),
+                    B::Secondary, can_delete && !state.upload_locked()).width_full());
+            }
         }
         if comics.len() > PAGE_WINDOW {
             root = root.child(t::pager(state.comic_page_cursor, comics.len(), COMIC_PAGE_PREV_EVENT, COMIC_PAGE_NEXT_EVENT));
