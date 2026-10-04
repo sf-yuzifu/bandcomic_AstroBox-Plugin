@@ -8,9 +8,12 @@
 //! - `GET /local/photo/<id>/chapter/<chapter>`：章节图片列表
 //! - `GET /local/photo/<id>/chapter/<chapter>/<page>.jpg`：正文单页图片（支持 width/quality/ifPNG/ifLVGL 参数）
 
+#[cfg(test)]
 use std::io::Cursor;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+#[cfg(test)]
+use image::{DynamicImage, ImageFormat};
 use serde_json::json;
+use crate::image_processor::{ImageRequest, ImageRole, PreparedImage, ImageProcessError};
 
 use crate::http_probe::{samples, ProbeResponse};
 use crate::ui::state::{ui_state, UploadMode};
@@ -39,7 +42,7 @@ fn percent_decode(s: &str) -> String {
 
 pub struct QueryParams {
     pub width: u32,
-    pub quality: u8,
+    pub quality: u32,
     pub if_png: bool,
     pub if_lvgl: bool,
 }
@@ -55,13 +58,13 @@ impl QueryParams {
             if let Some((k, v)) = pair.split_once('=') {
                 match k {
                     "width" => {
-                        if let Ok(w) = v.parse::<u32>() {
-                            width = w.clamp(10, 4096);
+                        if let Ok(w) = v.parse::<u64>() {
+                            width = w.clamp(10, 4096) as u32;
                         }
                     }
                     "quality" => {
-                        if let Ok(q) = v.parse::<u8>() {
-                            quality = q.clamp(1, 100);
+                        if let Ok(q) = v.parse::<u64>() {
+                            quality = q.clamp(1, 100) as u32;
                         }
                     }
                     "ifPNG" => {
@@ -94,7 +97,7 @@ pub struct LocalChapterData {
 #[derive(Clone)]
 pub enum LocalAsset { Disk(String), Memory(Vec<u8>) }
 impl LocalAsset {
-    fn read(&self) -> Result<Vec<u8>, String> {
+    fn read(&self) -> Result<Vec<u8>, ImageProcessError> {
         match self {
             Self::Disk(path) => crate::assets::read_master(path),
             Self::Memory(bytes) => Ok(bytes.clone()),
@@ -264,81 +267,41 @@ fn error_json(status: u16, msg: &str) -> ProbeResponse {
     json_response(status, &json!({ "code": status, "message": msg }))
 }
 
-/// 处理图片缩放与格式转换（优先 ifLVGL，其次 ifPNG，缺省为 JPEG，带磁盘缓存与 LVGL 尺寸安全检查）
+/// HTTP 参数只负责适配；所有图片规则和缓存均由共用处理器执行。
 pub fn process_image(
     data: &[u8],
     params: &QueryParams,
     allow_lvgl: bool,
-) -> Result<(Vec<u8>, &'static str), String> {
-    let is_lvgl = allow_lvgl && params.if_lvgl;
-    let cache_key = format!(
-        "{}_{}_{}_{}_{}",
-        crate::assets::hash_bytes(data),
-        params.width,
-        params.quality,
-        params.if_png,
-        is_lvgl
-    );
+) -> Result<PreparedImage, ImageProcessError> {
+    crate::image_processor::prepare_image(data, &ImageRequest {
+        role: if allow_lvgl { ImageRole::Page } else { ImageRole::Cover },
+        width: params.width, quality: params.quality,
+        if_png: params.if_png, if_lvgl: params.if_lvgl,
+    })
+}
 
-    let content_type: &'static str = if is_lvgl {
-        "application/octet-stream"
-    } else if params.if_png {
-        "image/png"
-    } else {
-        "image/jpeg"
-    };
-
-    if let Some(cached) = crate::assets::read_rendered_cache(&cache_key) {
-        return Ok((cached, content_type));
+fn image_response(asset: &LocalAsset, params: &QueryParams, is_page: bool, comic_id: &str, context: &str) -> ProbeResponse {
+    let result = asset.read().and_then(|bytes| process_image(&bytes, params, is_page));
+    match result {
+        Ok(product) => {
+            if crate::jobs::owns_image_request(comic_id) {
+                crate::ui::event_handler::record_image_notices(context, &product.notices);
+            }
+            ProbeResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), product.format.mime().into()),
+                    ("Content-Length".into(), product.bytes.len().to_string()), ("Cache-Control".into(), "no-store".into())],
+                body: product.bytes,
+            }
+        }
+        Err(error) => {
+            let message = format!("{context}：{error}");
+            if crate::jobs::owns_image_request(comic_id) {
+                crate::ui::event_handler::record_image_notices("HTTP 图片", &[message.clone()]);
+            }
+            error_json(error.http_status(), &message)
+        }
     }
-
-    let img = image::load_from_memory(data).map_err(|e| format!("解码图片失败: {}", e))?;
-
-    let (w, h) = img.dimensions();
-    let target_width = params.width.clamp(10, 4096);
-    let resized = if w > target_width {
-        let new_h = ((h as f64 * target_width as f64 / w as f64).round() as u32).max(1);
-        img.resize_exact(target_width, new_h, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
-
-    let result_bytes = if is_lvgl {
-        // LVGL 8 尺寸安全检查：宽高均限制在 11 bit (<= 2047) 以内，防止长图位移溢出
-        let safe_img = crate::assets::clamp_lvgl_dimensions(resized);
-        crate::lvgl::convert_to_lvgl_i8(&safe_img)
-    } else if params.if_png {
-        let mut buf = Cursor::new(Vec::new());
-        resized
-            .write_to(&mut buf, ImageFormat::Png)
-            .map_err(|e| format!("PNG 编码失败: {}", e))?;
-        buf.into_inner()
-    } else {
-        // JPEG 编码：透明区域先合成到白色背景，避免黑边
-        let rgba = resized.to_rgba8();
-        let mut bg = image::RgbaImage::from_pixel(
-            rgba.width(),
-            rgba.height(),
-            image::Rgba([255, 255, 255, 255]),
-        );
-        image::imageops::overlay(&mut bg, &rgba, 0, 0);
-        let rgb = DynamicImage::ImageRgba8(bg).to_rgb8();
-
-        let mut buf = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut buf,
-            params.quality.clamp(1, 100),
-        );
-        encoder
-            .encode_image(&DynamicImage::ImageRgb8(rgb))
-            .map_err(|e| format!("JPEG 编码失败: {}", e))?;
-        buf
-    };
-
-    // 缓存渲染结果
-    crate::assets::write_rendered_cache(&cache_key, &result_bytes);
-
-    Ok((result_bytes, content_type))
 }
 
 /// 路由分发
@@ -442,18 +405,7 @@ pub fn route_local(
             };
             let params = QueryParams::parse(query);
             // 封面不生成 LVGL indexed-8，保持普通图片格式
-            return match cover_bytes.read().and_then(|bytes| process_image(&bytes, &params, false)) {
-                Ok((body, content_type)) => Some(ProbeResponse {
-                    status: 200,
-                    headers: vec![
-                        ("Content-Type".into(), content_type.into()),
-                        ("Content-Length".into(), body.len().to_string()),
-                        ("Cache-Control".into(), "no-store".into()),
-                    ],
-                    body,
-                }),
-                Err(err) => Some(error_json(500, &err)),
-            };
+            return Some(image_response(cover_bytes, &params, false, &comic.id, &format!("《{}》封面", comic.name)));
         }
 
         // 4. GET /local/album/<id>
@@ -514,18 +466,7 @@ pub fn route_local(
             let page_bytes = &chapter.pages[page_idx - 1];
             let params = QueryParams::parse(query);
 
-            return match page_bytes.read().and_then(|bytes| process_image(&bytes, &params, true)) {
-                Ok((body, content_type)) => Some(ProbeResponse {
-                    status: 200,
-                    headers: vec![
-                        ("Content-Type".into(), content_type.into()),
-                        ("Content-Length".into(), body.len().to_string()),
-                        ("Cache-Control".into(), "no-store".into()),
-                    ],
-                    body,
-                }),
-                Err(err) => Some(error_json(500, &err)),
-            };
+            return Some(image_response(page_bytes, &params, true, &comic.id, &format!("《{}》第{}章第{}页", comic.name, chapter_idx, page_idx)));
         } else if parts.len() == 3 && parts[1] == "chapter" {
             // GET /local/photo/<id>/chapter/<chapter>
             let id = parts[0];
@@ -571,6 +512,29 @@ pub fn route_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_route_enforces_width_and_image_errors_are_json_with_a_real_status() {
+        let image = DynamicImage::new_rgba8(240, 480);
+        let mut output = Cursor::new(Vec::new());
+        image.write_to(&mut output, ImageFormat::Png).unwrap();
+        let comic = publish(LocalComicData { id: "errors".into(), name: "图片错误测试".into(), revision: "draft".into(),
+            cover: Some(LocalAsset::Memory(output.into_inner())),
+            chapters: vec![LocalChapterData { chapter_number: 1, title: "Chapter".into(),
+                pages: vec![LocalAsset::Memory(b"<html>bad image</html>".to_vec()), LocalAsset::Disk("cache/missing-image-test.png".into())] }] });
+        let base = "http://host:1234";
+        let cover = route_local("GET", &format!("/local/album/{}/cover", comic.id), "width=1000&ifLVGL=1&ifPNG=1", base).unwrap();
+        assert_eq!(image::load_from_memory(&cover.body).unwrap().width(), 80);
+        assert!(cover.headers.contains(&("Content-Type".into(), "image/png".into())));
+        for (page, status, stage) in [(1, 422, "解码"), (2, 500, "读取")] {
+            let response = route_local("GET", &format!("/local/photo/{}/chapter/1/{page}.jpg", comic.id), "ifLVGL=1", base).unwrap();
+            assert_eq!(response.status, status);
+            assert!(response.headers.contains(&("Content-Type".into(), "application/json; charset=utf-8".into())));
+            let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert!(error["message"].as_str().unwrap().contains(stage));
+            assert!(error["message"].as_str().unwrap().contains(&format!("第{page}页")));
+        }
+    }
 
     #[test]
     fn published_cover_is_independent_of_pages_and_later_uploads() {
@@ -644,6 +608,18 @@ mod tests {
         assert_eq!(p2.width, 4096);
         assert_eq!(p2.quality, 100);
         assert!(p2.if_lvgl);
+    }
+
+    #[test]
+    fn out_of_range_http_and_watch_quality_normalize_before_narrowing() {
+        let master = samples().unwrap().png.as_slice();
+        for value in [0u64, 300, u64::MAX] {
+            let query = QueryParams::parse(&format!("width={value}&quality={value}"));
+            let watch = crate::ui::state::WatchSettings::from_json(&json!({"imageSize":value,"imageQuality":value}));
+            let http = process_image(master, &query, true).unwrap();
+            let legacy = crate::image_processor::prepare_image(master, &watch.image_request(ImageRole::Page)).unwrap();
+            assert_eq!(http, legacy);
+        }
     }
 
     #[test]

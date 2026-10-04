@@ -40,6 +40,10 @@ impl Default for WatchSettings {
 }
 
 impl WatchSettings {
+    pub fn image_request(&self, role: crate::image_processor::ImageRole) -> crate::image_processor::ImageRequest {
+        crate::image_processor::ImageRequest { role, width: self.image_size, quality: self.image_quality,
+            if_png: self.image_use_png, if_lvgl: self.image_pre_transcode }
+    }
     /// 快应用侧设置项的值可能是字符串或数字/布尔，做兼容解析
     pub fn from_json(v: &Value) -> Self {
         let d = WatchSettings::default();
@@ -49,7 +53,7 @@ impl WatchSettings {
                     x.as_u64()
                         .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
                 })
-                .map(|n| n as u32)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
                 .unwrap_or(def)
         };
         let get_bool = |key: &str, def: bool| -> bool {
@@ -98,16 +102,19 @@ pub struct UploadFile {
 }
 
 impl UploadFile {
-    pub fn get_master_data(&self) -> Result<Vec<u8>, String> {
+    pub fn get_master_data(&self) -> Result<Vec<u8>, crate::image_processor::ImageProcessError> {
         if let Some(path) = &self.disk_path {
-            if let Ok(bytes) = crate::assets::read_master(path) {
-                return Ok(bytes);
+            match crate::assets::read_master(path) {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if self.data.is_empty() => return Err(error),
+                Err(_) => {}
             }
         }
         if !self.data.is_empty() {
             Ok(self.data.clone())
         } else {
-            Err("图片数据丢失（未在内存且无法读取磁盘）".to_string())
+            Err(crate::image_processor::ImageProcessError::new(crate::image_processor::ErrorStage::Read,
+                "图片数据丢失（未在内存且无法读取磁盘）"))
         }
     }
 }
@@ -266,6 +273,7 @@ pub struct UiState {
     pub upload_progress: f32,
     pub upload_current_file: String,
     pub upload_status: StatusState,
+    pub image_notices: Vec<String>,
     pub upload_status_timer_id: Option<u64>,
     pub upload_session: Option<UploadSession>,
     /// 最近一次收到的握手应答 (session, 快应用设置)
@@ -338,6 +346,7 @@ impl Default for UiState {
             upload_progress: 0.0,
             upload_current_file: String::new(),
             upload_status: StatusState::Default,
+            image_notices: Vec::new(),
             upload_status_timer_id: None,
             upload_session: None,
             hs_pong: None,
@@ -656,6 +665,16 @@ mod upload_tests {
         assert_eq!(page_window(12, 0), (0, 0));
         assert_eq!(page_window(12, 17), (16, 17));
         assert_eq!(page_window(2, 16), (8, 16));
+    }
+
+    #[test]
+    fn missing_disk_master_is_a_read_error_and_valid_memory_fallback_is_explicit() {
+        let mut file = file("missing");
+        file.disk_path = Some("cache/missing-ui-image-test.png".into());
+        file.data.clear();
+        assert!(file.get_master_data().unwrap_err().to_string().contains("读取母版图片失败"));
+        file.data = vec![1, 2, 3];
+        assert_eq!(file.get_master_data().unwrap(), vec![1, 2, 3]);
     }
 }
 

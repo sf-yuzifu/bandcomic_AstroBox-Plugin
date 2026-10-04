@@ -39,6 +39,11 @@ fn overview(state: &UiState) -> ui::Element {
     if !matches!(state.upload_status, StatusState::Default) {
         root = root.child(status(state));
     }
+    if !state.image_notices.is_empty() {
+        let mut panel = t::panel().gap(6).child(t::text("图片处理说明（最近一次发送）", 14, t::WARNING));
+        for notice in &state.image_notices { panel = panel.child(t::hint(notice)); }
+        root = root.child(panel);
+    }
 
     // 3. 漫画基础信息主卡片（封面 + 漫画名 + 模式/页数统计，点击修改名称）
     let name = if state.upload_comic_name_input.trim().is_empty() {
@@ -343,7 +348,7 @@ fn status(state: &UiState) -> ui::Element {
     }
 
     if matches!(state.upload_status, StatusState::Error(_)) {
-        panel = panel.child(t::hint("已整理的内容完好保留。请检查手环连接后再次点击发送。"));
+        panel = panel.child(t::hint("已整理的内容保留。请按上述原因修正图片、文件或连接后重试。"));
     }
 
     panel

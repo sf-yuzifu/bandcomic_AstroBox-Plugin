@@ -53,7 +53,7 @@ fn make_samples() -> Result<Samples, String> {
         .encode_image(&image).map_err(|e| e.to_string())?;
     let mut png = Cursor::new(Vec::new());
     image.write_to(&mut png, ImageFormat::Png).map_err(|e| e.to_string())?;
-    Ok(Samples { jpeg, png: png.into_inner(), lvgl: crate::lvgl::convert_to_lvgl_i8(&image) })
+    Ok(Samples { jpeg, png: png.into_inner(), lvgl: crate::lvgl::convert_to_lvgl_i8(&image)? })
 }
 
 fn response(status: u16, content_type: &str, body: Vec<u8>) -> ProbeResponse {

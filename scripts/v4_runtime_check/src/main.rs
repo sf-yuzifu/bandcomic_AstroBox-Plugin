@@ -29,6 +29,7 @@ struct Context {
     stops: u32,
     sent_interconnect: Arc<Mutex<Vec<String>>>,
     picked_images: usize,
+    next_pick: Option<(String, Vec<u8>)>,
     app_version: u32,
     launches: usize,
     launched_at: Option<std::time::Instant>,
@@ -67,6 +68,81 @@ fn picked_image(index: usize) -> Vec<u8> {
         }
     }
     bmp
+}
+
+// BITMAPV4HEADER with explicit RGBA masks: transparent/half-transparent test
+// pixels and a tall image exercise the guest decoder, never a host image library.
+fn rgba_bmp(width: u32, height: u32, transparent: bool) -> Vec<u8> {
+    let size = 122 + width as usize * height as usize * 4;
+    let mut bmp = vec![0u8; size];
+    bmp[..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&(size as u32).to_le_bytes());
+    bmp[10..14].copy_from_slice(&122u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&108u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&width.to_le_bytes());
+    bmp[22..26].copy_from_slice(&height.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+    bmp[30..34].copy_from_slice(&3u32.to_le_bytes());
+    for (offset, mask) in [(54, 0x00ff0000u32), (58, 0x0000ff00), (62, 0x000000ff), (66, 0xff000000)] {
+        bmp[offset..offset + 4].copy_from_slice(&mask.to_le_bytes());
+    }
+    for y in 0..height { for x in 0..width {
+        let offset = 122 + (y * width + x) as usize * 4;
+        let pixel = if transparent { [(y * 7) as u8, (x * 11) as u8, (x * 3 + y * 5) as u8,
+            if x < width / 3 { 0 } else if x < width * 2 / 3 { 128 } else { 255 }] }
+            else { [80, 120, 200, 255] };
+        bmp[offset..offset + 4].copy_from_slice(&pixel);
+    } }
+    bmp
+}
+
+fn image_dimensions(bytes: &[u8], format: &str) -> (u32, u32) {
+    match format {
+        "image/png" => {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+            (u32::from_be_bytes(bytes[16..20].try_into().unwrap()), u32::from_be_bytes(bytes[20..24].try_into().unwrap()))
+        }
+        "application/octet-stream" => {
+            let header = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(header & 1023, 10);
+            let dims = ((header >> 10) & 2047, header >> 21);
+            assert_eq!(bytes.len(), 1028 + (dims.0 * dims.1) as usize);
+            dims
+        }
+        "image/jpeg" => {
+            assert_eq!(&bytes[..2], &[255, 216]);
+            let mut position = 2;
+            loop {
+                assert_eq!(bytes[position], 255);
+                let marker = bytes[position + 1];
+                let length = u16::from_be_bytes(bytes[position + 2..position + 4].try_into().unwrap()) as usize;
+                if marker == 0xc0 {
+                    return (u16::from_be_bytes(bytes[position + 7..position + 9].try_into().unwrap()) as u32,
+                        u16::from_be_bytes(bytes[position + 5..position + 7].try_into().unwrap()) as u32);
+                }
+                position += 2 + length;
+                assert!(position < bytes.len(), "JPEG dimensions missing");
+            }
+        }
+        _ => panic!("unexpected image format"),
+    }
+}
+
+fn decode_base64(encoded: &str) -> Vec<u8> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    for chunk in encoded.as_bytes().chunks(4) {
+        assert_eq!(chunk.len(), 4);
+        let value = |byte| alphabet.iter().position(|&b| b == byte).unwrap() as u8;
+        let (a, b) = (value(chunk[0]), value(chunk[1]));
+        bytes.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = value(chunk[2]); bytes.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' { bytes.push((c << 6) | value(chunk[3])); }
+        }
+    }
+    bytes
 }
 
 impl WasiView for Context {
@@ -185,15 +261,16 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         Ok(())
     }))?;
     linker.instance("astrobox:psys-host-v4/dialog")?.func_new_concurrent("pick-file", |accessor, _, _, results| Box::pin(async move {
-        let index = accessor.with(|mut access| {
+        let (name, data) = accessor.with(|mut access| {
             let ctx = access.get();
+            if let Some(pick) = ctx.next_pick.take() { return pick; }
             let index = ctx.picked_images;
             ctx.picked_images += 1;
-            index
+            (format!("test_image_{index}.bmp"), picked_image(index))
         });
         let pick_res = Val::Record(vec![
-            ("name".into(), Val::String(format!("test_image_{index}.bmp"))),
-            ("data".into(), Val::List(picked_image(index).into_iter().map(Val::U8).collect())),
+            ("name".into(), Val::String(name)),
+            ("data".into(), Val::List(data.into_iter().map(Val::U8).collect())),
         ]);
         results[0] = Val::Result(Ok(Some(Box::new(pick_res))));
         Ok(())
@@ -391,6 +468,16 @@ async fn complete_startup_with_caps(
     accessor: &wasmtime::component::Accessor<Context>,
     caps: serde_json::Value,
 ) -> wasmtime::Result<()> {
+    complete_startup_with_profile(world, accessor, caps,
+        serde_json::json!({ "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false })).await
+}
+
+async fn complete_startup_with_profile(
+    world: &bindings::PsysWorldV4Http,
+    accessor: &wasmtime::component::Accessor<Context>,
+    caps: serde_json::Value,
+    settings: serde_json::Value,
+) -> wasmtime::Result<()> {
     use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
     let events = world.astrobox_psys_plugin_v4_event();
     let (delay, payload, registrations, sent, launched_at) = accessor.with(|mut access| {
@@ -417,7 +504,7 @@ async fn complete_startup_with_caps(
     assert_eq!(ping["type"], "hs_ping");
     events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
         "type": "hs_pong", "session": ping["session"],
-        "settings": { "imageSize": 480, "imageQuality": 50, "imageUsePng": false, "imagePreTranscode": false },
+        "settings": settings,
         "caps": caps
     }).to_string()).await?;
     Ok(())
@@ -648,10 +735,174 @@ async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::c
     Ok(())
 }
 
+async fn pick_test_image(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>, event: &str, name: &str, data: Vec<u8>) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::ui::Event;
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    accessor.with(|mut access| access.get().next_pick = Some((name.into(), data)));
+    world.astrobox_psys_plugin_v4_event().call_on_ui_event(accessor,event.into(),Event::Click,"{}".into()).await?;
+    world.astrobox_psys_plugin_v4_event().call_on_event(accessor,EventType::Timer,serde_json::json!({"payload":"pick_process"}).to_string()).await?;
+    Ok(())
+}
+
+async fn receive_legacy_import(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>, header: &serde_json::Value) -> wasmtime::Result<HashMap<String, Vec<u8>>> {
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    let events = world.astrobox_psys_plugin_v4_event();
+    let name = header["name"].as_str().unwrap();
+    let mut cursor = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"type":"import_header_ack","name":name}).to_string()).await?;
+    let mut files: HashMap<String, (usize, std::collections::BTreeMap<usize, String>)> = HashMap::new();
+    for _ in 0..10000 {
+        let messages: Vec<serde_json::Value> = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap()[cursor..]
+            .iter().map(|s|serde_json::from_str(s).unwrap()).collect());
+        assert!(!messages.is_empty(), "legacy sender stalled");
+        cursor += messages.len();
+        let mut last = None;
+        let mut done = false;
+        for message in messages {
+            if message["type"] == "import_comic_done" { done = true; continue; }
+            assert_eq!(message["type"], "import_comic_chunk");
+            let file = message["file"].as_str().unwrap().to_string();
+            let total = message["total"].as_u64().unwrap() as usize;
+            let entry = files.entry(file).or_insert_with(|| (total, Default::default()));
+            assert_eq!(entry.0, total);
+            entry.1.insert(message["index"].as_u64().unwrap() as usize, message["data"].as_str().unwrap().into());
+            last = Some(message);
+        }
+        if done {
+            return Ok(files.into_iter().map(|(file,(total,chunks))| {
+                assert_eq!(chunks.len(),total);
+                assert!(chunks.keys().copied().eq(0..total));
+                (file,decode_base64(&chunks.into_values().collect::<String>()))
+            }).collect());
+        }
+        let last = last.unwrap();
+        let ack = if let Some(gseq) = last["gseq"].as_u64() {
+            serde_json::json!({"type":"import_chunk_ack","name":name,"ack":gseq+1})
+        } else { serde_json::json!({"type":"import_chunk_ack","name":name,"file":last["file"],"index":last["index"]}) };
+        events.call_on_event(accessor,EventType::InterconnectMessage,ack.to_string()).await?;
+    }
+    panic!("legacy import did not finish");
+}
+
+async fn compare_image_import(
+    world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>, directory: &std::path::Path,
+    event: &str, outputs: &[(&str, &str)], png: bool, lvgl: bool, window: bool,
+) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::{ui::Event, http_server::Request};
+    let http = world.astrobox_psys_plugin_v4_http();
+    let events = world.astrobox_psys_plugin_v4_event();
+    let query = format!("width=96&quality=65&ifPNG={}&ifLVGL={}",u8::from(png),u8::from(lvgl));
+    let request = |path: &str| Request { method:"GET".into(),path:path.into(),query:query.clone(),headers:vec![],body:vec![] };
+    let mut expected = HashMap::new();
+    for &(file,path) in outputs {
+        let response = http.call_handle(accessor,1,request(path)).await?;
+        assert_eq!(response.status,200);
+        let mime = if file == "cover" { if png { "image/png" } else { "image/jpeg" } }
+            else if lvgl { "application/octet-stream" } else if png { "image/png" } else { "image/jpeg" };
+        assert!(response.headers.iter().any(|h|h.name.eq_ignore_ascii_case("content-type") && h.value == mime));
+        let (width,height) = image_dimensions(&response.body,mime);
+        if file == "cover" { assert_eq!(width,80); }
+        if lvgl && file != "cover" { assert!(width <= 2047 && height <= 2047); }
+        expected.insert(file.to_string(),response.body);
+    }
+    // Independently encode on the legacy path, then exercise real cache hits and corruption.
+    std::fs::remove_dir_all(directory.join("cache/rendered"))?;
+    let before = accessor.with(|mut access|access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor,event.into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_profile(world,accessor,if window { serde_json::json!({"importWindow":4}) } else { serde_json::json!({}) },
+        serde_json::json!({"imageSize":96,"imageQuality":65,"imageUsePng":png,"imagePreTranscode":lvgl})).await?;
+    let header: serde_json::Value = accessor.with(|mut access|access.get().sent_interconnect.lock().unwrap()[before..].iter()
+        .map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap()).find(|v|v["type"] == "import_comic_header").expect("valid images must produce a header"));
+    assert_eq!(header.get("wchunks").is_some(),window);
+    let actual = receive_legacy_import(world,accessor,&header).await?;
+    assert_eq!(actual,expected,"real HTTP body and reassembled legacy payload differ");
+    if lvgl && outputs.iter().any(|(_,path)|path.contains("/2.jpg")) {
+        assert!(rendered_text(accessor).contains("2047") && rendered_text(accessor).contains("整体缩小"));
+    }
+    for &(file,path) in outputs {
+        assert_eq!(http.call_handle(accessor,1,request(path)).await?.body,expected[file],"cache hit changed the product");
+    }
+    for entry in std::fs::read_dir(directory.join("cache/rendered"))? {
+        std::fs::write(entry?.path(),b"truncated-cache")?;
+    }
+    for &(file,path) in outputs {
+        assert_eq!(http.call_handle(accessor,1,request(path)).await?.body,expected[file],"corrupt cache changed the product");
+    }
+    Ok(())
+}
+
+async fn check_images(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>, directory: &std::path::Path) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::{ui::Event, http_server::Request};
+    let events = world.astrobox_psys_plugin_v4_event();
+    events.call_on_ui_render(accessor,"library-test".into()).await?;
+    events.call_on_ui_event(accessor,"tab_upload".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_mode_single".into(),Event::Click,"{}".into()).await?;
+    pick_test_image(world,accessor,"upload_pick_files","transparent.bmp",rgba_bmp(240,480,true)).await?;
+    pick_test_image(world,accessor,"upload_pick_files","long.bmp",rgba_bmp(64,6000,false)).await?;
+    assert!(rendered_text(accessor).contains("已整理 2 页正文"));
+    for (png,lvgl,window) in [(false,false,false),(true,false,true),(false,true,true),(true,true,true)] {
+        let first = if lvgl { "1.bin" } else { "1" };
+        let second = if lvgl { "2.bin" } else { "2" };
+        compare_image_import(world,accessor,directory,"upload_start",&[
+            ("cover","/local/album/single_1/cover"),(first,"/local/photo/single_1/chapter/1/1.jpg"),
+            (second,"/local/photo/single_1/chapter/1/2.jpg")],png,lvgl,window).await?;
+    }
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_mode_multi".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_add_chapter".into(),Event::Click,"{}".into()).await?;
+    pick_test_image(world,accessor,"chapter_pick_files_0","transparent.bmp",rgba_bmp(240,480,true)).await?;
+    pick_test_image(world,accessor,"chapter_pick_files_0","long.bmp",rgba_bmp(64,6000,false)).await?;
+    compare_image_import(world,accessor,directory,"upload_start",&[
+        ("cover","/local/album/multi_1/cover"),("1　第1章/1","/local/photo/multi_1/chapter/1/1.jpg"),
+        ("1　第1章/2","/local/photo/multi_1/chapter/1/2.jpg")],true,false,true).await?;
+    compare_image_import(world,accessor,directory,"chapter_upload_0",&[
+        ("1.bin","/local/photo/multi_1/chapter/1/1.jpg"),("2.bin","/local/photo/multi_1/chapter/1/2.jpg")],false,true,false).await?;
+
+    // Picker rejects bad data before it becomes a valid body page.
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,"upload_mode_single".into(),Event::Click,"{}".into()).await?;
+    pick_test_image(world,accessor,"upload_pick_files","bad.png",b"<html>bad image</html>".to_vec()).await?;
+    assert!(rendered_text(accessor).contains("bad.png") && rendered_text(accessor).contains("解码失败"));
+    assert!(rendered_text(accessor).contains("已整理 0 页正文"));
+    let mut oversized = rgba_bmp(1,1,false);
+    oversized[18..22].copy_from_slice(&4096u32.to_le_bytes()); oversized[22..26].copy_from_slice(&9000u32.to_le_bytes());
+    pick_test_image(world,accessor,"upload_pick_files","oversized.bmp",oversized).await?;
+    assert!(rendered_text(accessor).contains("预算失败") && rendered_text(accessor).contains("已整理 0 页正文"),"{}",rendered_text(accessor));
+
+    // Missing/corrupt disk data must fail on HTTP and before any legacy header.
+    pick_test_image(world,accessor,"upload_pick_files","missing.bmp",rgba_bmp(240,480,true)).await?;
+    for entry in std::fs::read_dir(directory.join("cache/masters"))? { std::fs::remove_file(entry?.path())?; }
+    let request = || Request { method:"GET".into(),path:"/local/photo/single_1/chapter/1/1.jpg".into(),query:"ifLVGL=1".into(),headers:vec![],body:vec![] };
+    let response = world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,request()).await?;
+    assert_eq!(response.status,500);
+    assert!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["message"].as_str().unwrap().contains("读取"));
+    let before = accessor.with(|mut access|access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor,"upload_start".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_profile(world,accessor,serde_json::json!({}),serde_json::json!({"imagePreTranscode":true})).await?;
+    assert!(rendered_text(accessor).contains("missing.bmp") && rendered_text(accessor).contains("读取失败"));
+    accessor.with(|mut access| assert!(!access.get().sent_interconnect.lock().unwrap()[before..].iter().any(|s|s.contains("import_comic_header"))));
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    pick_test_image(world,accessor,"upload_pick_files","corrupt.bmp",rgba_bmp(240,480,true)).await?;
+    for entry in std::fs::read_dir(directory.join("cache/masters"))? { std::fs::write(entry?.path(),b"corrupt-master")?; }
+    assert_eq!(world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,request()).await?.status,422);
+    let before = accessor.with(|mut access|access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor,"upload_start".into(),Event::Click,"{}".into()).await?;
+    complete_startup_with_profile(world,accessor,serde_json::json!({}),serde_json::json!({"imagePreTranscode":true})).await?;
+    assert!(rendered_text(accessor).contains("corrupt.bmp") && rendered_text(accessor).contains("解码失败"));
+    accessor.with(|mut access| assert!(!access.get().sent_interconnect.lock().unwrap()[before..].iter().any(|s|s.contains("import_comic_header"))));
+    // Re-selecting valid input repairs the disk master without requiring cache cleanup UI.
+    events.call_on_ui_event(accessor,"upload_clear".into(),Event::Click,"{}".into()).await?;
+    pick_test_image(world,accessor,"upload_pick_files","repaired.bmp",rgba_bmp(240,480,true)).await?;
+    assert_eq!(world.astrobox_psys_plugin_v4_http().call_handle(accessor,1,request()).await?.status,200);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> wasmtime::Result<()> {
     let wasm = std::env::args().nth(1).expect("usage: v4-runtime-check <plugin.wasm>");
     let sources_only = std::env::args().any(|a|a == "--sources-only");
+    let images_only = std::env::args().any(|a|a == "--images-only");
     let mut config = Config::new();
     config.wasm_component_model(true).wasm_component_model_async(true).wasm_memory64(false);
     let engine = Engine::new(&config)?;
@@ -680,6 +931,7 @@ async fn main() -> wasmtime::Result<()> {
         stops: 0,
         sent_interconnect: sent_interconnect.clone(),
         picked_images: 0,
+        next_pick: None,
         app_version: 382,
         launches: 0,
         launched_at: None,
@@ -725,6 +977,7 @@ async fn main() -> wasmtime::Result<()> {
         events.call_on_ui_event(accessor, "domain_input_blur".into(), Event::Blur,
             serde_json::json!({"value": url}).to_string()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one outgoing /config fetch produces the complete snapshot");
+        if images_only { check_images(&world,accessor,directory.path()).await?; return Ok(()); }
         if sources_only {
             check_sources(&world,accessor).await?;
             return Ok(());
@@ -1266,6 +1519,13 @@ async fn main() -> wasmtime::Result<()> {
 
         check_sources(&world,accessor).await?;
 
+        let masters: Vec<_> = std::fs::read_dir(directory.path().join("cache/masters"))?.collect::<Result<_, _>>()?;
+        assert_eq!(masters.len(),5,"WASI disk masters must not overwrite one another");
+        for expected in &image_bodies[1..] {
+            assert!(masters.iter().any(|entry|std::fs::read(entry.path()).unwrap() == *expected),"canonical PNG masters must match the full-size PNG products");
+        }
+        check_images(&world,accessor,directory.path()).await?;
+
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
         let port = identity["port"].as_u64().unwrap() as u16;
@@ -1286,16 +1546,15 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
+    if images_only {
+        println!("PASS: P1-45 actual release WASM HTTP/legacy byte equality, JPEG/PNG/LVGL priority, transparent/long images, cover width, single/multi/chapter uploads, stop-and-wait/window chunks, cache hits/corruption, bounded picks and missing/corrupt master errors.");
+        return Ok(());
+    }
     if sources_only {
         println!("PASS: P1-44 actual release WASM single-fetch catalogs, source selection/pagination, per-key Cookie keep/update/clear, immutable handshake payloads, stale forms/events, device changes, typed read errors and partial send failures.");
         return Ok(());
     }
-    let masters: Vec<_> = std::fs::read_dir(directory.path().join("cache/masters"))?.collect::<Result<_, _>>()?;
-    assert_eq!(masters.len(), 5, "WASI disk masters must not overwrite one another");
-    for index in 0..5 {
-        assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
-    }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
-    println!("PASS: P1-44 single-fetch catalogs, per-key Cookie operations, source selection/pagination, immutable payloads, read/send failures and device isolation; P1-43 stable deletion/results/query/timeouts; plus library search/completeness, version gates, startup silence, HTTP import/binding/images, disk masters and start/stop on the actual release WASM.");
+    println!("PASS: P1-45 HTTP/legacy byte equality, formats/transparency/long images, all upload entrances, caches and image errors; P1-44 source catalogs/Cookies; P1-43 deletion/results/timeouts; plus library completeness, version gates, HTTP import/binding, disk masters and start/stop on the actual release WASM.");
     Ok(())
 }

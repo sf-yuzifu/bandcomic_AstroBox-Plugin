@@ -9,7 +9,7 @@ use crate::sync_receive::{CoverChunks, MAX_COVER_CHUNKS};
 use std::time::Instant;
 use super::data_browser::DataPhase;
 use super::deletion::{DeletePhase, DELETE_QUERY_PREFIX, DELETE_TIMEOUT_EVENT, DELETE_TIMEOUT_MS};
-use image::ImageEncoder;
+use crate::image_processor::{ImageRole, PreparedImage};
 use serde_json::{Value, json};
 
 use super::build::{self, build_main_ui};
@@ -484,7 +484,15 @@ pub fn handle_pick_process() {
         None => return,
     };
 
-    let (thumbnail, master) = process_picked_image(&pick.data);
+    let (thumbnail, master) = match crate::image_processor::prepare_picked_image(&pick.data) {
+        Ok(images) => images,
+        Err(error) => {
+            ui_state().write().unwrap_or_else(|p| p.into_inner()).upload_status =
+                StatusState::Error(format!("选图《{}》：{}", pick.name, error));
+            rerender_upload_ui();
+            return;
+        }
+    };
     let master_len = master.len();
     let original_len = pick.data.len();
 
@@ -571,59 +579,6 @@ pub fn handle_pick_process() {
     rerender_upload_ui();
 }
 
-/// 选中图片统一处理：解码一次 → 缩略图 + 母版。
-/// 大图直缩在小算力 wasm 上很慢（Lanczos3 全卷积数秒级），两级缩放
-/// （先 Triangle 粗缩到 2× 再 Lanczos3 精缩）耗时仅零头且质量无可见差异
-fn process_picked_image(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let img = match image::load_from_memory(data) {
-        Ok(img) => img,
-        Err(e) => {
-            tracing::warn!("图片解码失败，使用原始数据: {}", e);
-            return (data.to_vec(), data.to_vec());
-        }
-    };
-    // 缩略图：100px 小尺寸下 Triangle 与 Lanczos3 无肉眼差异，直接快速滤波
-    let thumbnail = resize_decoded(&img, THUMBNAIL_WIDTH, data, true);
-    let master = resize_decoded(&img, MASTER_WIDTH, data, false);
-    (thumbnail, master)
-}
-
-/// 从已解码图像缩放并编码 PNG；宽度本就不超目标或编码失败时回退原始数据
-fn resize_decoded(
-    img: &image::DynamicImage,
-    target_width: u32,
-    original: &[u8],
-    fast: bool,
-) -> Vec<u8> {
-    let (w, h) = (img.width(), img.height());
-    if w <= target_width {
-        return original.to_vec();
-    }
-    let new_h = ((h as f64 * target_width as f64 / w as f64).round() as u32).max(1);
-    let resized = if fast {
-        img.resize_exact(target_width, new_h, image::imageops::FilterType::Triangle)
-    } else if w > target_width * 2 {
-        let pre_h = ((h as f64 * (target_width * 2) as f64 / w as f64).round() as u32).max(1);
-        let pre =
-            img.resize_exact(target_width * 2, pre_h, image::imageops::FilterType::Triangle);
-        pre.resize_exact(target_width, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img.resize_exact(target_width, new_h, image::imageops::FilterType::Lanczos3)
-    };
-    let mut buf = std::io::Cursor::new(Vec::new());
-    match resized.write_to(&mut buf, image::ImageFormat::Png) {
-        Ok(_) => {
-            let result = buf.into_inner();
-            tracing::info!("缩放完成: {} bytes -> {} bytes", original.len(), result.len());
-            result
-        }
-        Err(e) => {
-            tracing::warn!("PNG 编码失败，使用原始数据: {}", e);
-            original.to_vec()
-        }
-    }
-}
-
 fn handle_upload_move(index: usize, direction: i32) {
     {
         let mut state = ui_state()
@@ -659,6 +614,7 @@ fn handle_upload_clear() {
         state.upload_progress = 0.0;
         state.upload_current_file = String::new();
         state.upload_status = StatusState::Default;
+        state.image_notices.clear();
         state.upload_comic_name_input.clear();
         state.single_cover_follows_first = true;
         state.multi_cover_follows_first = true;
@@ -889,8 +845,8 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
     };
 
     let image_profile = crate::jobs::TaskImageProfile {
-        width: watch_settings.image_size,
-        quality: watch_settings.image_quality as u8,
+        width: watch_settings.image_size.clamp(10, 4096),
+        quality: watch_settings.image_quality.clamp(1, 100) as u8,
         if_png: watch_settings.image_use_png,
         if_lvgl: watch_settings.image_pre_transcode,
     };
@@ -950,13 +906,6 @@ async fn chapter_upload_continue(
     let mut page_num: u32 = 0;
     for (fi, file) in files.iter().enumerate() {
         page_num += 1;
-        // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
-        let name = if watch_settings.image_pre_transcode {
-            format!("{}.bin", page_num)
-        } else {
-            format!("{}", page_num)
-        };
-
         show_upload_status(StatusState::Processing(format!(
             "正在处理 {}/{}",
             fi + 1,
@@ -964,9 +913,10 @@ async fn chapter_upload_continue(
         )))
         .await;
 
-        // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（优先从磁盘读取）
-        let master_bytes = file.get_master_data().unwrap_or_else(|_| file.data.clone());
-        let b64 = base64_encode(&process_for_send(&master_bytes, &watch_settings, true));
+        let Some(product) = prepare_upload_image(file, &watch_settings, ImageRole::Page,
+            &format!("单章《{}》第{}页", comic_name, page_num)).await else { return; };
+        let name = product.format.page_name(page_num);
+        let b64 = base64_encode(&product.bytes);
         file_names.push(name.clone());
         all_files.push((name, b64));
     }
@@ -1041,6 +991,7 @@ fn reset_upload_progress() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.upload_progress = 0.0;
     state.upload_current_file = String::new();
+    state.image_notices.clear();
 }
 
 async fn handle_upload_start() {
@@ -1167,10 +1118,8 @@ async fn upload_start_continue(device_addr: String) {
                 )))
                 .await;
 
-                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理（封面不转码，优先读磁盘）
-                let raw_cover = cover_file.get_master_data().unwrap_or_else(|_| cover_file.data.clone());
-                let b64 =
-                    base64_encode(&process_for_send(&raw_cover, &watch_settings, false));
+                let Some(product) = prepare_upload_image(cover_file, &watch_settings, ImageRole::Cover, "单本封面").await else { return; };
+                let b64 = base64_encode(&product.bytes);
                 file_names.push("cover".to_string());
                 all_files.push(("cover".to_string(), b64));
             }
@@ -1179,13 +1128,6 @@ async fn upload_start_continue(device_addr: String) {
             let mut page_num: u32 = 0;
             for file in item.files.iter() {
                 page_num += 1;
-                // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
-                let name = if watch_settings.image_pre_transcode {
-                    format!("{}.bin", page_num)
-                } else {
-                    format!("{}", page_num)
-                };
-
                 show_upload_status(StatusState::Processing(format!(
                     "正在处理 ({}/{})",
                     all_files.len() + 1,
@@ -1193,9 +1135,10 @@ async fn upload_start_continue(device_addr: String) {
                 )))
                 .await;
 
-                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
-                let raw_page = file.get_master_data().unwrap_or_else(|_| file.data.clone());
-                let b64 = base64_encode(&process_for_send(&raw_page, &watch_settings, true));
+                let Some(product) = prepare_upload_image(file, &watch_settings, ImageRole::Page,
+                    &format!("单本第{}页", page_num)).await else { return; };
+                let name = product.format.page_name(page_num);
+                let b64 = base64_encode(&product.bytes);
                 file_names.push(name.clone());
                 all_files.push((name, b64));
             }
@@ -1214,8 +1157,8 @@ async fn upload_start_continue(device_addr: String) {
         if let Some(ref cover_file) = multi_cover {
             show_upload_status(StatusState::Processing("正在处理 封面".to_string())).await;
 
-            let raw_cover = cover_file.get_master_data().unwrap_or_else(|_| cover_file.data.clone());
-            let b64 = base64_encode(&process_for_send(&raw_cover, &watch_settings, false));
+            let Some(product) = prepare_upload_image(cover_file, &watch_settings, ImageRole::Cover, "多章作品封面").await else { return; };
+            let b64 = base64_encode(&product.bytes);
             all_files.push(("cover".to_string(), b64));
         }
 
@@ -1240,14 +1183,6 @@ async fn upload_start_continue(device_addr: String) {
             // Process pages
             for (fi, file) in chapter.files.iter().enumerate() {
                 page_num += 1;
-                // 预转码模式下页面以 .bin 命名落盘，快应用阅读时按 .bin 优先加载
-                let name = if watch_settings.image_pre_transcode {
-                    format!("{}.bin", page_num)
-                } else {
-                    format!("{}", page_num)
-                };
-                let file_key = format!("{}/{}", ch_name_val, name);
-
                 show_upload_status(StatusState::Processing(format!(
                     "正在处理 章节{} ({}/{})",
                     ci + 1,
@@ -1256,9 +1191,11 @@ async fn upload_start_continue(device_addr: String) {
                 )))
                 .await;
 
-                // data 为 MASTER_WIDTH 母版，发送前按快应用设置再处理
-                let raw_page = file.get_master_data().unwrap_or_else(|_| file.data.clone());
-                let b64 = base64_encode(&process_for_send(&raw_page, &watch_settings, true));
+                let Some(product) = prepare_upload_image(file, &watch_settings, ImageRole::Page,
+                    &format!("第{}章第{}页", ci + 1, page_num)).await else { return; };
+                let name = product.format.page_name(page_num);
+                let file_key = format!("{}/{}", ch_name_val, name);
+                let b64 = base64_encode(&product.bytes);
                 chap_names.push(name.clone());
                 all_files.push((file_key, b64));
             }
@@ -1660,8 +1597,6 @@ async fn handle_windowed_chunk_ack(name: &str, ack: usize) {
     }
 }
 
-const MASTER_WIDTH: u32 = 1280;
-const THUMBNAIL_WIDTH: u32 = 100;
 // 分片上限 32K（base64 字符 ≈ 24KB 二进制，加 JSON 外壳约 33K 字符）：
 // 窗口化后单片放大以摊薄 BLE 往返；同方向链路在网桥插件上 24K 帧已实测可行，
 // 43.7K 帧待真机验证——本值对应 33K 帧，若真机不稳回退 16384
@@ -1829,55 +1764,24 @@ fn current_watch_settings() -> WatchSettings {
     state.watch_settings.clone().unwrap_or_default()
 }
 
-/// 按快应用设置处理待发送的图片：缩放到 imageSize 后，
-/// 页面：imagePreTranscode 时转 LVGL indexed-8 bin，否则按 imageUsePng/imageQuality 编码；
-/// 封面（is_page=false）：始终普通图片格式（与下载链路行为一致）。
-fn process_for_send(data: &[u8], settings: &WatchSettings, is_page: bool) -> Vec<u8> {
-    let img = match image::load_from_memory(data) {
-        Ok(img) => img,
-        Err(e) => {
-            tracing::warn!("发送前图片解码失败，使用原始数据: {}", e);
-            return data.to_vec();
-        }
-    };
-
-    let target = settings.image_size.clamp(100, 4096);
-    let img = if img.width() > target {
-        let new_h =
-            ((img.height() as f64 * target as f64 / img.width() as f64).round() as u32).max(1);
-        img.resize_exact(target, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
-
-    if is_page && settings.image_pre_transcode {
-        return crate::lvgl::convert_to_lvgl_i8(&img);
+pub(crate) fn record_image_notices(context: &str, notices: &[String]) {
+    if notices.is_empty() { return; }
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    for notice in notices {
+        let notice = format!("{context}：{notice}");
+        if state.image_notices.len() < 8 && !state.image_notices.contains(&notice) { state.image_notices.push(notice); }
     }
+    drop(state);
+    rerender_upload_ui();
+}
 
-    let mut buf = std::io::Cursor::new(Vec::new());
-    if settings.image_use_png {
-        match img.write_to(&mut buf, image::ImageFormat::Png) {
-            Ok(_) => buf.into_inner(),
-            Err(e) => {
-                tracing::warn!("PNG 编码失败，使用原始数据: {}", e);
-                data.to_vec()
-            }
-        }
-    } else {
-        let rgb = img.to_rgb8();
-        let quality = settings.image_quality.clamp(1, 100) as u8;
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-        match encoder.write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        ) {
-            Ok(_) => buf.into_inner(),
-            Err(e) => {
-                tracing::warn!("JPEG 编码失败，使用原始数据: {}", e);
-                data.to_vec()
-            }
+async fn prepare_upload_image(file: &UploadFile, settings: &WatchSettings, role: ImageRole, context: &str) -> Option<PreparedImage> {
+    let result = file.get_master_data().and_then(|bytes| crate::image_processor::prepare_image(&bytes, &settings.image_request(role)));
+    match result {
+        Ok(product) => { record_image_notices(context, &product.notices); Some(product) }
+        Err(error) => {
+            show_upload_status(StatusState::Error(format!("{context}《{}》：{error}", file.name))).await;
+            None
         }
     }
 }

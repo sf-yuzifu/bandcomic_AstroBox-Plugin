@@ -99,6 +99,12 @@ pub fn get_task(task_id: &str) -> Option<TaskInfo> {
     mgr.tasks.get(task_id).cloned()
 }
 
+pub fn owns_image_request(comic_id: &str) -> bool {
+    let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    mgr.active_task_id.as_ref().and_then(|id| mgr.tasks.get(id))
+        .is_some_and(|task| task.comic_id == comic_id && matches!(task.status.as_str(), "ready" | "downloading"))
+}
+
 pub fn is_busy() -> bool {
     let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
     if mgr.last_progress.map(|t| t.elapsed().as_secs() > 120).unwrap_or(true) { return false; }
