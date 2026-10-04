@@ -1,92 +1,17 @@
-use serde_json::Value;
+use crate::source_config::{ConfigError, SourceCatalog, normalize_endpoint, parse_catalog};
 use waki::Client;
 
-async fn fetch_config_raw(domain: &str) -> Option<Value> {
-    let normalized_domain = domain.trim_end_matches('/');
-    let config_url = format!("{}/config", normalized_domain);
-
-    tracing::info!("请求配置 URL: {}", config_url);
-
-    let client = Client::new();
-    let resp = match client
-        .get(&config_url)
-        .header("Content-Type", "application/json")
-        .send()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("请求失败: {}", e);
-            return None;
-        }
-    };
-
-    if resp.status_code() != 200 {
-        tracing::error!("获取配置失败，状态码: {}", resp.status_code());
-        return None;
-    }
-
-    let body: Vec<u8> = match resp.body() {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            return None;
-        }
-    };
-
-    let body_str = String::from_utf8_lossy(&body);
-    tracing::info!("响应体: {}", body_str);
-
-    match serde_json::from_str::<Value>(&body_str) {
-        Ok(config_data) => Some(config_data),
-        Err(e) => {
-            tracing::error!("解析配置 JSON 失败: {}", e);
-            None
-        }
-    }
-}
-
-pub async fn fetch_source_name(domain: &str) -> Option<String> {
-    let config_data = fetch_config_raw(domain).await?;
-
-    let source_names: Vec<&str> = config_data
-        .as_object()
-        .map(|obj| obj.keys().map(|k| k.as_str()).collect())
-        .unwrap_or_default();
-
-    tracing::info!("配置中的 sourceNames: {:?}", source_names);
-
-    if source_names.is_empty() {
-        tracing::error!("配置中没有找到 sourceName");
-        return None;
-    }
-
-    let source_name = source_names[0].to_string();
-    tracing::info!("成功获取 sourceName: {}", source_name);
-    Some(source_name)
-}
-
-pub async fn fetch_source_config(domain: &str) -> Option<Value> {
-    let config_data = fetch_config_raw(domain).await?;
-
-    let source_names: Vec<&str> = config_data
-        .as_object()
-        .map(|obj| obj.keys().map(|k| k.as_str()).collect())
-        .unwrap_or_default();
-
-    if source_names.is_empty() {
-        tracing::error!("配置中没有找到 sourceName");
-        return None;
-    }
-
-    let config_array: Vec<Value> = source_names
-        .iter()
-        .map(|name| {
-            let name = name.to_string();
-            let value = &config_data[&name];
-            serde_json::json!({ name: value })
-        })
-        .collect();
-
-    tracing::info!("成功获取完整配置，共 {} 个源", config_array.len());
-    Some(Value::Array(config_array))
+/// One response is the authority for both display names and complete source configs.
+pub async fn fetch_source_catalog(endpoint: &str) -> Result<SourceCatalog, ConfigError> {
+    let endpoint = normalize_endpoint(endpoint)?;
+    let config_url = format!("{endpoint}/config");
+    tracing::info!("读取漫画源配置: {}", config_url);
+    let response = Client::new().get(&config_url).header("Accept", "application/json")
+        .connect_timeout(std::time::Duration::from_secs(15)).send()
+        .map_err(|e| ConfigError::Network(e.to_string()))?;
+    if response.status_code() != 200 { return Err(ConfigError::Http(response.status_code())); }
+    let body = response.body().map_err(|e| ConfigError::Network(format!("读取响应失败：{e}")))?;
+    let catalog = parse_catalog(&endpoint, &body)?;
+    tracing::info!("配置已解析: {} 个源，{} 个有效", catalog.entries.len(), catalog.valid_count());
+    Ok(catalog)
 }

@@ -207,6 +207,11 @@ pub fn accepts_pong(session_id: &str) -> bool {
         .is_some_and(|ph| ph.phase == HandshakePhase::Pinging && (session_id.is_empty() || ph.session == session_id))
 }
 
+pub fn accepts_pong_from(device_addr: &str, session_id: &str) -> bool {
+    pending().lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|ph|
+        ph.device_addr == device_addr && ph.phase == HandshakePhase::Pinging && (session_id.is_empty() || ph.session == session_id))
+}
+
 #[cfg(test)]
 mod session_tests {
     use super::*;
@@ -289,6 +294,7 @@ pub fn begin_wait<F, Fut>(
     F: FnOnce(HandshakeResult) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    super::state::ui_state().write().unwrap_or_else(|p| p.into_inner()).watch_delete = None;
     let session = format!(
         "hs{}",
         std::time::SystemTime::now()
@@ -301,7 +307,7 @@ pub fn begin_wait<F, Fut>(
     let ping_str = json!({
         "type": "hs_ping",
         "session": session,
-        "caps": { "syncWindow": SYNC_WINDOW, "syncSession": true, "httpDataSync": 1 },
+        "caps": { "syncWindow": SYNC_WINDOW, "syncSession": true, "httpDataSync": 1, "deleteProtocol": 1 },
     })
     .to_string();
 

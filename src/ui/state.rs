@@ -4,18 +4,13 @@ use serde_json::Value;
 
 use crate::transfer::{RecvFrontier, WindowedSender};
 use crate::sync_receive::{CoverChunks, SyncReceive};
+use super::data_browser::{DataBrowser, DataDevice, matching_indices};
+use crate::source_config::{SourceForm, SourceSync};
 
 pub const WATCH_APP_PKG_NAME: &str = "moe.yzf.comic";
 pub const CONFIG_KEY_COOKIE: &str = "savedCookie";
 pub const CONFIG_KEY_DOMAIN: &str = "sourceDomain";
 pub const CONFIG_KEY_SOURCE_NAME: &str = "sourceName";
-
-#[derive(Debug, Clone)]
-pub struct PluginConfig {
-    pub cookie: String,
-    pub domain: String,
-    pub source_name: String,
-}
 
 /// 快应用通过握手（hs_pong）下发的 APP_SETTING。
 /// 缺省值与快应用 app.ux 中 global.APP_SETTING 的默认值保持一致。
@@ -73,16 +68,6 @@ impl WatchSettings {
             keep_default_zoom: get_bool("keepDefaultZoom", d.keep_default_zoom),
             image_use_png: get_bool("imageUsePng", d.image_use_png),
             image_pre_transcode: get_bool("imagePreTranscode", d.image_pre_transcode),
-        }
-    }
-}
-
-impl Default for PluginConfig {
-    fn default() -> Self {
-        PluginConfig {
-            cookie: String::new(),
-            domain: String::new(),
-            source_name: String::new(),
         }
     }
 }
@@ -234,23 +219,29 @@ pub struct ComicInfo {
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceInfo {
+    pub key: String,
     pub name: String,
     pub api_url: String,
 }
 
 pub struct UiState {
     pub root_element_id: Option<String>,
-    pub config: PluginConfig,
-    pub fetched_source_name: Option<String>,
-    pub fetched_source_config: Option<Value>,
+    pub source_form: SourceForm,
+    pub source_sync: Option<SourceSync>,
+    pub source_sync_next: u64,
     pub current_status: StatusState,
     pub status_timer_id: Option<u64>,
-    pub pending_domain_fetch: Option<String>,
     pub current_tab: TabPage,
     pub app_comic_count: Option<usize>,
     pub app_source_count: Option<usize>,
     pub app_comics: Vec<ComicInfo>,
     pub app_sources: Vec<SourceInfo>,
+    pub data_browser: DataBrowser,
+    pub deletes: super::deletion::DeleteManager,
+    /// Only an accepted handshake for this address may enable stable deletion.
+    pub watch_delete: Option<(String, String)>,
+    pub comic_search: String,
+    pub source_search: String,
     pub app_data_status: StatusState,
     pub app_data_timer_id: Option<u64>,
     /// 无进展看门狗：收到有效数据只更新截止时间，不每片调用宿主定时器。
@@ -309,17 +300,21 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             root_element_id: None,
-            config: PluginConfig::default(),
-            fetched_source_name: None,
-            fetched_source_config: None,
+            source_form: SourceForm::default(),
+            source_sync: None,
+            source_sync_next: 0,
             current_status: StatusState::Default,
             status_timer_id: None,
-            pending_domain_fetch: None,
             current_tab: TabPage::Upload,
             app_comic_count: None,
             app_source_count: None,
             app_comics: Vec::new(),
             app_sources: Vec::new(),
+            data_browser: DataBrowser::default(),
+            deletes: super::deletion::DeleteManager::default(),
+            watch_delete: None,
+            comic_search: String::new(),
+            source_search: String::new(),
             app_data_status: StatusState::Default,
             app_data_timer_id: None,
             app_data_recv_timer_id: None,
@@ -361,13 +356,27 @@ impl Default for UiState {
 
 pub const DOMAIN_INPUT_CHANGE_EVENT: &str = "domain_input_change";
 pub const DOMAIN_INPUT_BLUR_EVENT: &str = "domain_input_blur";
-pub const COOKIE_INPUT_EVENT: &str = "cookie_input";
+pub const SOURCE_FETCH_EVENT: &str = "source_fetch";
+pub const SOURCE_SYNC_PREFIX: &str = "source_sync_";
+pub const SOURCE_SELECT_PREFIX: &str = "source_select_";
+pub const SOURCE_COOKIE_INPUT_PREFIX: &str = "source_cookie_input_";
+pub const SOURCE_COOKIE_KEEP_PREFIX: &str = "source_cookie_keep_";
+pub const SOURCE_COOKIE_UPDATE_PREFIX: &str = "source_cookie_update_";
+pub const SOURCE_COOKIE_CLEAR_PREFIX: &str = "source_cookie_clear_";
+pub const SOURCE_ALL_PREFIX: &str = "source_all_";
+pub const SOURCE_NONE_PREFIX: &str = "source_none_";
+pub const SOURCE_CATALOG_PREV: &str = "source_catalog_prev";
+pub const SOURCE_CATALOG_NEXT: &str = "source_catalog_next";
 pub const SYNC_BUTTON_EVENT: &str = "sync_button";
 pub const HIDE_STATUS_EVENT: &str = "hide_status";
 
 pub const TAB_SYNC_EVENT: &str = "tab_sync";
 pub const TAB_DATA_EVENT: &str = "tab_data";
 pub const FETCH_APP_DATA_EVENT: &str = "fetch_app_data";
+pub const COMIC_SEARCH_EVENT: &str = "comic_search";
+pub const SOURCE_SEARCH_EVENT: &str = "source_search";
+pub const COMIC_SEARCH_CLEAR_EVENT: &str = "comic_search_clear";
+pub const SOURCE_SEARCH_CLEAR_EVENT: &str = "source_search_clear";
 pub const HIDE_APP_DATA_STATUS_EVENT: &str = "hide_app_data_status";
 /// 拉取数据整体接收超时定时器事件
 pub const APP_DATA_RECV_TIMEOUT_EVENT: &str = "app_data_recv_timeout:";
@@ -437,6 +446,100 @@ pub const SOURCE_PAGE_PREV_EVENT: &str = "source_page_prev";
 pub const SOURCE_PAGE_NEXT_EVENT: &str = "source_page_next";
 
 impl UiState {
+    pub fn source_sync_busy(&self) -> bool { self.source_sync.as_ref().is_some_and(|sync| sync.phase.busy()) }
+
+    pub fn source_sync_current(&self, id: u64) -> bool {
+        self.source_sync.as_ref().is_some_and(|sync| sync.id == id && sync.phase.busy() && self.source_form.plan_current(&sync.plan))
+    }
+    pub fn comic_matches(&self) -> Vec<usize> {
+        matching_indices(self.app_comics.iter().map(|c| c.name.as_str()), &self.comic_search)
+    }
+
+    pub fn source_matches(&self) -> Vec<usize> {
+        matching_indices(self.app_sources.iter().map(|s| s.name.as_str()), &self.source_search)
+    }
+
+    pub fn clamp_data_pages(&mut self) {
+        self.comic_page_cursor = self.comic_page_cursor.min(self.comic_matches().len().saturating_sub(1) / PAGE_WINDOW);
+        self.source_page_cursor = self.source_page_cursor.min(self.source_matches().len().saturating_sub(1) / PAGE_WINDOW);
+    }
+
+    pub fn accept_library_data(&mut self) {
+        if self.data_browser.accept_data() {
+            self.app_comics.clear();
+            self.app_sources.clear();
+            self.app_comic_count = None;
+            self.app_source_count = None;
+            self.sync_comics_seen.clear();
+            self.sync_sources_seen.clear();
+        }
+    }
+
+    pub fn update_library_completeness(&mut self) {
+        self.data_browser.lists_complete = self.data_browser.lists_done &&
+            self.app_comic_count.is_some_and(|count| self.sync_comics_seen.len() == count &&
+                self.sync_comics_seen.iter().all(|index| *index < count)) &&
+            self.app_source_count.is_some_and(|count| self.sync_sources_seen.len() == count &&
+                self.sync_sources_seen.iter().all(|index| *index < count));
+    }
+
+    pub fn finish_library_sync(&mut self, skipped: Option<usize>) {
+        self.update_library_completeness();
+        let covers = self.app_comics.iter().filter(|c| !c.cover_base64.is_empty()).count();
+        self.data_browser.finish(super::data_browser::now_seconds(), covers, skipped);
+        self.clamp_data_pages();
+        if self.data_browser.lists_complete && let Some(owner) = &self.data_browser.owner {
+            self.deletes.verify_snapshot(&owner.addr, self.data_browser.revision, &self.app_comics, &self.app_sources);
+        }
+    }
+
+    pub fn capture_data_target(&self, revision: u64, index: usize, source: bool) -> Option<DataTarget> {
+        if self.data_browser.revision != revision || self.data_browser.busy() || !self.data_browser.lists_complete { return None; }
+        let owner = self.data_browser.owner.clone()?;
+        let item = if source {
+            let s = self.app_sources.get(index)?;
+            DataItem::Source { key: s.key.clone(), name: s.name.clone(), api_url: s.api_url.clone() }
+        } else {
+            let c = self.app_comics.get(index)?;
+            DataItem::Comic { id: c.id.clone(), name: c.name.clone() }
+        };
+        if item.name().is_empty() { return None; }
+        Some(DataTarget { revision, owner, item })
+    }
+
+    pub fn apply_delete_success(&mut self, target: &DataTarget) -> bool {
+        if !self.data_target_current(target) || !self.data_browser.owner_matches_connection() { return false; }
+        match &target.item {
+            DataItem::Comic { id, .. } => {
+                if self.app_comics.iter().filter(|c| c.id == *id).count() != 1 { return false; }
+                let skipped = self.app_comics.iter().find(|c| c.id == *id).is_some_and(|c| c.cover_base64.is_empty());
+                self.app_comics.retain(|c| c.id != *id);
+                if skipped { self.data_browser.covers_skipped = self.data_browser.covers_skipped.map(|n| n.saturating_sub(1)); }
+                self.data_browser.covers_received = self.app_comics.iter().filter(|c| !c.cover_base64.is_empty()).count();
+                self.app_comic_count = Some(self.app_comics.len());
+                self.sync_comics_seen = (0..self.app_comics.len()).collect();
+            }
+            DataItem::Source { key, .. } => {
+                if key.is_empty() || self.app_sources.iter().filter(|s| s.key == *key).count() != 1 { return false; }
+                self.app_sources.retain(|s| s.key != *key);
+                self.app_source_count = Some(self.app_sources.len());
+                self.sync_sources_seen = (0..self.app_sources.len()).collect();
+            }
+        }
+        self.data_browser.revision = self.data_browser.revision.wrapping_add(1);
+        self.clamp_data_pages();
+        true
+    }
+
+    pub fn data_target_current(&self, target: &DataTarget) -> bool {
+        self.data_browser.revision == target.revision && !self.data_browser.busy() && self.data_browser.lists_complete &&
+            self.data_browser.owner.as_ref().is_some_and(|owner| owner.addr == target.owner.addr) &&
+            match &target.item {
+                DataItem::Comic { id, name } => self.app_comics.iter().any(|c| c.id == *id && c.name == *name),
+                DataItem::Source { key, name, api_url } => self.app_sources.iter().any(|s| s.key == *key && s.name == *name && s.api_url == *api_url),
+            }
+    }
+
     pub fn upload_locked(&self) -> bool {
         self.pending_pick.is_some() || matches!(self.upload_status, StatusState::Processing(_))
     }
@@ -488,6 +591,32 @@ impl UiState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum DataItem {
+    Comic { id: String, name: String },
+    Source { key: String, name: String, api_url: String },
+}
+
+impl DataItem {
+    pub fn name(&self) -> &str {
+        match self { Self::Comic { name, .. } | Self::Source { name, .. } => name }
+    }
+    pub fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Comic { id, .. }, Self::Comic { id: other, .. }) => id == other,
+            (Self::Source { key, .. }, Self::Source { key: other, .. }) => !key.is_empty() && key == other,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DataTarget {
+    pub revision: u64,
+    pub owner: DataDevice,
+    pub item: DataItem,
+}
+
 #[cfg(test)]
 mod upload_tests {
     use super::*;
@@ -527,5 +656,103 @@ mod upload_tests {
         assert_eq!(page_window(12, 0), (0, 0));
         assert_eq!(page_window(12, 17), (16, 17));
         assert_eq!(page_window(2, 16), (8, 16));
+    }
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+    use super::super::data_browser::DataPhase;
+
+    fn device(addr: &str) -> DataDevice { DataDevice { name: addr.into(), addr: addr.into() } }
+
+    #[test]
+    fn filtered_pages_keep_slots_and_covers_do_not_reset_queries_or_page() {
+        let mut state = UiState::default();
+        state.app_comics = (0..40).map(|i| ComicInfo { id: i.to_string(),
+            name: format!("{} {i}", if i % 2 == 0 { "Book" } else { "Other" }), ..Default::default() }).collect();
+        state.app_sources = vec![SourceInfo { name: "中文源".into(), api_url: "test".into(), ..Default::default() }];
+        state.comic_search = " BOOK ".into();
+        state.source_search = "中文".into();
+        state.comic_page_cursor = 2;
+        let matches = state.comic_matches();
+        assert_eq!(matches.len(), 20);
+        let (start, end) = page_window(state.comic_page_cursor, matches.len());
+        assert_eq!(&matches[start..end], &[32, 34, 36, 38]);
+        state.app_comics[32].cover_base64 = "cover".into();
+        state.clamp_data_pages();
+        assert_eq!(state.comic_page_cursor, 2);
+        assert_eq!(state.source_matches(), vec![0]);
+        state.app_comics.truncate(10);
+        state.clamp_data_pages();
+        assert_eq!(state.comic_page_cursor, 0);
+        assert_eq!(state.comic_search, " BOOK ");
+    }
+
+    #[test]
+    fn dialog_target_survives_filtering_but_rejects_new_snapshot_and_different_owner() {
+        let mut state = UiState::default();
+        state.data_browser.begin(device("A"));
+        state.accept_library_data();
+        state.data_browser.phase = DataPhase::Finished;
+        state.data_browser.lists_complete = true;
+        state.app_comics = vec![ComicInfo { id: "one".into(), name: "Same".into(), ..Default::default() },
+            ComicInfo { id: "two".into(), name: "Same".into(), ..Default::default() }];
+        let target = state.capture_data_target(state.data_browser.revision, 1, false).unwrap();
+        assert!(matches!(&target.item, DataItem::Comic { id, .. } if id == "two"));
+        state.comic_search = "none".into();
+        state.app_comics.swap(0, 1);
+        assert!(state.data_target_current(&target));
+        state.data_browser.lists_complete = false;
+        assert!(!state.data_target_current(&target));
+        assert!(state.capture_data_target(target.revision, 0, false).is_none());
+        state.data_browser.lists_complete = true;
+        state.data_browser.owner = Some(device("B"));
+        assert!(!state.data_target_current(&target));
+        state.data_browser.owner = Some(device("A"));
+        state.data_browser.begin(device("A"));
+        assert!(!state.data_target_current(&target));
+        assert!(state.capture_data_target(target.revision, 1, false).is_none());
+    }
+
+    #[test]
+    fn declared_list_length_is_not_evidence_of_received_metadata() {
+        let mut state = UiState::default();
+        state.data_browser.begin(device("A"));
+        state.accept_library_data();
+        state.app_comic_count = Some(2);
+        state.app_source_count = Some(1);
+        state.app_comics.resize(2, ComicInfo::default());
+        state.app_sources.resize(1, SourceInfo::default());
+        state.sync_comics_seen.insert(1);
+        state.sync_sources_seen.insert(0);
+        state.data_browser.lists_done = true;
+        state.finish_library_sync(None);
+        assert!(!state.data_browser.lists_complete);
+        assert!(state.data_browser.complete_time().is_none());
+        state.sync_comics_seen.insert(0);
+        state.update_library_completeness();
+        assert!(state.data_browser.lists_complete);
+        state.sync_comics_seen.remove(&1);
+        state.sync_comics_seen.insert(2);
+        state.update_library_completeness();
+        assert!(!state.data_browser.lists_complete, "same count with an out-of-range slot is not complete");
+    }
+
+    #[test]
+    fn first_unordered_data_switches_owner_once_and_preserves_filters() {
+        let mut state = UiState::default();
+        state.data_browser.owner = Some(device("A"));
+        state.app_comics.push(ComicInfo { name: "old".into(), ..Default::default() });
+        state.comic_search = "new".into();
+        state.data_browser.begin(device("B"));
+        assert_eq!(state.app_comics.len(), 1);
+        state.accept_library_data();
+        state.app_comics.push(ComicInfo { name: "new".into(), ..Default::default() });
+        state.accept_library_data();
+        assert_eq!(state.app_comics.len(), 1);
+        assert_eq!(state.app_comics[0].name, "new");
+        assert_eq!(state.data_browser.owner.as_ref().unwrap().addr, "B");
+        assert_eq!(state.comic_matches(), vec![0]);
     }
 }

@@ -2,10 +2,13 @@ use super::COMIC_DATA_CARD_ID;
 use super::handshake;
 use super::state::*;
 use crate::astrobox::psys_host_v4::{self as psys_host, device, dialog, interconnect, timer};
-use crate::network::{fetch_source_config, fetch_source_name};
+use crate::network::fetch_source_catalog;
+use crate::source_config::{CatalogPhase, CookieAction, SourceSync, SyncPhase};
 use crate::transfer::{RecvFrontier, WindowedSender};
 use crate::sync_receive::{CoverChunks, MAX_COVER_CHUNKS};
 use std::time::Instant;
+use super::data_browser::DataPhase;
+use super::deletion::{DeletePhase, DELETE_QUERY_PREFIX, DELETE_TIMEOUT_EVENT, DELETE_TIMEOUT_MS};
 use image::ImageEncoder;
 use serde_json::{Value, json};
 
@@ -18,10 +21,9 @@ pub async fn ui_event_processor(
     event_payload: &str,
 ) {
     tracing::debug!(
-        "UI 事件: id={}, type={:?}, payload={}",
+        "UI 事件: id={}, type={:?}",
         event_id,
-        event_type,
-        event_payload
+        event_type
     );
 
     // Pending picks and active uploads own the draft until they finish.
@@ -39,8 +41,33 @@ pub async fn ui_event_processor(
     if edits_upload && ui_state().read().unwrap_or_else(|p| p.into_inner()).upload_locked() {
         return;
     }
+    let starts_device_operation = matches!(event_id, FETCH_APP_DATA_EVENT | SYNC_BUTTON_EVENT | UPLOAD_START_EVENT | crate::http_server::BIND_EVENT)
+        || [SOURCE_SYNC_PREFIX, CHAPTER_UPLOAD_PREFIX, DELETE_COMIC_PREFIX, DELETE_SOURCE_PREFIX, DELETE_QUERY_PREFIX].iter().any(|p| event_id.starts_with(p));
+    if starts_device_operation && ui_state().read().unwrap_or_else(|p| p.into_inner()).source_sync_busy() { return; }
+    if (matches!(event_id, FETCH_APP_DATA_EVENT | SYNC_BUTTON_EVENT | UPLOAD_START_EVENT | crate::http_server::BIND_EVENT) || event_id.starts_with(SOURCE_SYNC_PREFIX) || event_id.starts_with(CHAPTER_UPLOAD_PREFIX)) &&
+        ui_state().read().unwrap_or_else(|p| p.into_inner()).deletes.requests.iter()
+            .any(|r| matches!(r.phase, DeletePhase::Preparing | DeletePhase::Querying)) { return; }
 
     match event_id {
+        COMIC_SEARCH_EVENT | SOURCE_SEARCH_EVENT | COMIC_SEARCH_CLEAR_EVENT | SOURCE_SEARCH_CLEAR_EVENT => {
+            let clear = matches!(event_id, COMIC_SEARCH_CLEAR_EVENT | SOURCE_SEARCH_CLEAR_EVENT);
+            let value = if clear { Some(String::new()) } else {
+                serde_json::from_str::<Value>(event_payload).ok()
+                    .and_then(|value| value.get("value").and_then(Value::as_str).map(str::to_string))
+            };
+            if let Some(value) = value {
+                let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+                if matches!(event_id, COMIC_SEARCH_EVENT | COMIC_SEARCH_CLEAR_EVENT) {
+                    state.comic_search = value;
+                    state.comic_page_cursor = 0;
+                } else {
+                    state.source_search = value;
+                    state.source_page_cursor = 0;
+                }
+                drop(state);
+                build::rerender_main_ui();
+            }
+        }
         UPLOAD_OVERVIEW_EVENT => open_upload_view(UploadView::Overview),
         UPLOAD_INFO_EVENT => open_upload_view(UploadView::Info),
         UPLOAD_PAGES_EVENT => open_upload_view(UploadView::Pages(None)),
@@ -68,9 +95,9 @@ pub async fn ui_event_processor(
             let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
             let (cursor, total, forward) = match event_id {
                 COMIC_PAGE_PREV_EVENT | COMIC_PAGE_NEXT_EVENT =>
-                    (state.comic_page_cursor, state.app_comics.len(), event_id == COMIC_PAGE_NEXT_EVENT),
+                    (state.comic_page_cursor, state.comic_matches().len(), event_id == COMIC_PAGE_NEXT_EVENT),
                 SOURCE_PAGE_PREV_EVENT | SOURCE_PAGE_NEXT_EVENT =>
-                    (state.source_page_cursor, state.app_sources.len(), event_id == SOURCE_PAGE_NEXT_EVENT),
+                    (state.source_page_cursor, state.source_matches().len(), event_id == SOURCE_PAGE_NEXT_EVENT),
                 _ => {
                     let total = match state.upload_view {
                         UploadView::Overview if state.upload_mode == UploadMode::Multi => state.upload_chapters.len(),
@@ -128,17 +155,14 @@ pub async fn ui_event_processor(
                 }
             }
         }
-        COOKIE_INPUT_EVENT => {
-            if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
-                if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
-                    tracing::debug!("Cookie 输入变化: {}", text);
-                    handle_cookie_input(text.to_string());
-                }
-            }
-        }
-        SYNC_BUTTON_EVENT => {
-            tracing::info!("同步按钮被点击");
-            handle_sync().await;
+        SOURCE_FETCH_EVENT => load_source_config(true).await,
+        SOURCE_CATALOG_PREV | SOURCE_CATALOG_NEXT => {
+            let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+            let form = &mut state.source_form;
+            let total = form.catalog.as_ref().map_or(0, |c| c.entries.len());
+            let last = total.saturating_sub(1) / PAGE_WINDOW;
+            form.page = if event_id == SOURCE_CATALOG_NEXT { (form.page + 1).min(last) } else { form.page.saturating_sub(1) };
+            drop(state); build::rerender_main_ui();
         }
         HIDE_STATUS_EVENT => {
             hide_status();
@@ -209,6 +233,7 @@ pub async fn ui_event_processor(
             switch_tab(TabPage::Sync);
         }
         TAB_DATA_EVENT => {
+            refresh_data_connection().await;
             switch_tab(TabPage::Data);
         }
         TAB_UPLOAD_EVENT => {
@@ -219,7 +244,14 @@ pub async fn ui_event_processor(
             handle_fetch_app_data().await;
         }
         _ => {
-            if let Some(index_str) = event_id.strip_prefix(CHAPTER_EDIT_PREFIX) {
+            if let Some(generation) = event_id.strip_prefix(SOURCE_SYNC_PREFIX).and_then(|s|s.parse::<u64>().ok()) {
+                let current = ui_state().read().unwrap_or_else(|p|p.into_inner()).source_form.generation == generation;
+                if current { handle_sync().await; }
+            } else if handle_source_form_event(event_id, event_payload) {
+                build::rerender_main_ui();
+            } else if let Some(id) = event_id.strip_prefix(DELETE_QUERY_PREFIX) {
+                query_delete_result(id).await;
+            } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_EDIT_PREFIX) {
                 if let Ok(index) = index_str.parse::<usize>() {
                     open_upload_view(UploadView::Pages(Some(index)));
                 }
@@ -283,14 +315,12 @@ pub async fn ui_event_processor(
                     }
                 }
             } else if let Some(index_str) = event_id.strip_prefix(DELETE_COMIC_PREFIX) {
-                if let Ok(index) = index_str.parse::<usize>() {
-                    tracing::info!("删除漫画按钮被点击: index={}", index);
-                    handle_delete_comic(index).await;
+                if let Some((revision, index)) = parse_data_action(index_str) {
+                    handle_delete_data(revision, index, false).await;
                 }
             } else if let Some(index_str) = event_id.strip_prefix(DELETE_SOURCE_PREFIX) {
-                if let Ok(index) = index_str.parse::<usize>() {
-                    tracing::info!("删除漫画源按钮被点击: index={}", index);
-                    handle_delete_source(index).await;
+                if let Some((revision, index)) = parse_data_action(index_str) {
+                    handle_delete_data(revision, index, true).await;
                 }
             }
         }
@@ -1668,72 +1698,74 @@ fn update_domain_state(input_value: String) {
     let mut state = ui_state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.config.domain = input_value;
+    if state.source_form.set_input(input_value) && let Some(sync) = state.source_sync.as_mut().filter(|s| s.phase.busy()) {
+        sync.phase = if sync.configs_sent { SyncPhase::Partial } else { SyncPhase::Cancelled };
+        sync.message = if sync.configs_sent { "配置命令已发送，入口已变化；剩余命令停止发送，设备结果待核实" }
+            else { "配置入口已变化，原快照命令未发送" }.into();
+    }
+    drop(state);
+    build::rerender_main_ui();
 }
 
-fn handle_cookie_input(input_value: String) {
-    let mut state = ui_state()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.config.cookie = input_value;
+fn handle_source_form_event(id: &str, payload: &str) -> bool {
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    if state.source_sync_busy() { return false; }
+    for (prefix, select) in [(SOURCE_ALL_PREFIX, true), (SOURCE_NONE_PREFIX, false)] {
+        if let Some(generation) = id.strip_prefix(prefix).and_then(|v| v.parse::<u64>().ok()) {
+            let total = state.source_form.choices.len();
+            let mut changed = false;
+            for index in 0..total { changed |= state.source_form.edit_choice(generation, index, |c| c.selected = select); }
+            return changed;
+        }
+    }
+    let prefixes = [SOURCE_SELECT_PREFIX, SOURCE_COOKIE_INPUT_PREFIX, SOURCE_COOKIE_KEEP_PREFIX, SOURCE_COOKIE_UPDATE_PREFIX, SOURCE_COOKIE_CLEAR_PREFIX];
+    let Some((prefix, value)) = prefixes.iter().find_map(|prefix| id.strip_prefix(prefix).map(|value| (*prefix, value))) else { return false; };
+    let Some((generation, index)) = parse_data_action(value) else { return false; };
+    match prefix {
+        SOURCE_SELECT_PREFIX => {
+            let parsed = serde_json::from_str::<Value>(payload).ok();
+            let checked = parsed.as_ref().and_then(|v| v.get("checked").or_else(|| v.get("value"))).and_then(|v|
+                v.as_bool().or_else(|| match v.as_str() { Some("true" | "1" | "on") => Some(true), Some("false" | "0" | "off") => Some(false), _ => None }));
+            checked.is_some_and(|checked| state.source_form.edit_choice(generation, index, |c| c.selected = checked))
+        }
+        SOURCE_COOKIE_INPUT_PREFIX => {
+            let value = serde_json::from_str::<Value>(payload).ok().and_then(|v| v.get("value").and_then(Value::as_str).map(str::to_string));
+            value.is_some_and(|value| state.source_form.edit_choice(generation, index, |c| {
+                // A delayed input from before a keep/clear action cannot reverse that action.
+                if c.cookie_action == CookieAction::Update { c.cookie = value; }
+            }))
+        }
+        _ => state.source_form.edit_choice(generation, index, |c| c.cookie_action = match prefix {
+            SOURCE_COOKIE_KEEP_PREFIX => CookieAction::Keep, SOURCE_COOKIE_UPDATE_PREFIX => CookieAction::Update, _ => CookieAction::Clear,
+        }),
+    }
 }
 
 async fn handle_domain_blur(input_value: String) {
-    tracing::info!("处理域名失去焦点: {}", input_value);
-
-    {
-        let mut state = ui_state()
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.config.domain = input_value.clone();
-        state.fetched_source_name = None;
-        state.fetched_source_config = None;
-    }
-
-    if input_value.contains('.') {
-        tracing::info!("域名包含点号，开始获取配置: {}", input_value);
-        fetch_domain_config_async(input_value).await;
-    } else {
-        tracing::info!("域名不包含点号，跳过获取: {}", input_value);
-    }
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    if state.source_sync_busy() { return; }
+    // Bootstrap an initial blur-only host event. Later stale blur values never overwrite Change.
+    if state.source_form.generation == 0 && state.source_form.input.is_empty() { state.source_form.set_input(input_value.clone()); }
+    let matching = input_value == state.source_form.input ||
+        crate::source_config::normalize_endpoint(&input_value).ok().is_some_and(|endpoint| state.source_form.endpoint.as_ref() == Some(&endpoint));
+    drop(state);
+    if matching { load_source_config(false).await; }
 }
 
-async fn fetch_domain_config_async(domain: String) {
-    tracing::info!("fetch_domain_config_async 被调用: {}", domain);
-
-    show_status(StatusState::Processing("正在获取漫画源配置...".to_string())).await;
-
-    tracing::info!("调用 fetch_source_name: {}", domain);
-    match fetch_source_name(&domain).await {
-        Some(source_name) => {
-            tracing::info!("获取配置成功: {}", source_name);
-            let full_config = fetch_source_config(&domain).await;
-            {
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.fetched_source_name = Some(source_name.clone());
-                state.config.source_name = source_name.clone();
-                state.fetched_source_config = full_config;
-            }
-            show_status(StatusState::Success(format!("获取成功：{}", source_name))).await;
+async fn load_source_config(force: bool) {
+    let ticket = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.source_sync_busy() { return; }
+        match state.source_form.begin_load(force) {
+            Ok(ticket) => ticket,
+            Err(error) => { state.source_form.phase = CatalogPhase::Error; state.source_form.message = error.to_string(); None }
         }
-        None => {
-            tracing::error!("获取配置失败: {}", domain);
-            {
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.fetched_source_name = None;
-                state.fetched_source_config = None;
-                state.config.source_name = String::new();
-            }
-            show_status(StatusState::Error(
-                "无法获取漫画源配置，请检查域名是否正确。".to_string(),
-            ))
-            .await;
-        }
-    }
+    };
+    build::rerender_main_ui();
+    let Some(ticket) = ticket else { return; };
+    let result = fetch_source_catalog(&ticket.endpoint).await;
+    let changed = ui_state().write().unwrap_or_else(|p| p.into_inner()).source_form.apply_load(&ticket, result);
+    if changed { build::rerender_main_ui(); }
 }
 
 /// ACK 超时（毫秒）与最大重传次数
@@ -1777,21 +1809,6 @@ fn render_app_data_progress(msg: String) {
     }
 }
 
-/// 同步渲染同步页状态栏（无定时器管理）
-fn render_sync_progress(msg: String) {
-    let root_id = {
-        let mut state = ui_state()
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.current_status = StatusState::Processing(msg);
-        state.root_element_id.clone()
-    };
-    if let Some(root_id) = root_id {
-        let ui = build_main_ui();
-        psys_host::ui::render(&root_id, ui);
-    }
-}
-
 /// 生成一个把握手阶段进度转发到上传状态栏的回调
 fn upload_progress() -> impl Fn(String) {
     |msg| render_upload_progress(msg)
@@ -1800,11 +1817,6 @@ fn upload_progress() -> impl Fn(String) {
 /// 生成一个把握手阶段进度转发到数据页状态栏的回调
 fn app_data_progress() -> impl Fn(String) {
     |msg| render_app_data_progress(msg)
-}
-
-/// 生成一个把握手阶段进度转发到同步页状态栏的回调
-fn sync_progress() -> impl Fn(String) {
-    |msg| render_sync_progress(msg)
 }
 
 /// 当前生效的快应用设置（未握手时使用与快应用一致的缺省值）
@@ -2142,178 +2154,222 @@ pub async fn handle_upload_ack_timeout() {
 }
 
 async fn handle_sync() {
-    let (cookie, domain, mut source_name) = {
-        let state = ui_state()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (
-            state.config.cookie.clone(),
-            state.config.domain.clone(),
-            state.fetched_source_name.clone().or_else(|| {
-                if state.config.source_name.is_empty() {
-                    None
-                } else {
-                    Some(state.config.source_name.clone())
-                }
-            }),
-        )
+    let plan = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.source_sync_busy() { return; }
+        if state.source_form.phase != CatalogPhase::Ready { drop(state); build::rerender_main_ui(); return; }
+        if state.data_browser.busy() || state.deletes.busy() || state.upload_locked() {
+            state.source_form.message = "其他设备操作正在进行，请完成后再发送源配置".into();
+            drop(state); build::rerender_main_ui(); return;
+        }
+        match state.source_form.build_plan() {
+            Ok(plan) => plan,
+            Err(error) => { state.source_form.message = error.to_string(); drop(state); build::rerender_main_ui(); return; }
+        }
     };
+    // Construct and validate both payloads before any launch/send; never fetch here.
+    let devices = device::get_connected_device_list().await;
+    let Some(target) = devices.first() else {
+        show_status(StatusState::Error("没有已连接的设备，请检查手表连接。".into())).await;
+        return;
+    };
+    let id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if !state.source_form.plan_current(&plan) { return; }
+        state.source_sync_next = state.source_sync_next.wrapping_add(1);
+        let id = state.source_sync_next;
+        state.source_sync = Some(SourceSync { id, plan, device_name:target.name.clone(), device_addr:target.addr.clone(),
+            phase:SyncPhase::Preparing, configs_sent:false, cookies_sent:false, message:"正在检查并连接捕获的目标设备…".into() });
+        id
+    };
+    build::rerender_main_ui();
+    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &source_sync_progress(id)).await {
+        Ok(addr) if addr == target.addr && source_sync_current(id) => addr,
+        Ok(_) => { finish_source_sync(id, SyncPhase::Cancelled, "目标设备或配置入口已变化，命令未发送".into()); return; }
+        Err(message) => { finish_source_sync(id, SyncPhase::Failed, message); return; }
+    };
+    handshake::begin_wait(device_addr, source_sync_progress(id), move |result| async move {
+        if !source_sync_current(id) { return; }
+        match result {
+            Err(message) => finish_source_sync(id, SyncPhase::Failed, message),
+            Ok(_) => send_source_sync(id).await,
+        }
+    });
+}
 
-    tracing::info!("开始同步: domain={}, source_name={:?}", domain, source_name);
+fn source_sync_current(id: u64) -> bool { ui_state().read().unwrap_or_else(|p| p.into_inner()).source_sync_current(id) }
 
-    show_status(StatusState::Processing("正在验证输入...".to_string())).await;
+fn source_sync_progress(id: u64) -> impl Fn(String) + Send + 'static {
+    move |message| {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.source_sync_current(id) && let Some(sync) = state.source_sync.as_mut() { sync.message = message; }
+        drop(state); build::rerender_main_ui();
+    }
+}
 
-    if domain.is_empty() {
-        show_status(StatusState::Error("漫画源域名不能为空。".to_string())).await;
+fn finish_source_sync(id: u64, phase: SyncPhase, message: String) {
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    if let Some(sync) = state.source_sync.as_mut().filter(|s| s.id == id && s.phase.busy()) {
+        sync.phase = phase; sync.message = message;
+    }
+    drop(state); build::rerender_main_ui();
+}
+
+async fn source_target_connected(sync: &SourceSync) -> bool {
+    device::get_connected_device_list().await.first().is_some_and(|device| device.addr == sync.device_addr)
+}
+
+async fn send_source_sync(id: u64) {
+    let sync = {
+        let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+        if !state.source_sync_current(id) { return; }
+        state.source_sync.as_ref().unwrap().clone()
+    };
+    if !source_target_connected(&sync).await {
+        finish_source_sync(id, SyncPhase::Cancelled, "握手后连接已变化，配置与 Cookie 命令未发送".into()); return;
+    }
+    {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if !state.source_sync_current(id) { return; }
+        let op = state.source_sync.as_mut().unwrap(); op.phase = SyncPhase::Sending; op.message = "正在发送固定快照中的所选源配置…".into();
+    }
+    build::rerender_main_ui();
+    if interconnect::send_qaic_message(sync.device_addr.clone(), WATCH_APP_PKG_NAME.into(), sync.plan.configs_message.clone()).await.is_err() {
+        finish_source_sync(id, SyncPhase::Failed, "配置命令发送异常，设备是否收到待核实；Cookie 命令未发送".into()); return;
+    }
+    {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if let Some(op) = state.source_sync.as_mut().filter(|s| s.id == id) { op.configs_sent = true; }
+    }
+    if !source_sync_current(id) { return; }
+    if let Some(message) = &sync.plan.cookie_message {
+        if !source_target_connected(&sync).await {
+            finish_source_sync(id, SyncPhase::Partial, "配置命令已发送，但连接已变化；Cookie 未发送，设备保存结果待核实".into()); return;
+        }
+        if !source_sync_current(id) { return; }
+        source_sync_progress(id)("所选源配置命令已发送，正在发送各 key 的 Cookie 修改…".into());
+        if interconnect::send_qaic_message(sync.device_addr.clone(), WATCH_APP_PKG_NAME.into(), message.clone()).await.is_err() {
+            finish_source_sync(id, SyncPhase::Partial, "配置命令已发送，Cookie 命令发送异常；设备保存结果待核实".into()); return;
+        }
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if let Some(op) = state.source_sync.as_mut().filter(|s| s.id == id) { op.cookies_sent = true; }
+    }
+    finish_source_sync(id, SyncPhase::Sent, format!("已发送 {} 个所选源配置及 {} 项 Cookie 修改；设备保存结果待核实。可重新读取设备源列表确认配置。",
+        sync.plan.keys.len(), sync.plan.cookie_count));
+}
+
+fn parse_data_action(value: &str) -> Option<(u64, usize)> {
+    let (revision, index) = value.split_once('_')?;
+    Some((revision.parse().ok()?, index.parse().ok()?))
+}
+
+pub async fn refresh_data_connection() {
+    let devices = device::get_connected_device_list().await;
+    ui_state().write().unwrap_or_else(|p| p.into_inner()).data_browser.checked_device =
+        devices.first().map(|d| super::data_browser::DataDevice { name: d.name.clone(), addr: d.addr.clone() });
+}
+
+pub async fn handle_data_device_action() {
+    refresh_data_connection().await;
+    let timer_id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        let changed = state.data_browser.busy() && state.data_browser.requested_device.as_ref()
+            .is_some_and(|requested| state.data_browser.checked_device.as_ref()
+                .is_none_or(|current| current.addr != requested.addr));
+        if changed {
+            let message = "读取目标设备已断开或连接已切换，请重新读取".to_string();
+            state.data_browser.fail(message.clone());
+            state.app_data_status = StatusState::Error(message);
+            state.sync_receive.finish();
+            state.http_data_sync = None;
+            state.app_data_recv_timer_id.take()
+        } else { None }
+    };
+    if let Some(id) = timer_id { timer::clear_timer(id); }
+    let timers = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        let current = state.data_browser.checked_device.as_ref().map(|d| d.addr.clone());
+        let mut timers = Vec::new();
+        for request in &mut state.deletes.requests {
+            if request.phase.busy() && current.as_deref() != Some(&request.target.owner.addr) {
+                request.phase = if request.session.is_empty() { DeletePhase::Failed } else { DeletePhase::Unknown };
+                request.message = if request.session.is_empty() { "设备连接已变化，删除命令未发送" }
+                    else { "目标设备已断开或连接已切换，删除结果未确认；请重连后查询或读取核实" }.into();
+                if let Some(id) = request.timer_id.take() { timers.push(id); }
+            }
+        }
+        if let Some(sync) = state.source_sync.as_mut().filter(|s| s.phase.busy()) && current.as_deref() != Some(&sync.device_addr) {
+            sync.phase = if sync.configs_sent { SyncPhase::Partial } else { SyncPhase::Cancelled };
+            sync.message = if sync.configs_sent { "原设备连接已变化，已发送配置的保存结果待核实；剩余命令停止发送" }
+                else { "原目标设备已断开或切换，配置与 Cookie 命令未发送" }.into();
+        }
+        timers
+    };
+    for id in timers { timer::clear_timer(id); }
+    build::rerender_main_ui();
+}
+
+async fn fail_library_sync(message: String) {
+    ui_state().write().unwrap_or_else(|p| p.into_inner()).data_browser.fail(message.clone());
+    show_app_data_status(StatusState::Error(message)).await;
+}
+
+async fn handle_delete_data(revision: u64, index: usize, source: bool) {
+    let target = ui_state().read().unwrap_or_else(|p| p.into_inner()).capture_data_target(revision, index, source);
+    let Some(target) = target else {
+        show_app_data_status(StatusState::Error("列表已变化、未完整或正在同步，请重新读取后选择条目。".into())).await;
+        return;
+    };
+    refresh_data_connection().await;
+    if !data_delete_valid(&target) {
+        data_delete_status(&target, StatusState::Error("当前连接与这份列表不匹配，请读取目标设备数据后再操作。".into())).await;
         return;
     }
-
-    if source_name.is_none() {
-        show_status(StatusState::Processing("正在获取漫画源配置...".to_string())).await;
-
-        match fetch_source_name(&domain).await {
-            Some(name) => {
-                source_name = Some(name.clone());
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.fetched_source_name = Some(name.clone());
-                state.config.source_name = name;
-            }
-            None => {
-                show_status(StatusState::Error(
-                    "无法获取漫画源配置，请检查域名是否正确。".to_string(),
-                ))
-                .await;
-                return;
-            }
-        }
-    }
-
-    let source_name = source_name.unwrap();
-
-    show_status(StatusState::Processing("正在检查快应用...".to_string())).await;
-
-    let progress = sync_progress();
-    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
-        Ok(addr) => addr,
-        Err(msg) => {
-            show_status(StatusState::Error(msg)).await;
-            return;
-        }
-    };
-
-    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续同步流程
-    handshake::begin_wait(
-        device_addr.clone(),
-        sync_progress(),
-        move |result| async move { match result {
-            Err(msg) => {
-                show_status(StatusState::Error(msg)).await;
-            }
-            Ok(_) => {
-                sync_continue(cookie, domain, source_name, device_addr).await;
-            }
-        } },
-    );
+    if source { handle_delete_source(target).await; } else { handle_delete_comic(target).await; }
 }
 
-async fn sync_continue(cookie: String, domain: String, source_name: String, device_addr: String) {
-    show_status(StatusState::Processing("正在发送到手表...".to_string())).await;
+fn data_delete_valid(target: &DataTarget) -> bool {
+    let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+    state.data_target_current(target) && state.data_browser.checked_device.as_ref()
+        .is_some_and(|device| device.addr == target.owner.addr)
+}
 
-    if !cookie.is_empty() {
-        let cookie_data = json!({
-            "type": "cookie",
-            &source_name: cookie
-        });
-
-        let cookie_str = match serde_json::to_string(&cookie_data) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("序列化 Cookie 数据失败: {}", e);
-                show_status(StatusState::Error("数据序列化失败。".to_string())).await;
-                return;
-            }
-        };
-
-        match interconnect::send_qaic_message(device_addr.clone(), WATCH_APP_PKG_NAME.into(), cookie_str).await {
-            Ok(_) => {
-                tracing::info!("Cookie 发送成功");
-            }
-            Err(e) => {
-                tracing::error!("发送 Cookie 失败: {:?}", e);
-                show_status(StatusState::Error("Cookie 发送失败。".to_string())).await;
-                return;
-            }
+fn delete_progress(id: &str) -> impl Fn(String) + Send + 'static {
+    let id = id.to_string();
+    move |message| {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if let Some(request) = state.deletes.get_mut(&id) && request.phase.busy() {
+            request.message = message;
         }
+        drop(state);
+        build::rerender_main_ui();
     }
+}
 
-    show_status(StatusState::Processing("正在发送漫画源配置...".to_string())).await;
+async fn data_delete_status(target: &DataTarget, status: StatusState) {
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.revision == target.revision {
+        show_app_data_status(status).await;
+    }
+}
 
-    let source_config = {
-        let state = ui_state()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.fetched_source_config.clone()
-    };
-
-    let source_config = match source_config {
-        Some(config) => config,
-        None => {
-            tracing::info!("缓存中没有完整配置，重新获取");
-            match fetch_source_config(&domain).await {
-                Some(config) => config,
-                None => {
-                    show_status(StatusState::Success(
-                        "Cookie 已同步，但漫画源配置获取失败。".to_string(),
-                    ))
-                    .await;
-                    return;
-                }
-            }
-        }
-    };
-
-    let source_msg = json!({
-        "type": "source_config",
-        "configs": source_config
-    });
-
-    let source_msg_str = match serde_json::to_string(&source_msg) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("序列化漫画源配置失败: {}", e);
-            show_status(StatusState::Error("漫画源配置序列化失败。".to_string())).await;
-            return;
-        }
-    };
-
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), source_msg_str).await {
+async fn prepare_data_delete(target: &DataTarget, id: &str) -> Option<String> {
+    refresh_data_connection().await;
+    if !data_delete_valid(target) {
+        set_delete_phase(id, DeletePhase::Failed, "列表或连接已变化，删除命令未发送".into());
+        return None;
+    }
+    match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &delete_progress(id)).await {
+        Ok(addr) if addr == target.owner.addr && data_delete_valid(target) => Some(addr),
         Ok(_) => {
-            show_status(StatusState::Success("同步成功！".to_string())).await;
+            set_delete_phase(id, DeletePhase::Failed, "目标设备已变化，删除命令未发送。".into());
+            None
         }
-        Err(e) => {
-            tracing::error!("发送漫画源配置失败: {:?}", e);
-            show_status(StatusState::Error("漫画源配置发送失败。".to_string())).await;
-        }
+        Err(message) => { set_delete_phase(id, DeletePhase::Failed, message); None }
     }
 }
 
-async fn handle_delete_comic(index: usize) {
-    let comic_name = {
-        let state = ui_state()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.app_comics.get(index).map(|c| c.name.clone())
-    };
-
-    let comic_name = match comic_name {
-        Some(name) if !name.is_empty() => name,
-        _ => {
-            show_app_data_status(StatusState::Error("找不到该漫画信息。".to_string())).await;
-            return;
-        }
-    };
+async fn handle_delete_comic(target: DataTarget) {
+    let comic_name = target.item.name().to_string();
 
     let dialog_info = dialog::DialogInfo {
         title: format!("确认删除《{}》", comic_name),
@@ -2344,103 +2400,11 @@ async fn handle_delete_comic(index: usize) {
         return;
     }
 
-    show_app_data_status(StatusState::Processing(format!(
-        "正在删除: {}...",
-        comic_name
-    )))
-    .await;
-
-    let progress = app_data_progress();
-    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
-        Ok(addr) => addr,
-        Err(msg) => {
-            show_app_data_status(StatusState::Error(msg)).await;
-            return;
-        }
-    };
-
-    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
-    handshake::begin_wait(
-        device_addr.clone(),
-        app_data_progress(),
-        move |result| async move { match result {
-            Err(msg) => {
-                show_app_data_status(StatusState::Error(msg)).await;
-            }
-            Ok(_) => {
-                delete_comic_continue(comic_name, index, device_addr).await;
-            }
-        } },
-    );
+    prepare_and_send_delete(target).await;
 }
 
-async fn delete_comic_continue(comic_name: String, index: usize, device_addr: String) {
-    let delete_msg = json!({
-        "type": "delete_comic",
-        "name": comic_name
-    });
-
-    let delete_str = match serde_json::to_string(&delete_msg) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("序列化删除消息失败: {}", e);
-            show_app_data_status(StatusState::Error("序列化失败。".to_string())).await;
-            return;
-        }
-    };
-
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), delete_str).await {
-        Ok(_) => {
-            tracing::info!("删除命令已发送: {}", comic_name);
-
-            {
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if index < state.app_comics.len() {
-                    state.app_comics.remove(index);
-                    state.app_comic_count = Some(state.app_comics.len());
-                }
-            }
-
-            show_app_data_status(StatusState::Success(format!("已删除: {}", comic_name))).await;
-
-            let root_id: Option<String>;
-            {
-                let state = ui_state()
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                root_id = state.root_element_id.clone();
-            }
-            if let Some(root_id) = root_id {
-                let ui = build_main_ui();
-                psys_host::ui::render(&root_id, ui);
-            }
-
-            build::render_comic_data_card(COMIC_DATA_CARD_ID);
-        }
-        Err(e) => {
-            tracing::error!("发送删除命令失败: {:?}", e);
-            show_app_data_status(StatusState::Error("发送删除命令失败。".to_string())).await;
-        }
-    }
-}
-
-async fn handle_delete_source(index: usize) {
-    let source_name = {
-        let state = ui_state()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.app_sources.get(index).map(|s| s.name.clone())
-    };
-
-    let source_name = match source_name {
-        Some(name) if !name.is_empty() => name,
-        _ => {
-            show_app_data_status(StatusState::Error("找不到该漫画源信息。".to_string())).await;
-            return;
-        }
-    };
+async fn handle_delete_source(target: DataTarget) {
+    let source_name = target.item.name().to_string();
 
     let dialog_info = dialog::DialogInfo {
         title: format!("确认删除漫画源「{}」", source_name),
@@ -2471,90 +2435,150 @@ async fn handle_delete_source(index: usize) {
         return;
     }
 
-    show_app_data_status(StatusState::Processing(format!(
-        "正在删除漫画源: {}...",
-        source_name
-    )))
-    .await;
-
-    let progress = app_data_progress();
-    let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
-        Ok(addr) => addr,
-        Err(msg) => {
-            show_app_data_status(StatusState::Error(msg)).await;
-            return;
-        }
-    };
-
-    // 握手等待由定时器事件驱动，完成后在 on_done 回调里继续删除流程
-    handshake::begin_wait(
-        device_addr.clone(),
-        app_data_progress(),
-        move |result| async move { match result {
-            Err(msg) => {
-                show_app_data_status(StatusState::Error(msg)).await;
-            }
-            Ok(_) => {
-                delete_source_continue(source_name, index, device_addr).await;
-            }
-        } },
-    );
+    prepare_and_send_delete(target).await;
 }
 
-async fn delete_source_continue(source_name: String, index: usize, device_addr: String) {
-    let delete_msg = json!({
-        "type": "delete_source",
-        "name": source_name
-    });
-
-    let delete_str = match serde_json::to_string(&delete_msg) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("序列化删除消息失败: {}", e);
-            show_app_data_status(StatusState::Error("序列化失败。".to_string())).await;
-            return;
-        }
+fn set_delete_phase(id: &str, phase: DeletePhase, message: String) {
+    let timer_id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        let Some(request) = state.deletes.get_mut(id) else { return; };
+        if request.phase.final_result() { return; }
+        request.phase = phase;
+        request.message = message;
+        request.deadline = None;
+        request.timer_id.take()
     };
+    if let Some(id) = timer_id { timer::clear_timer(id); }
+    build::rerender_main_ui();
+}
 
-    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), delete_str).await {
-        Ok(_) => {
-            tracing::info!("删除漫画源命令已发送: {}", source_name);
-
-            {
-                let mut state = ui_state()
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if index < state.app_sources.len() {
-                    state.app_sources.remove(index);
-                    state.app_source_count = Some(state.app_sources.len());
-                }
-            }
-
-            show_app_data_status(StatusState::Success(format!(
-                "已删除漫画源: {}",
-                source_name
-            )))
-            .await;
-
-            let root_id: Option<String>;
-            {
-                let state = ui_state()
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                root_id = state.root_element_id.clone();
-            }
-            if let Some(root_id) = root_id {
-                let ui = build_main_ui();
-                psys_host::ui::render(&root_id, ui);
-            }
-
-            build::render_comic_data_card(COMIC_DATA_CARD_ID);
+async fn prepare_and_send_delete(target: DataTarget) {
+    let id = ui_state().write().unwrap_or_else(|p| p.into_inner()).deletes.begin(target.clone());
+    let Some(id) = id else {
+        show_app_data_status(StatusState::Error("已有删除请求等待确认，请先查询结果或重新读取核实。".into())).await;
+        return;
+    };
+    let Some(device_addr) = prepare_data_delete(&target, &id).await else { return; };
+    handshake::begin_wait(device_addr.clone(), delete_progress(&id), move |result| async move {
+        match result {
+            Err(message) => set_delete_phase(&id, DeletePhase::Failed, message),
+            Ok(_) => send_delete_request(id, target, device_addr).await,
         }
-        Err(e) => {
-            tracing::error!("发送删除漫画源命令失败: {:?}", e);
-            show_app_data_status(StatusState::Error("发送删除命令失败。".to_string())).await;
+    });
+}
+
+fn arm_delete_timeout(id: &str) {
+    let generation = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        let Some(request) = state.deletes.get_mut(id) else { return; };
+        request.wait_generation = request.wait_generation.wrapping_add(1);
+        request.deadline = Some(Instant::now() + std::time::Duration::from_millis(DELETE_TIMEOUT_MS));
+        request.wait_generation
+    };
+    let tid = timer::set_timeout(DELETE_TIMEOUT_MS, &format!("{DELETE_TIMEOUT_EVENT}{id}:{generation}"));
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    if let Some(request) = state.deletes.get_mut(id) { request.timer_id = Some(tid); }
+}
+
+pub fn handle_delete_timeout(payload: &str) {
+    let Some((id, generation)) = payload.rsplit_once(':') else { return; };
+    let Ok(generation) = generation.parse::<u64>() else { return; };
+    let request = ui_state().read().unwrap_or_else(|p| p.into_inner()).deletes.get(id).cloned();
+    let Some(request) = request.filter(|r| r.wait_generation == generation && r.phase.busy()) else { return; };
+    let now = Instant::now();
+    if request.timed_out(generation, now) {
+        set_delete_phase(id, DeletePhase::Unknown, "未收到设备最终结果，请查询原结果或重新读取核实。".into());
+    } else if let Some(deadline) = request.deadline {
+        if let Some(tid) = request.timer_id { timer::clear_timer(tid); }
+        let remaining = deadline.saturating_duration_since(now).as_millis() as u64 + 1;
+        let tid = timer::set_timeout(remaining, &format!("{DELETE_TIMEOUT_EVENT}{payload}"));
+        if let Some(request) = ui_state().write().unwrap_or_else(|p| p.into_inner()).deletes.get_mut(id) { request.timer_id = Some(tid); }
+    }
+}
+
+async fn send_delete_request(id: String, target: DataTarget, device_addr: String) {
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).deletes.get(&id)
+        .is_none_or(|r| r.phase != DeletePhase::Preparing) { return; }
+    refresh_data_connection().await;
+    if !data_delete_valid(&target) {
+        set_delete_phase(&id, DeletePhase::Failed, "列表或连接已变化，删除命令未发送。".into());
+        return;
+    }
+    let negotiated = ui_state().read().unwrap_or_else(|p| p.into_inner()).watch_delete.clone().filter(|(addr, _)| *addr == device_addr);
+    let message = if let Some((_, session)) = negotiated {
+        let valid = {
+            let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+            match &target.item {
+                DataItem::Comic { id, .. } => !id.is_empty() && state.app_comics.iter().filter(|c| c.id == *id).count() == 1,
+                DataItem::Source { key, .. } => !key.is_empty() && key != "using" && state.app_sources.iter().filter(|s| s.key == *key).count() == 1,
+            }
+        };
+        if !valid { set_delete_phase(&id, DeletePhase::Failed, "目标缺少唯一 ID/key，请重新读取设备数据。".into()); return; }
+        let message = {
+            let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+            let Some(request) = state.deletes.get_mut(&id) else { return; };
+            request.session = session;
+            request.phase = DeletePhase::Waiting;
+            request.message = "删除命令正在发送，等待设备实际文件及索引结果…".into();
+            request.wire_message(None)
+        };
+        arm_delete_timeout(&id); // register before send; never await the result under BUSINESS_EVENTS
+        message
+    } else {
+        let ambiguous = {
+            let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+            match &target.item {
+                DataItem::Comic { name, .. } => state.app_comics.iter().filter(|c| c.name == *name).count() != 1,
+                DataItem::Source { name, .. } => state.app_sources.iter().filter(|s| s.name == *name || (!s.key.is_empty() && s.key == *name)).count() != 1,
+            }
+        };
+        if ambiguous { set_delete_phase(&id, DeletePhase::Failed, "旧端删除协议按名称定位，同名条目请在设备端删除。".into()); return; }
+        json!({"type": if matches!(target.item, DataItem::Comic { .. }) { "delete_comic" } else { "delete_source" }, "name":target.item.name()})
+    };
+    let modern = message["type"] == "delete_item";
+    build::rerender_main_ui();
+    match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), message.to_string()).await {
+        Ok(_) if !modern => set_delete_phase(&id, DeletePhase::LegacySent, "删除命令已发送，待刷新核实；请重新读取确认设备结果。".into()),
+        Ok(_) => {},
+        Err(error) => {
+            tracing::warn!("删除发送异常: {:?}", error);
+            set_delete_phase(&id, if modern { DeletePhase::Unknown } else { DeletePhase::LegacySent },
+                "发送异常，设备结果未确认，请重新读取核实。".into());
         }
     }
+}
+
+async fn query_delete_result(id: &str) {
+    let request = ui_state().read().unwrap_or_else(|p| p.into_inner()).deletes.get(id).cloned();
+    let Some(request) = request.filter(|r| r.phase == DeletePhase::Unknown && !r.session.is_empty()) else { return; };
+    refresh_data_connection().await;
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.checked_device.as_ref()
+        .is_none_or(|device| device.addr != request.target.owner.addr) {
+        set_delete_phase(id, DeletePhase::Unknown, "请先连接原目标设备，再查询删除结果。".into()); return;
+    }
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.busy() { return; }
+    set_delete_phase(id, DeletePhase::Querying, "正在连接原设备查询删除结果…".into());
+    let addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &delete_progress(id)).await {
+        Ok(addr) if addr == request.target.owner.addr => addr,
+        _ => { set_delete_phase(id, DeletePhase::Unknown, "无法连接原设备，请重新读取核实。".into()); return; }
+    };
+    let id = id.to_string();
+    handshake::begin_wait(addr.clone(), delete_progress(&id), move |result| async move {
+        if ui_state().read().unwrap_or_else(|p| p.into_inner()).deletes.get(&id)
+            .is_none_or(|r| r.phase != DeletePhase::Querying) { return; }
+        refresh_data_connection().await;
+        let session = ui_state().read().unwrap_or_else(|p| p.into_inner()).watch_delete.clone()
+            .filter(|(device, _)| *device == addr).map(|(_, session)| session);
+        let connected = ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.checked_device.as_ref().is_some_and(|d| d.addr == addr);
+        if result.is_err() || session.is_none() || !connected {
+            set_delete_phase(&id, DeletePhase::Unknown, "原设备无法查询结果，请重新读取核实。".into()); return;
+        }
+        arm_delete_timeout(&id);
+        let message = request.wire_message(session.as_deref()).to_string();
+        if interconnect::send_qaic_message(addr, WATCH_APP_PKG_NAME.into(), message).await.is_err() {
+            set_delete_phase(&id, DeletePhase::Unknown, "结果查询发送异常，请重新读取核实。".into());
+        }
+    });
 }
 
 /// 到有效进展的截止时间才检查，不每个封面片都clear/set宿主定时器。
@@ -2594,8 +2618,6 @@ async fn disarm_app_data_recv_timeout() -> u64 {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.sync_receive.finish();
         state.http_data_sync = None;
-        state.sync_comics_seen.clear();
-        state.sync_sources_seen.clear();
         (state.app_data_recv_timer_id.take(), state.sync_receive.generation())
     };
     if let Some(t) = old {
@@ -2631,44 +2653,34 @@ pub async fn handle_app_data_recv_timeout(generation: u64) {
         if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished {
             return;
         }
-        if cover_phase {
-            show_app_data_status(StatusState::Success(
-                "数据获取完成（封面可能不完整）".to_string(),
-            )).await;
-        } else {
-            show_app_data_status(StatusState::Error("接收超时，请重试。".to_string())).await;
-        }
+        fail_library_sync(if cover_phase { "封面接收超时，请重试。" } else { "列表接收超时，请重试。" }.into()).await;
 }
 
 async fn handle_fetch_app_data() {
     let operation = disarm_app_data_recv_timeout().await;
     if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
+    refresh_data_connection().await;
+    let target = ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.checked_device.clone();
+    let Some(target) = target else {
+        ui_state().write().unwrap_or_else(|p| p.into_inner()).data_browser.begin_request(None);
+        fail_library_sync("没有已连接的设备，请检查手表连接。".into()).await;
+        return;
+    };
+    ui_state().write().unwrap_or_else(|p| p.into_inner()).data_browser.begin(target.clone());
     show_app_data_status(StatusState::Processing("正在获取快应用数据...".to_string())).await;
 
-    // 新一轮数据会话：清空上一轮残留。
-    // 清理动作必须在发起请求时完成——安卓端消息乱序，
-    // 靠 app_data_header 到达时机清理会误删已收到的数据
+    // Clear transport buffers now. The visible list switches on the first valid
+    // message, not on the header: legacy interconnect can deliver metadata first.
     {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.sync_receive.generation() != operation { return; }
-        state.app_comics.clear();
-        state.app_sources.clear();
-        state.app_comic_count = None;
-        state.app_source_count = None;
+        // Keep the previous visible snapshot until the first valid incoming message.
         state.cover_chunk_buffers.clear();
         // 滑窗接收会话重置：新一轮 gseq 从 0 开始
         state.sync_recv = None;
-        // 清理过期的 pending_covers（30秒未补挂的丢弃）
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        state.pending_covers.retain(|_, (_, ts)| now - *ts < 30);
-        if !state.pending_covers.is_empty() {
-            tracing::info!("清理了 {} 个过期封面缓存", state.pending_covers.len());
-        }
+        state.pending_covers.clear();
     }
 
     let progress = move |message: String| {
@@ -2676,10 +2688,14 @@ async fn handle_fetch_app_data() {
         if current { app_data_progress()(message); }
     };
     let device_addr = match handshake::prepare_launch(handshake::MIN_MANAGEMENT_VERSION, &progress).await {
-        Ok(addr) => addr,
+        Ok(addr) if addr == target.addr => addr,
+        Ok(_) => {
+            fail_library_sync("准备期间目标设备已变化，请重新读取。".into()).await;
+            return;
+        }
         Err(msg) => {
             if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
-            show_app_data_status(StatusState::Error(msg)).await;
+            fail_library_sync(msg).await;
             return;
         }
     };
@@ -2697,7 +2713,7 @@ async fn handle_fetch_app_data() {
             if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
             match result {
             Err(msg) => {
-                show_app_data_status(StatusState::Error(msg)).await;
+                fail_library_sync(msg).await;
             }
             Ok(_) => {
                 fetch_app_data_send_request(device_addr, operation).await;
@@ -2709,6 +2725,12 @@ async fn handle_fetch_app_data() {
 
 async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
     if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != operation { return; }
+    refresh_data_connection().await;
+    if ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.checked_device.as_ref()
+        .is_none_or(|device| device.addr != device_addr) {
+        fail_library_sync("握手后连接已变化，读取请求未发送。".into()).await;
+        return;
+    }
     let use_http = ui_state().read().unwrap_or_else(|p| p.into_inner()).watch_http_data_sync;
     tracing::info!("获取快应用数据请求: use_http={}, addr={}", use_http, device_addr);
     let http = if use_http {
@@ -2734,7 +2756,7 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            show_app_data_status(StatusState::Error("请求序列化失败。".to_string())).await;
+            fail_library_sync("请求序列化失败。".to_string()).await;
             return;
         }
     };
@@ -2756,14 +2778,12 @@ async fn fetch_app_data_send_request(device_addr: String, operation: u64) {
         Err(e) => {
             {
                 let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
-                if state.sync_receive.generation() != generation || state.app_comic_count.is_some()
-                    || !state.sync_comics_seen.is_empty() || !state.sync_sources_seen.is_empty() { return; }
+                if state.sync_receive.generation() != generation || state.data_browser.incoming { return; }
             }
             let finished = disarm_app_data_recv_timeout().await;
             if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished { return; }
             tracing::error!("发送数据请求失败: {:?}", e);
-            show_app_data_status(StatusState::Error("发送请求失败，请检查连接。".to_string()))
-                .await;
+            fail_library_sync("发送请求失败，请检查连接。".to_string()).await;
         }
     }
 }
@@ -2802,6 +2822,8 @@ pub async fn handle_interconnect_message(payload: &str) {
         }
     };
 
+    let source_addr = ["deviceAddr", "device_addr", "addr"].iter().find_map(|key|
+        outer.get(key).and_then(Value::as_str).map(str::to_string));
     let parsed = if let Some(pt) = outer.get("payloadText") {
         if let Some(s) = pt.as_str() {
             tracing::info!("从 payloadText 字符串解包数据");
@@ -2826,6 +2848,14 @@ pub async fn handle_interconnect_message(payload: &str) {
         tracing::info!("直接使用原始 payload 对象");
         outer
     };
+
+    if parsed.get("type").and_then(Value::as_str) == Some("delete_result") {
+        handle_delete_result(&parsed, source_addr.as_deref());
+        return;
+    }
+    if parsed.get("type").and_then(Value::as_str) == Some("hs_pong") && let Some(source) = source_addr.as_deref() {
+        if get_addr(&addr_cell).await.as_deref() != Some(source) { return; }
+    }
 
     // 方向 B 滑窗接收：带 gseq 的同步帧先经 RecvFrontier 乱序缓存、按序还原后再派发；
     // 每帧（含重复帧）都回累计 ACK（sync_ack）。旧快应用帧无 gseq，直接走旧路径。
@@ -2893,8 +2923,14 @@ fn valid_sync_message(msg: &Value) -> bool {
                 && msg.get("name").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
                 && msg.get("data").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
         }
-        Some("app_data_comic") => msg.get("comic").is_some_and(Value::is_object),
-        Some("app_data_source") => msg.get("source").is_some_and(Value::is_object),
+        Some("app_data_comic") => msg.get("comic").and_then(|v| v.get("name"))
+            .and_then(Value::as_str).is_some_and(|name| !name.is_empty()) &&
+            msg.get("index").and_then(Value::as_u64).unwrap_or(0) < 10_000,
+        Some("app_data_source") => msg.get("source").and_then(|v| v.get("name"))
+            .and_then(Value::as_str).is_some_and(|name| !name.is_empty()) &&
+            msg.get("index").and_then(Value::as_u64).unwrap_or(0) < 10_000,
+        Some("app_data_header") => ["comic_count", "source_count"].iter().all(|key|
+            msg.get(key).and_then(Value::as_u64).is_some_and(|count| count <= 10_000)),
         Some(kind) => sync_message_type(kind),
         None => false,
     }
@@ -2914,6 +2950,8 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
         if state.http_data_sync.is_some() || !state.sync_receive.active() || !valid_sync_message(parsed)
             || !state.sync_receive.matches_session(parsed.get("session").and_then(Value::as_str))
             || (!windowed && state.sync_receive.session().is_some()) { return; }
+        drop(state);
+        ui_state().write().unwrap_or_else(|p| p.into_inner()).accept_library_data();
     }
 
     match msg_type {
@@ -2939,6 +2977,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             let fresh = state.app_comic_count.is_none() && state.app_source_count.is_none();
             state.app_comic_count = Some(comic_count);
             state.app_source_count = Some(source_count);
+            state.update_library_completeness();
             if fresh { state.sync_receive.progress(Instant::now()); }
             // 安卓端消息可能乱序：comic/source/封面分片可能先于 header 到达，
             // 这里只按需扩容（不重建、不清缓冲区），数据按 index/名字落位
@@ -2992,10 +3031,12 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                     }
                     state.app_comics[index] = info;
                     if state.sync_comics_seen.insert(index) { state.sync_receive.progress(Instant::now()); }
+                    state.update_library_completeness();
+                    state.data_browser.covers_received = state.app_comics.iter().filter(|c| !c.cover_base64.is_empty()).count();
                     // 接收进度提示
                     state.app_data_status = StatusState::Processing(format!(
                         "接收漫画 {}/{}",
-                        index + 1,
+                        state.sync_comics_seen.len(),
                         state.app_comic_count.unwrap_or(0)
                     ));
                     state.root_element_id.clone()
@@ -3019,6 +3060,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
 
             if let Some(source) = source {
                 let info = SourceInfo {
+                    key: source.get("key").and_then(Value::as_str).unwrap_or("").to_string(),
                     name: source
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -3039,10 +3081,11 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                     }
                     state.app_sources[index] = info;
                     if state.sync_sources_seen.insert(index) { state.sync_receive.progress(Instant::now()); }
+                    state.update_library_completeness();
                     // 接收进度提示
                     state.app_data_status = StatusState::Processing(format!(
                         "接收漫画源 {}/{}",
-                        index + 1,
+                        state.sync_sources_seen.len(),
                         state.app_source_count.unwrap_or(0)
                     ));
                     state.root_element_id.clone()
@@ -3069,18 +3112,23 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
         Some("app_data_done") => {
             tracing::info!("列表数据接收完成，渲染 UI");
 
-            let (comic_count, source_count, root_id, fresh_done) = {
+            let (comic_count, source_count, root_id, fresh_done, finish_empty) = {
                 let mut state = ui_state()
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let comic_count = state.app_comic_count.unwrap_or(0);
                 let fresh_done = !state.sync_receive.cover_phase();
+                state.data_browser.lists_done = true;
+                state.update_library_completeness();
+                let finish_empty = comic_count == 0 && state.data_browser.lists_complete && !windowed;
+                state.data_browser.phase = DataPhase::Covers;
                 // 有漫画时还有封面要收：进入封面接收阶段；
                 // 没有漫画则整个拉取流程结束
-                state.app_data_status = if comic_count > 0 || windowed {
+                state.app_data_status = if !finish_empty {
                     if fresh_done { state.sync_receive.covers(Instant::now()); }
                     StatusState::Processing(if comic_count > 0 { "正在接收封面..." } else { "正在完成同步..." }.to_string())
                 } else {
+                    state.finish_library_sync(None);
                     StatusState::Success("数据获取成功！".to_string())
                 };
                 (
@@ -3088,11 +3136,12 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                     state.app_source_count.unwrap_or(0),
                     state.root_element_id.clone(),
                     fresh_done,
+                    finish_empty,
                 )
             };
 
             // 封面阶段重新武装整体超时；无封面则整个流程结束，解除超时
-            if comic_count > 0 || windowed {
+            if !finish_empty {
                 if fresh_done { schedule_app_data_recv_timeout().await; }
             } else {
                 disarm_app_data_recv_timeout().await;
@@ -3121,15 +3170,19 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                 state.cover_chunk_buffers.clear();
                 state.pending_covers.clear();
                 if let Some(frontier) = state.sync_recv.as_mut() { frontier.clear_pending(); }
+                state.finish_library_sync(None);
                 incomplete
             };
                 let finished = disarm_app_data_recv_timeout().await;
                 if ui_state().read().unwrap_or_else(|p| p.into_inner()).sync_receive.generation() != finished {
                     return;
                 }
-                show_app_data_status(StatusState::Success(if incomplete {
+                let lists_complete = ui_state().read().unwrap_or_else(|p| p.into_inner()).data_browser.lists_complete;
+                show_app_data_status(if !lists_complete {
+                    StatusState::Error("列表接收不完整，请重新读取。".into())
+                } else { StatusState::Success(if incomplete {
                     "数据获取完成（封面可能不完整）"
-                } else { "数据获取成功！" }.to_string())).await;
+                } else { "数据获取成功！" }.to_string()) }).await;
             build::render_comic_data_card(COMIC_DATA_CARD_ID);
         }
         Some("cover_data_chunk") => {
@@ -3176,6 +3229,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         state.pending_covers.insert(name.to_string(), (cover, now));
                     }
                     state.cover_chunk_buffers.remove(name);
+                    state.data_browser.covers_received = state.app_comics.iter().filter(|c| !c.cover_base64.is_empty()).count();
                     // 无论挂载还是暂存都算拼完，都需要回 cover_ack
                     (true, state.root_element_id.clone())
                 } else {
@@ -3257,7 +3311,7 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             tracing::info!("收到握手应答: session={}, settings={:?}", session, settings);
 
             if let Some(ref addr) = get_addr(addr_cell).await {
-                if !handshake::accepts_pong(&session) { return; }
+                if !handshake::accepts_pong_from(addr, &session) { return; }
                 {
                     let mut state = ui_state()
                         .write()
@@ -3275,6 +3329,9 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         .and_then(Value::as_bool).unwrap_or(false);
                     state.watch_http_data_sync = parsed.get("caps").and_then(|c| c.get("httpDataSync"))
                         .and_then(Value::as_u64) == Some(1);
+                    state.watch_delete = (parsed.get("caps").and_then(|c| c.get("deleteProtocol"))
+                        .and_then(Value::as_u64) == Some(1) && !session.is_empty())
+                        .then(|| (addr.clone(), session.clone()));
                 }
                 // 完成挂起的握手会话，锁外直接等待业务续体。
                 handshake::handle_hs_pong(addr, &session, &parsed).await;
@@ -3369,6 +3426,21 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
             tracing::info!("收到未处理的消息类型: {:?}", msg_type);
         }
     }
+}
+
+fn handle_delete_result(value: &Value, source_addr: Option<&str>) {
+    let timer_id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        let Some(id) = state.deletes.accept_result(value, source_addr) else { return; };
+        let request = state.deletes.get(&id).unwrap().clone();
+        if request.phase == DeletePhase::Success && !state.apply_delete_success(&request.target) {
+            state.deletes.get_mut(&id).unwrap().message.push_str("；原请求已完成，当前列表未直接调整，请重新读取核实");
+        }
+        state.deletes.get_mut(&id).unwrap().timer_id.take()
+    };
+    if let Some(id) = timer_id { timer::clear_timer(id); }
+    build::rerender_main_ui();
+    build::render_comic_data_card(COMIC_DATA_CARD_ID);
 }
 
 pub async fn show_app_data_status(status: StatusState) {

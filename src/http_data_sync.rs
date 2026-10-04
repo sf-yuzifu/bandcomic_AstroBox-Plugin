@@ -1,6 +1,7 @@
 //! Bounded HTTP callbacks from the watch. One binary cover in flight, no Base64 on the wire.
 use crate::http_probe::{self, ProbeResponse};
 use crate::ui::state::{ui_state, ComicInfo, SourceInfo, StatusState};
+use crate::ui::data_browser::DataPhase;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +25,8 @@ pub struct Comic {
 }
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Source {
+    #[serde(default)]
+    pub key: String,
     pub name: String,
     #[serde(rename = "apiUrl")]
     pub api_url: String,
@@ -186,7 +189,7 @@ impl HttpDataSync {
                     let items: Vec<Source> = serde_json::from_value(value.get("items").cloned().unwrap_or(Value::Null))
                         .map_err(|_| (400, "Invalid sources"))?;
                     if items.is_empty() || items.len() > 16 || offset.saturating_add(items.len()) > counts.1 ||
-                        items.iter().any(|s| s.name.len() > 4096 || s.api_url.len() > 8192) {
+                        items.iter().any(|s| s.key.len() > 512 || s.name.len() > 4096 || s.api_url.len() > 8192) {
                         return Err((400, "Invalid source batch"));
                     }
                     if offset < self.sources.len() {
@@ -313,6 +316,7 @@ pub fn route(method: &str, path: &str, query: &str, body: &[u8]) -> Option<Probe
     if state.sync_receive.remaining(state.sync_receive.generation(), Instant::now()).is_some_and(|d| d.is_zero()) {
         state.http_data_sync = None;
         state.sync_receive.finish();
+        state.data_browser.fail("HTTP 数据同步超时，请重试".into());
         state.app_data_status = StatusState::Error("HTTP 数据同步超时，请重试".into());
         let timer_id = state.app_data_recv_timer_id.take();
         drop(state);
@@ -326,28 +330,40 @@ pub fn route(method: &str, path: &str, query: &str, body: &[u8]) -> Option<Probe
     };
     let changed = !matches!(update, Update::None);
     let refresh = !matches!(&update, Update::None | Update::Progress);
+    if matches!(&update, Update::Header(..)) { state.accept_library_data(); }
     let mut timer_id = None;
     match update {
         Update::Header(comics, sources) => {
             state.app_comic_count = Some(comics);
             state.app_source_count = Some(sources);
         }
-        Update::Comics(items) => state.app_comics.extend(items.into_iter().map(|item| ComicInfo {
-            id: item.id, name: item.name, page_count: item.page_count, chapters: item.chapters, cover_base64: String::new(),
-        })),
-        Update::Sources(items) => state.app_sources.extend(items.into_iter().map(|item| SourceInfo {
-            name: item.name, api_url: item.api_url,
-        })),
+        Update::Comics(items) => {
+            let start = state.app_comics.len();
+            state.sync_comics_seen.extend(start..start + items.len());
+            state.app_comics.extend(items.into_iter().map(|item| ComicInfo {
+                id: item.id, name: item.name, page_count: item.page_count, chapters: item.chapters, cover_base64: String::new(),
+            }));
+        }
+        Update::Sources(items) => {
+            let start = state.app_sources.len();
+            state.sync_sources_seen.extend(start..start + items.len());
+            state.app_sources.extend(items.into_iter().map(|item| SourceInfo { key: item.key, name: item.name, api_url: item.api_url }));
+        }
         Update::ListsDone => {
+            state.data_browser.lists_done = true;
+            state.update_library_completeness();
+            state.data_browser.phase = DataPhase::Covers;
             state.sync_receive.http_covers(Instant::now());
             state.app_data_status = StatusState::Processing("HTTP 列表已接收，正在接收封面...".into());
         }
         Update::Cover(index, cover) => {
             state.app_comics[index].cover_base64 = cover;
+            state.data_browser.covers_received = state.app_comics.iter().filter(|c| !c.cover_base64.is_empty()).count();
             let received = state.http_data_sync.as_ref().unwrap().resolved.len();
             state.app_data_status = StatusState::Processing(format!("HTTP 封面 {}/{}", received, state.app_comics.len()));
         }
         Update::Complete(skipped) => {
+            state.finish_library_sync(Some(skipped));
             state.sync_receive.finish();
             timer_id = state.app_data_recv_timer_id.take();
             state.app_data_status = StatusState::Success(if skipped == 0 { "数据获取成功（HTTP）".into() }
@@ -355,6 +371,7 @@ pub fn route(method: &str, path: &str, query: &str, body: &[u8]) -> Option<Probe
         }
         _ => {}
     }
+    if refresh { state.clamp_data_pages(); }
     if changed { state.sync_receive.progress(Instant::now()); }
     let ack = json!({"ok": true, "receivedComics": state.app_comics.len(), "receivedSources": state.app_sources.len(),
         "resolvedCovers": state.http_data_sync.as_ref().map(|sync| sync.resolved.len()).unwrap_or(0),

@@ -7,6 +7,7 @@ use crate::exports::astrobox::psys_plugin_v4::{
 pub mod logger;
 pub mod ui;
 pub mod network;
+pub mod source_config;
 pub mod lvgl;
 pub mod transfer;
 pub mod sync_receive;
@@ -65,6 +66,9 @@ impl event::Guest for MyPlugin {
             event::EventType::InterconnectMessage => {
                 ui::handle_interconnect_message(&event_payload).await;
             }
+            event::EventType::DeviceAction => {
+                ui::event_handler::handle_data_device_action().await;
+            }
             event::EventType::Timer => {
                 // 宿主把定时器 payload 包在 JSON 信封里送达：
                 // {"kind":"timeout","payload":"...","timerId":N}
@@ -97,6 +101,8 @@ impl event::Guest for MyPlugin {
                     .and_then(|value| value.parse::<u64>().ok())
                 {
                     ui::event_handler::handle_app_data_recv_timeout(generation).await;
+                } else if let Some(payload) = timer_payload.strip_prefix(ui::deletion::DELETE_TIMEOUT_EVENT) {
+                    ui::event_handler::handle_delete_timeout(payload);
                 } else if timer_payload.starts_with(&format!("{}:", ui::state::HS_REGISTER_RETRY_EVENT))
                     || timer_payload.starts_with(&format!("{}:", ui::state::HS_PING_EVENT))
                 {
@@ -124,6 +130,7 @@ impl event::Guest for MyPlugin {
     }
 
     async fn on_ui_render(element_id: String) {
+        ui::event_handler::refresh_data_connection().await;
         ui::render_main_ui(&element_id);
     }
 

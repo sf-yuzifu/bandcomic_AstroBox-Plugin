@@ -2,10 +2,11 @@
 //! This exercises the built plugin, but does not replace installed AstroBox tests.
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use wasmtime::{Config, Engine, Store};
 use wasmtime::component::{Component, Linker, ResourceTable, Val};
-use wasmtime::component::{types::ComponentItem, ResourceType};
+use wasmtime::component::{types::ComponentItem, ResourceType, Resource, ResourceAny};
+use std::collections::HashMap;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, FsPerms};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
@@ -33,6 +34,15 @@ struct Context {
     launched_at: Option<std::time::Instant>,
     registrations: usize,
     timers: Vec<(u64, String)>,
+    device_addr: String,
+    device_name: String,
+    connected: bool,
+    ui_nodes: HashMap<u32, Vec<String>>,
+    ui_next: u32,
+    rendered: HashMap<String, Vec<String>>,
+    fail_send_type: Option<String>,
+    switch_after_send_type: Option<String>,
+    sent_targets: Vec<String>,
 }
 
 // Five distinct 2x2 BMPs: a cover followed by four pages. No image dependency is
@@ -74,7 +84,7 @@ fn fixture() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = count.clone();
     let task = std::thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
             let mut request = Vec::new();
@@ -92,6 +102,67 @@ fn fixture() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
         }
     });
     (url, count, task)
+}
+
+struct SourceFixture {
+    root: String,
+    count: Arc<AtomicUsize>,
+    stopped: Arc<AtomicBool>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SourceFixture {
+    fn drop(&mut self) {
+        self.stopped.store(true,Ordering::SeqCst);
+        if let Some(task) = self.task.take() { task.join().unwrap(); }
+    }
+}
+
+fn source_fixture() -> SourceFixture {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let root = format!("http://{}",listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let count = Arc::new(AtomicUsize::new(0)); let calls = count.clone();
+    let stopped = Arc::new(AtomicBool::new(false)); let stop = stopped.clone();
+    let task = std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            let (mut stream,_) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(std::time::Duration::from_millis(5)); continue; }
+                Err(error) => panic!("source fixture accept: {error}"),
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|b|b == b"\r\n\r\n") {
+                let mut buffer = [0u8;1024]; let size = stream.read(&mut buffer).unwrap();
+                assert!(size>0); bytes.extend_from_slice(&buffer[..size]);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+            calls.fetch_add(1,Ordering::SeqCst);
+            let config = |api: &str| serde_json::json!({"name":"同名源","apiUrl":api,"detailPath":"/album/<id>",
+                "photoPath":"/photo/<id>","searchPath":"/search/<text>/<page>","future":{"preserved":true}});
+            let (status,body) = match path {
+                "/multi/config" => (200,serde_json::json!({"A":config("https://a.example"),"B":config("https://b.example"),
+                    "Broken":{"name":"无效源","apiUrl":"https://bad.example","detailPath":"/album"},"C":config("https://c.example")}).to_string()),
+                "/other/config" => (200,serde_json::json!({"A":config("https://other.example")}).to_string()),
+                "/paged/config" => {
+                    let map: serde_json::Map<_,_> = (0..10).map(|i|(format!("K{i:02}"),config(&format!("https://s{i}.example")))).collect();
+                    (200,serde_json::Value::Object(map).to_string())
+                }
+                "/http-error/config" => (503,"{}".into()),
+                "/json-error/config" => (200,"{broken".into()),
+                "/model-error/config" => (200,"[]".into()),
+                "/all-bad/config" => (200,serde_json::json!({"using":config("https://a.example")}).to_string()),
+                "/network-error/config" => continue, // close without a response
+                _ => panic!("unexpected source fixture route: {path}"),
+            };
+            write!(stream,"HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                if status == 200 { "OK" } else { "Service Unavailable" },body.len()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        }
+    });
+    SourceFixture { root,count,stopped,task:Some(task) }
 }
 
 fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
@@ -127,12 +198,20 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(Some(Box::new(pick_res))));
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/device")?.func_new_concurrent("get-connected-device-list", |_, _, _, results| Box::pin(async move {
+    linker.instance("astrobox:psys-host-v4/dialog")?.func_new_concurrent("show-dialog", |_, _, _, results| Box::pin(async move {
+        results[0] = Val::Record(vec![("clicked-btn-id".into(), Val::String("confirm".into())),
+            ("input-result".into(), Val::String(String::new()))]);
+        Ok(())
+    }))?;
+    linker.instance("astrobox:psys-host-v4/device")?.func_new_concurrent("get-connected-device-list", |accessor, _, _, results| Box::pin(async move {
+        let (connected, name, addr) = accessor.with(|mut access| {
+            let ctx = access.get(); (ctx.connected, ctx.device_name.clone(), ctx.device_addr.clone())
+        });
         let dev = Val::Record(vec![
-            ("name".into(), Val::String("Xiaomi Smart Band 9 Pro".into())),
-            ("addr".into(), Val::String("11:22:33:44:55:66".into())),
+            ("name".into(), Val::String(name)),
+            ("addr".into(), Val::String(addr)),
         ]);
-        results[0] = Val::List(vec![dev]);
+        results[0] = Val::List(if connected { vec![dev] } else { vec![] });
         Ok(())
     }))?;
     linker.instance("astrobox:psys-host-v4/thirdpartyapp")?.func_new_concurrent("get-thirdparty-app-list", |accessor, _, _, results| Box::pin(async move {
@@ -156,14 +235,22 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         results[0] = Val::Result(Ok(None));
         Ok(())
     }))?;
-    linker.instance("astrobox:psys-host-v4/interconnect")?.func_wrap_concurrent("send-qaic-message", |accessor, (_addr, _pkg, data): (String, String, String)| {
-        accessor.with(|mut access| {
+    linker.instance("astrobox:psys-host-v4/interconnect")?.func_wrap_concurrent("send-qaic-message", |accessor, (addr, _pkg, data): (String, String, String)| {
+        let failed = accessor.with(|mut access| {
             let ctx = access.get();
             assert!(ctx.launched_at.expect("send must follow launch").elapsed() >= std::time::Duration::from_secs(3),
                 "interconnect message sent before the 3-second startup delay");
+            let message_type = serde_json::from_str::<serde_json::Value>(&data).unwrap()["type"].as_str().unwrap().to_string();
+            ctx.sent_targets.push(addr);
             ctx.sent_interconnect.lock().unwrap().push(data);
+            let failed = ctx.fail_send_type.as_deref() == Some(&message_type);
+            if failed { ctx.fail_send_type = None; }
+            if ctx.switch_after_send_type.as_deref() == Some(&message_type) {
+                ctx.switch_after_send_type = None; ctx.device_addr = "CC:DD:EE:00:11:22".into(); ctx.device_name = "Switched device".into();
+            }
+            failed
         });
-        Box::pin(async { Ok((Ok::<(), String>(()),)) })
+        Box::pin(async move { Ok((if failed { Err("injected send failure".to_string()) } else { Ok(()) },)) })
     })?;
 
     let mut timers = linker.instance("astrobox:psys-host-v4/timer")?;
@@ -208,6 +295,67 @@ fn add_test_hosts(linker: &mut Linker<Context>) -> wasmtime::Result<()> {
         Ok((Ok::<(), String>(()),))
     }))?;
     Ok(())
+}
+
+// Small UI resource host: retain text/event IDs, not a renderer or layout engine.
+// This lets the actual guest build/filter its UI and expose the resulting rows.
+fn add_ui_test_host(linker: &mut Linker<Context>, engine: &Engine, component: &Component) -> wasmtime::Result<()> {
+    let component_type = component.component_type();
+    let import = component_type.imports(engine)
+        .find(|(name, _)| *name == "astrobox:psys-host-v4/ui").unwrap().1;
+    let ComponentItem::ComponentInstance(instance) = import.ty else { unreachable!() };
+    let mut interface = linker.instance("astrobox:psys-host-v4/ui")?;
+    interface.resource("element", ResourceType::host::<()>(), |mut store, rep| {
+        store.data_mut().ui_nodes.remove(&rep); Ok(())
+    })?;
+    for (name, export) in instance.exports(engine) {
+        let ComponentItem::ComponentFunc(function) = export.ty else { continue; };
+        if function.async_() { continue; }
+        let method = name.to_string();
+        interface.func_new(name, move |mut store, _, params, results| {
+            let rep = |value: &Val, store: &mut wasmtime::StoreContextMut<'_, Context>| -> wasmtime::Result<u32> {
+                let Val::Resource(resource) = value else { panic!("expected UI element") };
+                Ok(resource.try_into_resource::<()>(store)?.rep())
+            };
+            if method == "render" {
+                let Val::String(id) = &params[0] else { unreachable!() };
+                let key = rep(&params[1], &mut store)?;
+                let text = store.data().ui_nodes[&key].clone();
+                store.data_mut().rendered.insert(id.clone(), text);
+                return Ok(());
+            }
+            let mut text = if method.starts_with("[constructor]") {
+                match &params[1] { Val::Option(Some(value)) => match &**value {
+                    Val::String(content) => vec![content.clone()], _ => vec![],
+                }, _ => vec![] }
+            } else {
+                let key = rep(&params[0], &mut store)?;
+                store.data().ui_nodes[&key].clone()
+            };
+            if method.ends_with(".child") {
+                let key = rep(&params[1], &mut store)?;
+                text.extend(store.data().ui_nodes[&key].clone());
+            } else if method.ends_with(".on") && let Val::String(id) = &params[2] {
+                text.push(id.clone());
+            }
+            let ctx = store.data_mut();
+            ctx.ui_next += 1;
+            let key = ctx.ui_next;
+            ctx.ui_nodes.insert(key, text);
+            results[0] = Val::Resource(ResourceAny::try_from_resource(Resource::<()>::new_own(key), &mut store)?);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn rendered_text(accessor: &wasmtime::component::Accessor<Context>) -> String {
+    accessor.with(|mut access| access.get().rendered.get("library-test").unwrap().join("\n"))
+}
+
+fn rendered_delete(accessor: &wasmtime::component::Accessor<Context>, prefix: &str) -> Vec<String> {
+    accessor.with(|mut access| access.get().rendered.get("library-test").unwrap().iter()
+        .filter(|text| text.starts_with(prefix)).cloned().collect())
 }
 
 fn stub_unused_astrobox_imports(linker: &mut Linker<Context>, engine: &Engine, component: &Component) -> wasmtime::Result<()> {
@@ -279,9 +427,231 @@ async fn complete_startup(world: &bindings::PsysWorldV4Http, accessor: &wasmtime
     complete_startup_with_caps(world, accessor, serde_json::json!({"httpImport": true})).await
 }
 
+async fn sync_delete_fixture(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::{ui::Event, http_server::Request};
+    let events = world.astrobox_psys_plugin_v4_event();
+    events.call_on_ui_event(accessor, "comic_search_clear".into(), Event::Click, "{}".into()).await?;
+    events.call_on_ui_event(accessor, "source_search_clear".into(), Event::Click, "{}".into()).await?;
+    events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+    complete_startup_with_caps(world, accessor, serde_json::json!({"httpDataSync":1,"syncSession":true,"deleteProtocol":1})).await?;
+    let message: serde_json::Value = accessor.with(|mut access| serde_json::from_str(access.get().sent_interconnect.lock().unwrap().last().unwrap()).unwrap());
+    assert_eq!(message["type"], "request_data");
+    let root = format!("/control/sync/{}", message["session"].as_str().unwrap());
+    let mut bodies = vec![serde_json::json!({"kind":"header","comicCount":3,"sourceCount":2}),
+        serde_json::json!({"kind":"comics","offset":0,"items":[
+            {"id":"same_one","name":"同名漫画","page_count":1,"chapters":0},
+            {"id":"same_two","name":"同名漫画","page_count":2,"chapters":0},
+            {"id":"other","name":"Other","page_count":3,"chapters":0}]}),
+        serde_json::json!({"kind":"sources","offset":0,"items":[
+            {"key":"source_a","name":"同名源","apiUrl":"http://a"},
+            {"key":"source_b","name":"同名源","apiUrl":"http://b"}]}),
+        serde_json::json!({"kind":"done"})];
+    for body in bodies.drain(..) {
+        let response = world.astrobox_psys_plugin_v4_http().call_handle(accessor, 1, Request { method:"POST".into(),
+            path:format!("{root}/metadata"),query:String::new(),headers:vec![],body:body.to_string().into_bytes() }).await?;
+        assert_eq!(response.status, 200);
+    }
+    for id in ["same_one","same_two","other"] {
+        assert_eq!(world.astrobox_psys_plugin_v4_http().call_handle(accessor, 1, Request { method:"POST".into(),
+            path:format!("{root}/skip"),query:String::new(),headers:vec![],body:serde_json::json!({"id":id}).to_string().into_bytes() }).await?.status, 200);
+    }
+    assert_eq!(world.astrobox_psys_plugin_v4_http().call_handle(accessor, 1, Request { method:"POST".into(),
+        path:format!("{root}/complete"),query:String::new(),headers:vec![],body:b"{}".to_vec() }).await?.status, 200);
+    // The real HTTP guest must retain these keys before a delete target is captured.
+    assert!(rendered_text(accessor).contains("Key：source_b"));
+    Ok(())
+}
+
+fn delete_result(request: &serde_json::Value, status: &str) -> serde_json::Value {
+    serde_json::json!({"type":"delete_result","protocol":1,"requestId":request["requestId"],"session":request["session"],
+        "kind":request["kind"],"comicId":request["comicId"],"sourceKey":request["sourceKey"],"status":status,
+        "filesState":if request["kind"] == "source" { "not_applicable" } else { "removed" },
+        "indexState":if status == "success" { "removed" } else { "retained" },"message":format!("device {status}")})
+}
+
+async fn read_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>, endpoint: &str) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::ui::Event;
+    let events = world.astrobox_psys_plugin_v4_event();
+    events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,serde_json::json!({"value":endpoint}).to_string()).await?;
+    events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":endpoint}).to_string()).await?;
+    Ok(())
+}
+
+async fn begin_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::ui::Event;
+    let event = rendered_delete(accessor,"source_sync_")[0].clone();
+    world.astrobox_psys_plugin_v4_event().call_on_ui_event(accessor,event,Event::Click,"{}".into()).await?;
+    Ok(())
+}
+
+async fn sync_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    begin_sources(world,accessor).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({})).await
+}
+
+async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::component::Accessor<Context>) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::ui::Event;
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    let fixture = source_fixture();
+    let events = world.astrobox_psys_plugin_v4_event();
+    let (original_addr,original_name,original_version) = accessor.with(|mut access| {
+        let ctx = access.get(); let value = (ctx.device_addr.clone(),ctx.device_name.clone(),ctx.app_version); ctx.app_version=318; value
+    });
+    let commands = |start: usize| accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap()[start..].iter()
+        .map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap())
+        .filter(|m|matches!(m["type"].as_str(),Some("source_config"|"cookie"))).collect::<Vec<_>>());
+    let sent_len = || accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_render(accessor,"library-test".into()).await?;
+    events.call_on_ui_event(accessor,"tab_sync".into(),Event::Click,"{}".into()).await?;
+    let endpoint = format!("{}/multi",fixture.root);
+    read_sources(world,accessor,&endpoint).await?;
+    assert_eq!(fixture.count.load(Ordering::SeqCst),1);
+    let text = rendered_text(accessor);
+    assert!(text.contains("已读取 4 个源，3 个可同步") && text.contains("已选择 0 个"));
+    assert!(text.contains("Key：A") && text.contains("Key：B") && text.contains("detailPath"));
+    assert!(rendered_delete(accessor,"source_sync_").is_empty(),"multi-source needs explicit selection");
+    let select = rendered_delete(accessor,"source_select_"); assert_eq!(select.len(),3,"invalid row has no selector");
+    let update = rendered_delete(accessor,"source_cookie_update_");
+    let clear = rendered_delete(accessor,"source_cookie_clear_");
+    let keep = rendered_delete(accessor,"source_cookie_keep_");
+    for id in &select[..2] { events.call_on_ui_event(accessor,id.clone(),Event::Change,r#"{"checked":true}"#.into()).await?; }
+    for (index,cookie) in [(0,"cookie-a"),(1,"cookie-b"),(2,"unselected-cookie-c")] {
+        events.call_on_ui_event(accessor,update[index].clone(),Event::Click,"{}".into()).await?;
+        let input = rendered_delete(accessor,"source_cookie_input_")[index].clone();
+        events.call_on_ui_event(accessor,input,Event::Change,serde_json::json!({"value":cookie}).to_string()).await?;
+    }
+    let old_input_a = rendered_delete(accessor,"source_cookie_input_")[0].clone();
+    events.call_on_ui_event(accessor,clear[1].clone(),Event::Click,"{}".into()).await?;
+    let old_sync_event = rendered_delete(accessor,"source_sync_")[0].clone();
+    let before = sent_len();
+    begin_sources(world,accessor).await?;
+    // Even injected stale UI events while waiting cannot edit the captured payload.
+    events.call_on_ui_event(accessor,old_input_a.clone(),Event::Change,r#"{"value":"must-not-replace-a"}"#.into()).await?;
+    events.call_on_ui_event(accessor,select[1].clone(),Event::Change,r#"{"checked":false}"#.into()).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({})).await?;
+    let sent = commands(before); assert_eq!(sent.len(),2);
+    assert_eq!(sent[0]["type"],"source_config"); assert_eq!(sent[0]["configs"].as_array().unwrap().len(),2);
+    assert!(sent[0]["configs"][0].get("A").is_some() && sent[0]["configs"][1].get("B").is_some());
+    assert_eq!(sent[0]["configs"][0]["A"]["future"]["preserved"],true);
+    assert_eq!(sent[1],serde_json::json!({"type":"cookie","A":"cookie-a","B":""}));
+    assert_eq!(fixture.count.load(Ordering::SeqCst),1,"sync must not re-fetch /config");
+    assert!(rendered_text(accessor).contains("命令已发送，待设备核实"));
+    assert!(!rendered_text(accessor).contains("同步成功"));
+
+    // Explicit refresh restores this endpoint's drafts, but old generation events stay stale.
+    events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
+    assert_eq!(fixture.count.load(Ordering::SeqCst),2);
+    let before = sent_len();
+    events.call_on_ui_event(accessor,old_sync_event.clone(),Event::Click,"{}".into()).await?;
+    assert_eq!(sent_len(),before,"old sync button cannot send the refreshed snapshot");
+    events.call_on_ui_event(accessor,old_input_a.clone(),Event::Change,r#"{"value":"wrong-old-generation"}"#.into()).await?;
+    assert!(rendered_text(accessor).contains("cookie-a") && !rendered_text(accessor).contains("wrong-old-generation"));
+    events.call_on_ui_event(accessor,keep[0].clone(),Event::Click,"{}".into()).await?; // stale keep is ignored too
+    let current_keep = rendered_delete(accessor,"source_cookie_keep_");
+    events.call_on_ui_event(accessor,current_keep[0].clone(),Event::Click,"{}".into()).await?;
+    let before = sent_len(); sync_sources(world,accessor).await?;
+    assert_eq!(commands(before)[1],serde_json::json!({"type":"cookie","B":""}),"keep is omission, not clear");
+    assert_eq!(fixture.count.load(Ordering::SeqCst),2);
+
+    // The real guest reports failed/partial transport separately from device persistence.
+    accessor.with(|mut access|access.get().fail_send_type=Some("source_config".into()));
+    let before = sent_len(); sync_sources(world,accessor).await?;
+    assert_eq!(commands(before).len(),1,"config send failure cannot send Cookie");
+    assert!(rendered_text(accessor).contains("配置命令发送异常") && rendered_text(accessor).contains("Cookie 命令未发送"));
+    accessor.with(|mut access|access.get().fail_send_type=Some("cookie".into()));
+    let before = sent_len(); sync_sources(world,accessor).await?;
+    assert_eq!(commands(before).len(),2);
+    assert!(rendered_text(accessor).contains("部分命令已发送") && rendered_text(accessor).contains("Cookie 命令发送异常"));
+    accessor.with(|mut access|access.get().switch_after_send_type=Some("source_config".into()));
+    let before = sent_len(); sync_sources(world,accessor).await?;
+    assert_eq!(commands(before).len(),1,"changed device cannot receive Cookie from the original plan");
+    assert!(rendered_text(accessor).contains("连接已变化"));
+    accessor.with(|mut access| {
+        let ctx = access.get(); assert!(ctx.sent_targets[before..].iter().all(|a|a == &original_addr));
+        ctx.device_addr=original_addr.clone(); ctx.device_name=original_name.clone();
+    });
+    events.call_on_event(accessor,EventType::DeviceAction,"{}".into()).await?;
+
+    // Address mutation during the timer-driven handshake stops the old plan and old blur.
+    let before = sent_len();
+    begin_sources(world,accessor).await?;
+    let other = format!("{}/other",fixture.root);
+    events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,serde_json::json!({"value":other}).to_string()).await?;
+    complete_startup_with_caps(world,accessor,serde_json::json!({})).await?;
+    assert!(commands(before).is_empty());
+    assert!(rendered_text(accessor).contains("配置入口已变化") && !rendered_text(accessor).contains("Key：A"));
+    let count = fixture.count.load(Ordering::SeqCst);
+    events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":endpoint}).to_string()).await?;
+    assert_eq!(fixture.count.load(Ordering::SeqCst),count,"stale blur cannot restore the previous endpoint");
+    events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":other}).to_string()).await?;
+    assert_eq!(fixture.count.load(Ordering::SeqCst),count+1);
+    assert!(rendered_text(accessor).contains("已选择 1 个"),"single valid source defaults selected");
+    let invalid_sync_event = rendered_delete(accessor,"source_sync_")[0].clone();
+    let update_a = rendered_delete(accessor,"source_cookie_update_")[0].clone();
+    events.call_on_ui_event(accessor,update_a,Event::Click,"{}".into()).await?;
+    events.call_on_ui_event(accessor,old_input_a,Event::Change,r#"{"value":"credential-from-old-endpoint"}"#.into()).await?;
+    assert!(!rendered_text(accessor).contains("cookie-a") && !rendered_text(accessor).contains("credential-from-old-endpoint"));
+    assert!(rendered_delete(accessor,"source_sync_").is_empty(),"empty update requires explicit clear or a value");
+    let before = sent_len(); events.call_on_ui_event(accessor,invalid_sync_event,Event::Click,"{}".into()).await?;
+    assert_eq!(sent_len(),before,"invalid Cookie is blocked before handshake or any command");
+    let keep_a = rendered_delete(accessor,"source_cookie_keep_")[0].clone();
+    events.call_on_ui_event(accessor,keep_a,Event::Click,"{}".into()).await?;
+    begin_sources(world,accessor).await?;
+    accessor.with(|mut access| { access.get().device_addr="FF:00:11:22:33:44".into(); });
+    events.call_on_event(accessor,EventType::DeviceAction,"{}".into()).await?;
+    let before = sent_len(); complete_startup_with_caps(world,accessor,serde_json::json!({})).await?;
+    assert!(commands(before).is_empty() && rendered_text(accessor).contains("原目标设备已断开或切换"));
+    accessor.with(|mut access| { let ctx=access.get(); ctx.device_addr=original_addr.clone(); ctx.device_name=original_name.clone(); });
+    events.call_on_event(accessor,EventType::DeviceAction,"{}".into()).await?;
+
+    // Error state persists after transient status timers and cannot reuse the old snapshot.
+    for (path,reason) in [("http-error","HTTP 503"),("json-error","配置 JSON 错误"),("model-error","字段 config"),
+        ("all-bad","可同步；1 个配置无效"),("network-error","网络错误")] {
+        let uri = format!("{}/{path}",fixture.root);
+        let count = fixture.count.load(Ordering::SeqCst); read_sources(world,accessor,&uri).await?;
+        assert_eq!(fixture.count.load(Ordering::SeqCst),count+1);
+        assert!(rendered_text(accessor).contains(reason),"{path}: {}",rendered_text(accessor));
+        events.call_on_event(accessor,EventType::Timer,r#"{"payload":"hide_status"}"#.into()).await?;
+        assert!(rendered_text(accessor).contains(reason));
+        assert!(rendered_delete(accessor,"source_sync_").is_empty());
+        let before=sent_len(); events.call_on_ui_event(accessor,old_sync_event.clone(),Event::Click,"{}".into()).await?;
+        assert_eq!(sent_len(),before); assert_eq!(fixture.count.load(Ordering::SeqCst),count+1);
+        assert!(rendered_text(accessor).contains(reason),"stale sync button cannot erase the specific read error");
+    }
+    let before = sent_len();
+    events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,r#"{"value":"ftp://example.com"}"#.into()).await?;
+    let count = fixture.count.load(Ordering::SeqCst);
+    events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
+    assert!(rendered_text(accessor).contains("地址错误")); assert_eq!(fixture.count.load(Ordering::SeqCst),count);
+    assert_eq!(sent_len(),before);
+
+    // Larger catalogs render eight rows; original slots on the second page build one filtered payload.
+    read_sources(world,accessor,&format!("{}/paged",fixture.root)).await?;
+    assert_eq!(rendered_delete(accessor,"source_select_").len(),8);
+    assert!(rendered_text(accessor).contains("Key：K00") && !rendered_text(accessor).contains("Key：K09"));
+    events.call_on_ui_event(accessor,"source_catalog_next".into(),Event::Click,"{}".into()).await?;
+    assert_eq!(rendered_delete(accessor,"source_select_").len(),2);
+    assert!(rendered_text(accessor).contains("Key：K09"));
+    let all = rendered_delete(accessor,"source_all_")[0].clone();
+    events.call_on_ui_event(accessor,all,Event::Click,"{}".into()).await?;
+    let update_last = rendered_delete(accessor,"source_cookie_update_")[1].clone();
+    events.call_on_ui_event(accessor,update_last,Event::Click,"{}".into()).await?;
+    let input_last = rendered_delete(accessor,"source_cookie_input_")[0].clone();
+    events.call_on_ui_event(accessor,input_last,Event::Change,r#"{"value":"last-page-cookie"}"#.into()).await?;
+    let before=sent_len(); let count=fixture.count.load(Ordering::SeqCst);
+    sync_sources(world,accessor).await?;
+    let sent=commands(before);
+    assert_eq!(sent[0]["configs"].as_array().unwrap().len(),10);
+    assert_eq!(sent[1],serde_json::json!({"type":"cookie","K09":"last-page-cookie"}));
+    assert_eq!(fixture.count.load(Ordering::SeqCst),count);
+    accessor.with(|mut access|access.get().app_version=original_version);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> wasmtime::Result<()> {
     let wasm = std::env::args().nth(1).expect("usage: v4-runtime-check <plugin.wasm>");
+    let sources_only = std::env::args().any(|a|a == "--sources-only");
     let mut config = Config::new();
     config.wasm_component_model(true).wasm_component_model_async(true).wasm_memory64(false);
     let engine = Engine::new(&config)?;
@@ -294,6 +664,7 @@ async fn main() -> wasmtime::Result<()> {
     stub_unused_astrobox_imports(&mut linker, &engine, &component)?;
     linker.allow_shadowing(true);
     add_test_hosts(&mut linker)?;
+    add_ui_test_host(&mut linker, &engine, &component)?;
     let directory = tempfile::tempdir_in(std::env::temp_dir().join("opencode")).unwrap();
     let mut wasi = WasiCtxBuilder::new();
     // Guest debug output is also written to its sandbox log; keep the smoke-check console bounded.
@@ -314,6 +685,15 @@ async fn main() -> wasmtime::Result<()> {
         launched_at: None,
         registrations: 0,
         timers: Vec::new(),
+        device_addr: "11:22:33:44:55:66".into(),
+        device_name: "Xiaomi Smart Band 9 Pro".into(),
+        connected: true,
+        ui_nodes: HashMap::new(),
+        ui_next: 0,
+        rendered: HashMap::new(),
+        fail_send_type: None,
+        switch_after_send_type: None,
+        sent_targets: Vec::new(),
     });
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let world = bindings::PsysWorldV4Http::new(&mut store, &instance)?;
@@ -344,11 +724,18 @@ async fn main() -> wasmtime::Result<()> {
         // Test outgoing WASI p2 fetch for sources
         events.call_on_ui_event(accessor, "domain_input_blur".into(), Event::Blur,
             serde_json::json!({"value": url}).to_string()).await?;
-        assert_eq!(requests.load(Ordering::SeqCst), 2, "outgoing p2 HTTP config fetches");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "one outgoing /config fetch produces the complete snapshot");
+        if sources_only {
+            check_sources(&world,accessor).await?;
+            return Ok(());
+        }
+        events.call_on_ui_render(accessor,"library-test".into()).await?;
+        events.call_on_ui_event(accessor,"tab_sync".into(),Event::Click,"{}".into()).await?;
+        let source_sync_event = rendered_delete(accessor,"source_sync_")[0].clone();
 
         // Both management tabs reject 317 before launch, registration or send.
         accessor.with(|mut access| access.get().app_version = 317);
-        for event in ["sync_button", "fetch_app_data"] {
+        for event in [source_sync_event.as_str(), "fetch_app_data"] {
             events.call_on_ui_event(accessor, event.into(), Event::Click, "{}".into()).await?;
         }
         accessor.with(|mut access| {
@@ -359,7 +746,7 @@ async fn main() -> wasmtime::Result<()> {
         });
         // 318 is accepted by sync/data, each with a fresh startup wait.
         accessor.with(|mut access| access.get().app_version = 318);
-        events.call_on_ui_event(accessor, "sync_button".into(), Event::Click, "{}".into()).await?;
+        events.call_on_ui_event(accessor, source_sync_event, Event::Click, "{}".into()).await?;
         complete_startup(&world, accessor).await?;
         let last: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(last["type"], "source_config");
@@ -655,6 +1042,230 @@ async fn main() -> wasmtime::Result<()> {
         let res_resp = http.call_handle(accessor, 1, res_req).await?;
         assert_eq!(res_resp.status, 200);
 
+        // P1-42: real guest UI, filtered slots, HTTP/legacy completion and ownership.
+        events.call_on_ui_render(accessor, "library-test".into()).await?;
+        events.call_on_ui_event(accessor, "tab_data".into(), Event::Click, "{}".into()).await?;
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        complete_startup_with_caps(&world, accessor, serde_json::json!({"httpDataSync":1, "syncSession":true})).await?;
+        let message: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        let root = format!("/control/sync/{}", message["session"].as_str().unwrap());
+        let callback = |resource: &str, body: serde_json::Value| Request {
+            method: "POST".into(), path: format!("{root}/{resource}"), query: String::new(), headers: vec![],
+            body: body.to_string().into_bytes(),
+        };
+        assert_eq!(http.call_handle(accessor, 1, callback("metadata", serde_json::json!({
+            "kind":"header", "comicCount":25, "sourceCount":10}))).await?.status, 200);
+        for (start, end) in [(0, 16), (16, 25)] {
+            let items: Vec<_> = (start..end).map(|i| serde_json::json!({"id":format!("id{i}"),
+                "name":format!("{} {i}", if i % 2 == 0 { "Book" } else { "Other" }), "page_count":3, "chapters":0})).collect();
+            assert_eq!(http.call_handle(accessor, 1, callback("metadata", serde_json::json!({
+                "kind":"comics", "offset":start, "items":items}))).await?.status, 200);
+        }
+        let sources: Vec<_> = (0..10).map(|i| serde_json::json!({"name":format!("Source {i}"), "apiUrl":format!("http://source{i}")})).collect();
+        assert_eq!(http.call_handle(accessor, 1, callback("metadata", serde_json::json!({
+            "kind":"sources", "offset":0, "items":sources}))).await?.status, 200);
+        assert_eq!(http.call_handle(accessor, 1, callback("metadata", serde_json::json!({"kind":"done"}))).await?.status, 200);
+        let sent_before_search = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, "comic_search".into(), Event::Change, r#"{"value":" BOOK "}"#.into()).await?;
+        events.call_on_ui_event(accessor, "comic_page_next".into(), Event::Click, "{}".into()).await?;
+        events.call_on_ui_event(accessor, "source_search".into(), Event::Change, r#"{"value":"Source 9"}"#.into()).await?;
+        let text = rendered_text(accessor);
+        assert!(text.contains("匹配 13 本") && text.contains("Book 16") && text.contains("Book 24"));
+        assert!(!text.contains("Book 0\n") && !text.contains("Other 17"));
+        assert!(text.contains("Source 9") && !text.contains("Source 0\n"));
+        assert_eq!(sent_interconnect.lock().unwrap().len(), sent_before_search, "filter/page changes are local");
+        assert_eq!(http.call_handle(accessor, 1, Request { method:"PUT".into(), path:format!("{root}/covers/16"),
+            query:format!("offset=0&total={}", png.len()), headers:vec![], body:png.clone() }).await?.status, 200);
+        assert!(rendered_text(accessor).contains("Book 24"), "cover updates preserve filtered page");
+        for i in 0..25 {
+            if i != 16 {
+                assert_eq!(http.call_handle(accessor, 1, callback("skip", serde_json::json!({"id":format!("id{i}")}))).await?.status, 200);
+            }
+        }
+        assert_eq!(http.call_handle(accessor, 1, callback("complete", serde_json::json!({"skipped":24}))).await?.status, 200);
+        assert_eq!(rendered_delete(accessor, "delete_comic_").len(), 5, "only the filtered page is rendered");
+        assert!(rendered_text(accessor).contains("24 张封面缺失或跳过"));
+        events.call_on_ui_event(accessor, "comic_search".into(), Event::Change, r#"{"value":"absent"}"#.into()).await?;
+        assert!(rendered_text(accessor).contains("没有匹配的漫画"));
+        assert!(rendered_delete(accessor, "delete_comic_").is_empty());
+        events.call_on_ui_event(accessor, "comic_search_clear".into(), Event::Click, "{}".into()).await?;
+        assert_eq!(rendered_delete(accessor, "delete_comic_").len(), 8);
+        events.call_on_ui_event(accessor, "comic_search".into(), Event::Change, r#"{"value":"Book 24"}"#.into()).await?;
+        let delete_event = rendered_delete(accessor, "delete_comic_")[0].clone();
+        events.call_on_ui_event(accessor, delete_event.clone(), Event::Click, "{}".into()).await?;
+        complete_startup(&world, accessor).await?;
+        let deletion: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(deletion["type"], "delete_comic");
+        assert_eq!(deletion["name"], "Book 24", "filtered index must retain the original row identity");
+        assert!(rendered_text(accessor).contains("Book 24") && rendered_text(accessor).contains("重新读取确认设备结果"));
+        let last_time = rendered_text(accessor).lines().find(|s| s.starts_with("最近完整同步：")).unwrap().to_string();
+        accessor.with(|mut access| {
+            let ctx = access.get(); ctx.device_addr = "AA:BB:CC:DD:EE:FF".into(); ctx.device_name = "Device B".into();
+        });
+        events.call_on_event(accessor, EventType::DeviceAction, "{}".into()).await?;
+        let sent = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, delete_event.clone(), Event::Click, "{}".into()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), sent, "another device cannot receive deletion for A's list");
+        accessor.with(|mut access| access.get().app_version = 317);
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        assert!(rendered_text(accessor).contains("Book 24") && rendered_text(accessor).contains("仍显示上次列表"));
+        assert!(rendered_text(accessor).contains(&last_time), "failed refresh must retain A's full-sync time");
+        accessor.with(|mut access| access.get().app_version = 382);
+        events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+        complete_startup_with_caps(&world, accessor, serde_json::json!({"httpDataSync":1, "syncSession":true})).await?;
+        let message: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        let root_b = format!("/control/sync/{}", message["session"].as_str().unwrap());
+        for value in [serde_json::json!({"kind":"header", "comicCount":2, "sourceCount":0}),
+            serde_json::json!({"kind":"comics", "offset":0, "items":[{"id":"B1", "name":"New B", "page_count":1, "chapters":0}]})] {
+            assert_eq!(http.call_handle(accessor, 1, Request { method:"POST".into(), path:format!("{root_b}/metadata"),
+                query:String::new(), headers:vec![], body:value.to_string().into_bytes() }).await?.status, 200);
+        }
+        assert!(rendered_text(accessor).contains("Device B") && rendered_text(accessor).contains("本设备尚无完整同步记录"));
+        accessor.with(|mut access| access.get().connected = false);
+        events.call_on_event(accessor, EventType::DeviceAction, "{}".into()).await?;
+        assert!(rendered_text(accessor).contains("当前仅有部分数据"));
+        assert_eq!(http.call_handle(accessor, 1, Request { method:"POST".into(), path:format!("{root_b}/complete"),
+            query:String::new(), headers:vec![], body:b"{}".to_vec() }).await?.status, 409);
+        accessor.with(|mut access| access.get().connected = true);
+        events.call_on_ui_event(accessor, "comic_search_clear".into(), Event::Click, "{}".into()).await?;
+        for complete_lists in [false, true] {
+            events.call_on_ui_event(accessor, "fetch_app_data".into(), Event::Click, "{}".into()).await?;
+            complete_startup_with_caps(&world, accessor, serde_json::json!({"syncSession":true})).await?;
+            let message: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+            assert!(message.get("http").is_none());
+            // A metadata row deliberately arrives before the header. Done arrives before the final row.
+            let mut frames = vec![serde_json::json!({"type":"app_data_comic", "index":1,
+                "comic":{"id":"L2", "name":"Legacy Two", "page_count":2, "chapters":0}}),
+                serde_json::json!({"type":"app_data_header", "comic_count":2, "source_count":0}),
+                serde_json::json!({"type":"app_data_done"})];
+            if complete_lists { frames.push(serde_json::json!({"type":"app_data_comic", "index":0,
+                "comic":{"id":"L1", "name":"Legacy One", "page_count":1, "chapters":0}})); }
+            frames.push(serde_json::json!({"type":"cover_done"}));
+            for (gseq, mut frame) in frames.into_iter().enumerate() {
+                frame["session"] = message["session"].clone(); frame["gseq"] = serde_json::json!(gseq);
+                events.call_on_event(accessor, EventType::InterconnectMessage, frame.to_string()).await?;
+            }
+            let text = rendered_text(accessor);
+            assert!(text.contains("Legacy Two"));
+            if complete_lists { assert!(text.contains("Legacy One") && text.contains("2 张封面未回传"));
+                assert!(!text.contains("本设备尚无完整同步记录")); }
+            else {
+                assert!(text.contains("同步未完整") && text.contains("本设备尚无完整同步记录"));
+                assert!(rendered_delete(accessor, "delete_comic_").is_empty(), "partial lists cannot offer name-based deletion");
+            }
+        }
+        let sent = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, delete_event, Event::Click, "{}".into()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(), sent, "stale button from A cannot act on B's snapshot");
+
+        // P1-43: exercise the release guest's actual dialog/handshake/send/result and timers.
+        sync_delete_fixture(&world, accessor).await?;
+        let original_time = rendered_text(accessor).lines().find(|s| s.starts_with("最近完整同步：")).unwrap().to_string();
+        let second = rendered_delete(accessor, "delete_comic_")[1].clone();
+        events.call_on_ui_event(accessor, second.clone(), Event::Click, "{}".into()).await?;
+        complete_startup_with_caps(&world, accessor, serde_json::json!({"deleteProtocol":1})).await?;
+        let deletion: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(deletion["type"], "delete_item"); assert_eq!(deletion["comicId"], "same_two");
+        assert!(rendered_text(accessor).contains("等待设备删除结果") && rendered_text(accessor).contains("ID：same_two"));
+        events.call_on_event(accessor, EventType::InterconnectMessage, delete_result(&deletion,"partial").to_string()).await?;
+        assert!(rendered_text(accessor).contains("设备部分操作完成") && rendered_text(accessor).contains("ID：same_two"));
+        events.call_on_ui_event(accessor, second.clone(), Event::Click, "{}".into()).await?;
+        complete_startup_with_caps(&world, accessor, serde_json::json!({"deleteProtocol":1})).await?;
+        let retry: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_ne!(retry["requestId"], deletion["requestId"]);
+        let result = delete_result(&retry,"success");
+        events.call_on_event(accessor, EventType::InterconnectMessage, result.to_string()).await?;
+        events.call_on_event(accessor, EventType::InterconnectMessage, result.to_string()).await?;
+        assert!(!rendered_text(accessor).contains("ID：same_two") && rendered_text(accessor).contains("ID：same_one"));
+        assert!(rendered_text(accessor).contains("漫画 2/2 本") && rendered_text(accessor).contains(&original_time));
+        let sent = sent_interconnect.lock().unwrap().len();
+        events.call_on_ui_event(accessor, second, Event::Click, "{}".into()).await?;
+        assert_eq!(sent_interconnect.lock().unwrap().len(),sent,"success invalidates old index-based buttons");
+
+        let source = rendered_delete(accessor,"delete_source_")[1].clone();
+        events.call_on_ui_event(accessor,source,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        let source_delete: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(source_delete["sourceKey"],"source_b");
+        let mut wrong = delete_result(&source_delete,"success"); wrong["sourceKey"] = serde_json::json!("source_a");
+        events.call_on_event(accessor,EventType::InterconnectMessage,wrong.to_string()).await?;
+        assert!(rendered_text(accessor).contains("Key：source_b"));
+        events.call_on_event(accessor,EventType::InterconnectMessage,delete_result(&source_delete,"success").to_string()).await?;
+        assert!(!rendered_text(accessor).contains("Key：source_b") && rendered_text(accessor).contains("Key：source_a"));
+
+        let first = rendered_delete(accessor,"delete_comic_")[0].clone();
+        events.call_on_ui_event(accessor,first,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        let lost: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        let timeout = accessor.with(|mut access| access.get().timers.iter().rev().find(|(_,p)|
+            p.starts_with(&format!("delete_result_timeout:{}:",lost["requestId"].as_str().unwrap()))).unwrap().1.clone());
+        events.call_on_event(accessor,EventType::Timer,serde_json::json!({"payload":timeout}).to_string()).await?;
+        assert!(rendered_text(accessor).contains("等待设备删除结果"),"early timer cannot expire the real deadline");
+        tokio::time::sleep(std::time::Duration::from_millis(20_050)).await;
+        events.call_on_event(accessor,EventType::Timer,serde_json::json!({"payload":timeout}).to_string()).await?;
+        assert!(rendered_text(accessor).contains("删除结果待核实") && rendered_text(accessor).contains("ID：same_one"));
+        let query = rendered_delete(accessor,"delete_query_")[0].clone();
+        events.call_on_ui_event(accessor,query,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        let query_message: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(query_message["type"],"delete_status"); assert_eq!(query_message["requestSession"],lost["session"]);
+        assert_ne!(query_message["session"],lost["session"]);
+        events.call_on_event(accessor,EventType::Timer,serde_json::json!({"payload":timeout}).to_string()).await?;
+        assert!(rendered_text(accessor).contains("查询原删除结果"),"stale timeout cannot terminate new query");
+        events.call_on_event(accessor,EventType::InterconnectMessage,serde_json::json!({"deviceAddr":"wrong-device",
+            "payloadText":delete_result(&lost,"success")}).to_string()).await?;
+        assert!(rendered_text(accessor).contains("ID：same_one"));
+        events.call_on_event(accessor,EventType::InterconnectMessage,delete_result(&lost,"success").to_string()).await?;
+        assert!(!rendered_text(accessor).contains("ID：same_one"));
+
+        let other = rendered_delete(accessor,"delete_comic_")[0].clone();
+        events.call_on_ui_event(accessor,other,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        let delayed: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        sync_delete_fixture(&world,accessor).await?; // refresh while waiting, same ID in a new snapshot
+        events.call_on_event(accessor,EventType::InterconnectMessage,delete_result(&delayed,"success").to_string()).await?;
+        assert!(rendered_text(accessor).contains("ID：other") && rendered_text(accessor).contains("当前列表未直接调整"));
+
+        let first = rendered_delete(accessor,"delete_comic_")[0].clone();
+        events.call_on_ui_event(accessor,first,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        accessor.with(|mut access| access.get().connected=false);
+        events.call_on_event(accessor,EventType::DeviceAction,"{}".into()).await?;
+        assert!(rendered_text(accessor).contains("删除结果待核实") && rendered_text(accessor).contains("ID：same_one"));
+        assert!(!rendered_text(accessor).contains("设备已确认删除"));
+        accessor.with(|mut access| access.get().connected=true);
+        sync_delete_fixture(&world,accessor).await?;
+        assert!(rendered_text(accessor).contains("重新读取确认条目仍在"));
+        let first = rendered_delete(accessor,"delete_comic_")[0].clone();
+        events.call_on_ui_event(accessor,first,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({})).await?;
+        assert!(rendered_text(accessor).contains("旧端删除协议按名称定位"));
+        let last: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last["type"],"hs_ping","legacy same-name deletion must not send a delete command");
+
+        // No native HTTP capability (10 Pro-style path): keys must survive the QAIC list as well.
+        events.call_on_ui_event(accessor,"fetch_app_data".into(),Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"syncSession":true,"deleteProtocol":1})).await?;
+        let qaic_request: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert!(qaic_request.get("http").is_none());
+        for (gseq, mut frame) in [serde_json::json!({"type":"app_data_header","comic_count":0,"source_count":2}),
+            serde_json::json!({"type":"app_data_source","index":0,"source":{"key":"qaic_a","name":"同名源","apiUrl":"http://a"}}),
+            serde_json::json!({"type":"app_data_source","index":1,"source":{"key":"qaic_b","name":"同名源","apiUrl":"http://b"}}),
+            serde_json::json!({"type":"app_data_done"}),serde_json::json!({"type":"cover_done"})].into_iter().enumerate() {
+            frame["session"] = qaic_request["session"].clone(); frame["gseq"] = serde_json::json!(gseq);
+            events.call_on_event(accessor,EventType::InterconnectMessage,frame.to_string()).await?;
+        }
+        assert!(rendered_text(accessor).contains("Key：qaic_b"));
+        let second = rendered_delete(accessor,"delete_source_")[1].clone();
+        events.call_on_ui_event(accessor,second,Event::Click,"{}".into()).await?;
+        complete_startup_with_caps(&world,accessor,serde_json::json!({"deleteProtocol":1})).await?;
+        let deletion: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(deletion["sourceKey"],"qaic_b");
+        events.call_on_event(accessor,EventType::InterconnectMessage,delete_result(&deletion,"success").to_string()).await?;
+        assert!(!rendered_text(accessor).contains("Key：qaic_b") && rendered_text(accessor).contains("Key：qaic_a"));
+
+        check_sources(&world,accessor).await?;
+
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
         let port = identity["port"].as_u64().unwrap() as u16;
@@ -675,12 +1286,16 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
+    if sources_only {
+        println!("PASS: P1-44 actual release WASM single-fetch catalogs, source selection/pagination, per-key Cookie keep/update/clear, immutable handshake payloads, stale forms/events, device changes, typed read errors and partial send failures.");
+        return Ok(());
+    }
     let masters: Vec<_> = std::fs::read_dir(directory.path().join("cache/masters"))?.collect::<Result<_, _>>()?;
     assert_eq!(masters.len(), 5, "WASI disk masters must not overwrite one another");
     for index in 0..5 {
         assert!(masters.iter().any(|entry| std::fs::read(entry.path()).unwrap() == picked_image(index)));
     }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
-    println!("PASS: version gates, startup silence, HTTP data-sync binary probe/metadata/cover callbacks/replays/old-session isolation, single launch per HTTP import, loopback/fallback binding, source/task/image endpoints, JPEG/PNG/LVGL, disk masters and start/stop checked on the actual release WASM.");
+    println!("PASS: P1-44 single-fetch catalogs, per-key Cookie operations, source selection/pagination, immutable payloads, read/send failures and device isolation; P1-43 stable deletion/results/query/timeouts; plus library search/completeness, version gates, startup silence, HTTP import/binding/images, disk masters and start/stop on the actual release WASM.");
     Ok(())
 }

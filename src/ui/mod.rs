@@ -5,6 +5,8 @@ pub mod event_handler;
 pub mod handshake;
 pub mod theme;
 pub mod upload;
+pub mod data_browser;
+pub mod deletion;
 
 use tracing;
 
