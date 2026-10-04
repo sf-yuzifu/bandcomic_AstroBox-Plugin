@@ -1422,19 +1422,20 @@ async fn main() -> wasmtime::Result<()> {
         events.call_on_ui_event(accessor, "http_probe_bind_device".into(), Event::Click, "{}".into()).await?;
         complete_startup(&world, accessor).await?;
         let first: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
-        assert_eq!(first["endpoint"], bind_msg["endpoint"], "saved LAN IP must not override loopback priority");
+        // 4ba6a6a: 有有效备用局域网 IP 时直接优先尝试局域网 IP；若未命中则回落回环。
+        assert_eq!(first["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
         events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
             "type": "gateway_bind_result", "session": first["session"],
-            "success": false, "nativeFetch": true, "error": "loopback unavailable"
+            "success": false, "nativeFetch": true, "error": "lan unavailable"
         }).to_string()).await?;
         let fallback: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
-        assert_eq!(fallback["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_eq!(fallback["endpoint"], bind_msg["endpoint"]);
         assert_ne!(fallback["session"], first["session"]);
         let count = sent_interconnect.lock().unwrap().len();
         events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
             "type": "gateway_bind_result", "session": first["session"], "success": true
         }).to_string()).await?;
-        assert_eq!(sent_interconnect.lock().unwrap().len(), count, "late loopback result must be ignored");
+        assert_eq!(sent_interconnect.lock().unwrap().len(), count, "late lan result must be ignored");
         events.call_on_event(accessor, EventType::InterconnectMessage, serde_json::json!({
             "type": "gateway_bind_result", "session": fallback["session"], "success": true, "probeLength": 689
         }).to_string()).await?;
@@ -1449,7 +1450,7 @@ async fn main() -> wasmtime::Result<()> {
         let timeout = serde_json::json!({"payload": format!("http_bind_timeout:{}", first["session"].as_str().unwrap())}).to_string();
         events.call_on_event(accessor, EventType::Timer, timeout.clone()).await?;
         let fallback: serde_json::Value = serde_json::from_str(sent_interconnect.lock().unwrap().last().unwrap()).unwrap();
-        assert_eq!(fallback["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
+        assert_eq!(fallback["endpoint"], bind_msg["endpoint"]);
         let count = sent_interconnect.lock().unwrap().len();
         events.call_on_event(accessor, EventType::Timer, timeout).await?;
         assert_eq!(sent_interconnect.lock().unwrap().len(), count);
@@ -1531,7 +1532,7 @@ async fn main() -> wasmtime::Result<()> {
         let bind_msg_str = sent_interconnect.lock().unwrap().last().cloned().unwrap();
         let bind_msg: serde_json::Value = serde_json::from_str(&bind_msg_str).unwrap();
         assert_eq!(bind_msg["type"], "gateway_bind");
-        assert_eq!(bind_msg["endpoint"], format!("http://127.0.0.1:{}", identity["port"]));
+        assert_eq!(bind_msg["endpoint"], format!("http://192.168.1.100:{}", identity["port"]));
         let reply = serde_json::json!({ "type": "gateway_bind_result", "session": bind_msg["session"],
             "success": true, "nativeFetch": true, "probeLength": 689 });
         events.call_on_event(accessor, EventType::InterconnectMessage, reply.to_string()).await?;
@@ -1551,7 +1552,7 @@ async fn main() -> wasmtime::Result<()> {
         let book_id = task_detail["comicId"].as_str().unwrap();
         assert!(book_id.starts_with("book_"));
         assert_eq!(task_detail["totalPages"], 5);
-        assert_eq!(task_detail["coverUrl"], format!("http://127.0.0.1:{}/local/album/{book_id}/cover", identity["port"]));
+        assert_eq!(task_detail["coverUrl"], format!("{}/local/album/{book_id}/cover", bind_msg["endpoint"].as_str().unwrap()));
         let cfg = http.call_handle(accessor, 1, req_query("/config", "")).await?;
         let cfg_val: serde_json::Value = serde_json::from_slice(&cfg.body).unwrap();
         assert_eq!(cfg_val["LocalUpload"]["apiUrl"], task_msg["endpoint"]);
