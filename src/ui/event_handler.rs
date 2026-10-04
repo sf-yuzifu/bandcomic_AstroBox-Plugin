@@ -728,8 +728,18 @@ fn handle_chapter_del_file(chapter_index: usize, file_index: usize) {
     rerender_upload_ui();
 }
 
+pub fn is_any_import_busy() -> bool {
+    if crate::jobs::is_busy() { return true; }
+    if PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return true; }
+    let state = ui_state().read().unwrap_or_else(|p| p.into_inner());
+    state.upload_session.is_some() || state.upload_result_session.is_some()
+}
+
 async fn handle_chapter_upload(chapter_index: usize) {
-    if crate::jobs::is_busy() || PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return; }
+    if is_any_import_busy() {
+        show_upload_status(StatusState::Error("已有导入任务正在进行，请等待完成或取消".into())).await;
+        return;
+    }
     // Reuse the same connection flow
     let comic_name;
     let chapter_data;
@@ -904,7 +914,7 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
         interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), msg).await
     {
         tracing::error!("发送 import_http_task 失败: {:?}", e);
-        show_upload_status(StatusState::Error("发送任务失败，请检查连接。".to_string())).await;
+        crate::jobs::abort_task(&task_id, "发送任务失败，请检查连接。");
     }
 }
 
@@ -1033,7 +1043,10 @@ fn reset_upload_progress() {
 }
 
 async fn handle_upload_start() {
-    if crate::jobs::is_busy() || PENDING_HTTP_IMPORT.lock().unwrap_or_else(|p| p.into_inner()).is_some() { return; }
+    if is_any_import_busy() {
+        show_upload_status(StatusState::Error("已有导入任务正在进行，请等待完成或取消".into())).await;
+        return;
+    }
     reset_upload_progress();
     let empty = ui_state().read().unwrap_or_else(|p| p.into_inner()).page_count() == 0;
     if empty {

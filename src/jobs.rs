@@ -114,6 +114,37 @@ pub fn get_task(task_id: &str) -> Option<TaskInfo> {
     mgr.tasks.get(task_id).cloned()
 }
 
+pub fn abort_task(task_id: &str, reason: &str) {
+    let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(task) = mgr.tasks.get_mut(task_id) {
+        if task.status != "completed" {
+            task.status = "failed".to_string();
+        }
+    }
+    if mgr.active_task_id.as_deref() == Some(task_id) {
+        mgr.active_task_id = None;
+    }
+    let mut ustate = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    ustate.upload_status = StatusState::Error(reason.to_string());
+    drop(ustate);
+    crate::ui::build::rerender_main_ui();
+}
+
+pub fn cancel_active_task(reason: &str) {
+    let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(active_id) = mgr.active_task_id.take() {
+        if let Some(task) = mgr.tasks.get_mut(&active_id) {
+            if task.status != "completed" {
+                task.status = "failed".to_string();
+            }
+        }
+    }
+    let mut ustate = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    ustate.upload_status = StatusState::Error(reason.to_string());
+    drop(ustate);
+    crate::ui::build::rerender_main_ui();
+}
+
 pub fn owns_image_request(comic_id: &str) -> bool {
     let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
     mgr.active_task_id.as_ref().and_then(|id| mgr.tasks.get(id))
@@ -351,5 +382,43 @@ mod tests {
         finish_task(&task_id, false, 1, 3, Some("再次网络中断".into()));
         let task_after = get_task(&task_id).unwrap();
         assert_eq!(task_after.status, "failed");
+    }
+
+    #[test]
+    fn abort_and_cancel_immediately_clear_busy_without_waiting() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let task_id = create_task(
+            "comic_4".into(),
+            "取消测试漫画".into(),
+            "rev_4".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 3 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+        assert!(is_busy());
+
+        abort_task(&task_id, "发送失败测试");
+        assert!(!is_busy());
+        let task = get_task(&task_id).unwrap();
+        assert_eq!(task.status, "failed");
+
+        // 测试 cancel_active_task
+        let task_id_2 = create_task(
+            "comic_5".into(),
+            "活跃取消漫画".into(),
+            "rev_5".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 2 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+        assert!(is_busy());
+        cancel_active_task("超时清理");
+        assert!(!is_busy());
+        let task2 = get_task(&task_id_2).unwrap();
+        assert_eq!(task2.status, "failed");
     }
 }
