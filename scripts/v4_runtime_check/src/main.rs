@@ -970,9 +970,12 @@ async fn check_chapter_import(world: &bindings::PsysWorldV4Http, accessor: &wasm
     events.call_on_ui_event(accessor,"fetch_app_data".into(),Event::Click,"{}".into()).await?;
     complete_startup_with_caps(world,accessor,serde_json::json!({"syncSession":true})).await?;
     let session = last_message()["session"].clone();
+    let target_cover = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jCz8AAAAASUVORK5CYII=";
     for (gseq, mut frame) in [serde_json::json!({"type":"app_data_header","comic_count":1,"source_count":0}),
         serde_json::json!({"type":"app_data_comic","index":0,"comic":{"id":"local_existing","name":"已有漫画","page_count":2,"chapters":2}}),
-        serde_json::json!({"type":"app_data_done"}),serde_json::json!({"type":"cover_done"})].into_iter().enumerate() {
+        serde_json::json!({"type":"app_data_done"}),
+        serde_json::json!({"type":"cover_data_chunk","name":"已有漫画","index":0,"total":1,"data":target_cover}),
+        serde_json::json!({"type":"cover_done"})].into_iter().enumerate() {
         frame["session"] = session.clone();
         frame["gseq"] = serde_json::json!(gseq);
         events.call_on_event(accessor,EventType::InterconnectMessage,frame.to_string()).await?;
@@ -981,7 +984,13 @@ async fn check_chapter_import(world: &bindings::PsysWorldV4Http, accessor: &wasm
     assert_eq!(targets.len(),1,"{}",rendered_text(accessor));
     let target = targets[0].clone();
     events.call_on_ui_event(accessor,target,Event::Click,"{}".into()).await?;
-    assert!(rendered_text(accessor).contains("local_existing"));
+    let preview = rendered_text(accessor);
+    assert!(preview.contains("local_existing") && preview.contains("已有漫画") && preview.contains(target_cover));
+    assert!(preview.contains("选择时设备概要：2 页正文 · 2 话") && preview.contains("现有章节和正文未载入编辑"));
+    assert!(preview.contains("待发送草稿") && preview.contains("章节追加测试"), "selecting a target must preserve the outgoing draft");
+    events.call_on_ui_event(accessor,"tab_data".into(),Event::Click,"{}".into()).await?;
+    assert!(rendered_text(accessor).contains("✓ 已选为导入目标"));
+    events.call_on_ui_event(accessor,"tab_upload".into(),Event::Click,"{}".into()).await?;
     // HTTP task carries the same logical identity, explicit target, and sparse real number.
     events.call_on_ui_event(accessor,"chapter_upload_1".into(),Event::Click,"{}".into()).await?;
     let mut http_caps = caps.clone(); http_caps["httpImport"] = serde_json::json!(true);
@@ -1009,6 +1018,8 @@ async fn check_chapter_import(world: &bindings::PsysWorldV4Http, accessor: &wasm
         "failedFiles":0,"indexSuccess":false,"error":"导入目标已失效"}).to_string()).await?;
     assert!(rendered_text(accessor).contains("导入目标已失效"));
     events.call_on_ui_event(accessor,"import_target_clear".into(),Event::Click,"{}".into()).await?;
+    assert!(!rendered_text(accessor).contains("local_existing"));
+    assert!(rendered_text(accessor).contains("章节追加测试"));
     // Removing a preceding draft chapter never renumbers the surviving fifth chapter.
     events.call_on_ui_event(accessor,"chapter_delete_0".into(),Event::Click,"{}".into()).await?;
     events.call_on_ui_event(accessor,"upload_start".into(),Event::Click,"{}".into()).await?;

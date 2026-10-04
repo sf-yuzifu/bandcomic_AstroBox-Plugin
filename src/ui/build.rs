@@ -261,16 +261,20 @@ fn build_data_ui(state: &UiState) -> ui::Element {
                     .child(t::icon("book", t::MUTED));
                 row = row.child(placeholder);
             }
-            root = root.child(t::panel().gap(10)
+            let mut comic_card = t::panel().gap(10)
                 .child(row.child(t::column().gap(4).flex_grow(1.0)
                     .child(t::text(&comic.name, 15, t::TEXT))
                     .child(t::hint(&format!("ID：{}", comic.id)))
-                    .child(t::hint(&detail))))
-                .child(t::button("从设备删除", &format!("{DELETE_COMIC_PREFIX}{}_{index}", state.data_browser.revision), B::Danger, can_delete).width_full()));
+                    .child(t::hint(&detail))));
             if comic.id.starts_with("local_") {
-                root = root.child(t::button("作为本地导入目标", &format!("{IMPORT_TARGET_PREFIX}{}_{index}", state.data_browser.revision),
-                    B::Secondary, can_delete && !state.upload_locked()).width_full());
+                let selected = state.upload_target.as_ref().is_some_and(|target| target.id == comic.id &&
+                    state.data_browser.owner.as_ref().is_some_and(|owner| owner.addr == target.device_addr));
+                comic_card = comic_card.child(t::button(if selected { "✓ 已选为导入目标" } else { "作为本地导入目标" },
+                    &format!("{IMPORT_TARGET_PREFIX}{}_{index}", state.data_browser.revision),
+                    if selected { B::AccentQuiet } else { B::Secondary }, can_delete && !state.upload_locked()).width_full());
             }
+            root = root.child(comic_card.child(t::button("从设备删除", &format!("{DELETE_COMIC_PREFIX}{}_{index}",
+                state.data_browser.revision), B::Danger, can_delete).width_full()));
         }
         if comics.len() > PAGE_WINDOW {
             root = root.child(t::pager(state.comic_page_cursor, comics.len(), COMIC_PAGE_PREV_EVENT, COMIC_PAGE_NEXT_EVENT));

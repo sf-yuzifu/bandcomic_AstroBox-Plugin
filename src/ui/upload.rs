@@ -21,6 +21,33 @@ fn selected_cover(state: &UiState) -> Option<&UploadFile> {
     }
 }
 
+fn target_card(state: &UiState) -> ui::Element {
+    let Some(target) = &state.upload_target else {
+        return t::panel().gap(6).child(t::text("发送目标", 14, t::TEXT))
+            .child(t::hint("当前作品身份：首次新建，再次发送更新同一作品。可在设备书架选择已有本地作品。"));
+    };
+    let mut preview = t::row().gap(12);
+    preview = if target.cover_base64.is_empty() {
+        preview.child(ui::Element::new(ui::ElementType::Div, None).width(48).height(66).radius(8).bg(t::CONTROL)
+            .flex().align_center().justify_center().flex_shrink(0.0).child(t::icon("book", t::MUTED)))
+    } else {
+        preview.child(ui::Element::new(ui::ElementType::Image, Some(&target.cover_base64))
+            .width(48).height(66).radius(8).flex_shrink(0.0).prop("style", "object-fit:cover"))
+    };
+    let summary = if target.is_serial { format!("选择时设备概要：{} 页正文 · {} 话", target.page_count, target.chapters) }
+        else { format!("选择时设备概要：{} 页正文 · 单本漫画", target.page_count) };
+    preview = preview.child(t::column().gap(4).flex_grow(1.0)
+        .child(t::text(&target.name, 16, t::TEXT))
+        .child(t::hint(&format!("ID：{}", target.id))).child(t::hint(&summary)));
+    t::panel().gap(10)
+        .child(t::text("已选择设备作品作为发送目标", 14, t::ACCENT))
+        .child(preview)
+        .child(t::hint(&format!("目标设备：{}（{}）", target.device_name, target.device_addr)))
+        .child(t::hint("此处是目标作品概要；现有章节和正文未载入编辑。下面整理的是本次待发送草稿。"))
+        .child(t::hint("仅发送本章：追加/更新指定章，保留设备作品书名、封面及其他章。发送整本：以本次草稿替换目标整书。"))
+        .child(t::button("取消目标选择，使用当前作品身份", IMPORT_TARGET_CLEAR, B::Quiet, !state.upload_locked()).width_full())
+}
+
 fn overview(state: &UiState) -> ui::Element {
     let count = state.page_count();
     let locked = state.upload_locked();
@@ -44,6 +71,9 @@ fn overview(state: &UiState) -> ui::Element {
         for notice in &state.image_notices { panel = panel.child(t::hint(notice)); }
         root = root.child(panel);
     }
+
+    // Show the selected device record separately from the editable outgoing draft.
+    root = root.child(target_card(state));
 
     // 3. 漫画基础信息主卡片（封面 + 漫画名 + 模式/页数统计，点击修改名称）
     let name = if state.upload_comic_name_input.trim().is_empty() {
@@ -71,16 +101,12 @@ fn overview(state: &UiState) -> ui::Element {
 
     book_card = book_card
         .child(t::column().gap(4).flex_grow(1.0)
+            .child(t::text("待发送草稿（点击编辑名称）", 12, t::MUTED))
             .child(t::text(name, 16, t::TEXT))
             .child(t::hint(&detail)))
         .child(t::icon("chevron", t::MUTED));
 
     root = root.child(book_card);
-    let target = state.upload_target.as_ref().map(|t| format!("目标：{} · {}", t.name, t.id))
-        .unwrap_or_else(|| "目标：当前作品身份（首次新建，再次发送更新同一作品）".into());
-    root = root.child(t::panel().gap(6).child(t::hint(&target))
-        .child(t::hint("发送整本将替换该作品；仅发送本章追加/更新指定章，保留其他章。可在设备书架选择已有本地作品。"))
-        .child(t::button("清除已有目标，使用当前作品身份", IMPORT_TARGET_CLEAR, B::Quiet, !locked && state.upload_target.is_some())));
 
     // 4. 内容与操作分区
     if state.upload_mode == UploadMode::Single {

@@ -243,13 +243,7 @@ pub async fn ui_event_processor(
             if let Some((revision, index)) = event_id.strip_prefix(IMPORT_TARGET_PREFIX).and_then(parse_data_action) {
                 refresh_data_connection().await;
                 let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
-                if state.data_browser.owner_matches_connection() && let Some(target) = state.capture_data_target(revision, index, false)
-                    && let DataItem::Comic { id, name } = target.item && id.starts_with("local_") {
-                    state.upload_target = Some(ImportTarget { device_addr: target.owner.addr, id, name,
-                        is_serial: state.app_comics[index].chapters > 0 });
-                    state.current_tab = TabPage::Upload;
-                    state.upload_view = UploadView::Overview;
-                }
+                state.select_import_target(revision, index);
                 drop(state); rerender_upload_ui();
             } else if let Some(index) = event_id.strip_prefix(CHAPTER_NUMBER_INPUT_PREFIX).and_then(|s| s.parse::<usize>().ok()) {
                 let number = serde_json::from_str::<Value>(event_payload).ok().and_then(|v| v.get("value").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()));

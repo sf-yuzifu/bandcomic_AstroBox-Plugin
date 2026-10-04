@@ -497,6 +497,20 @@ impl UiState {
             operation: if chapter.is_some() { "upsert_chapters" } else { "replace_book" }.into(),
             is_serial: self.upload_mode == UploadMode::Multi }))
     }
+
+    pub fn select_import_target(&mut self, revision: u64, index: usize) -> bool {
+        if self.upload_locked() || !self.data_browser.owner_matches_connection() { return false; }
+        let Some(target) = self.capture_data_target(revision, index, false) else { return false; };
+        let DataItem::Comic { id, name } = target.item else { return false; };
+        if !id.starts_with("local_") { return false; }
+        let comic = &self.app_comics[index];
+        self.upload_target = Some(ImportTarget { device_addr: target.owner.addr, device_name: target.owner.name, id, name,
+            is_serial: comic.chapters > 0, page_count: comic.page_count, chapters: comic.chapters,
+            cover_base64: comic.cover_base64.clone() });
+        self.current_tab = TabPage::Upload;
+        self.upload_view = UploadView::Overview;
+        true
+    }
     pub fn source_sync_busy(&self) -> bool { self.source_sync.as_ref().is_some_and(|sync| sync.phase.busy()) }
 
     pub fn source_sync_current(&self, id: u64) -> bool {
@@ -642,12 +656,16 @@ impl UiState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImportTarget {
     pub device_addr: String,
+    pub device_name: String,
     pub id: String,
     pub name: String,
     pub is_serial: bool,
+    pub page_count: usize,
+    pub chapters: usize,
+    pub cover_base64: String,
 }
 
 pub fn new_book_id() -> String {
@@ -752,7 +770,7 @@ mod upload_tests {
         state.add_chapter(); state.add_chapter();
         for chapter in &mut state.upload_chapters { chapter.files.push(file("page")); }
         assert!(state.import_plan("A", Some(0)).unwrap().is_none());
-        state.upload_target = Some(ImportTarget { device_addr: "A".into(), id: "local_old".into(), name: "旧书".into(), is_serial: true });
+        state.upload_target = Some(ImportTarget { device_addr: "A".into(), id: "local_old".into(), name: "旧书".into(), is_serial: true, ..Default::default() });
         assert!(state.import_plan("A", Some(0)).is_err());
         state.watch_chapter_import = true;
         assert!(state.import_plan("B", Some(0)).is_err());
