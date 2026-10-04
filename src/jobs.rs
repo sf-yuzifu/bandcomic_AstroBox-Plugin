@@ -57,6 +57,7 @@ pub struct TaskInfo {
 struct TaskManager {
     tasks: HashMap<String, TaskInfo>,
     active_task_id: Option<String>,
+    last_failed_task_id: Option<String>,
     last_progress: Option<std::time::Instant>,
 }
 
@@ -106,6 +107,9 @@ pub fn create_task(
     mgr.tasks.insert(task_id.clone(), task);
     mgr.active_task_id = Some(task_id.clone());
     mgr.last_progress = Some(std::time::Instant::now());
+    if mgr.last_failed_task_id.as_deref() == Some(&task_id) {
+        mgr.last_failed_task_id = None;
+    }
     task_id
 }
 
@@ -119,6 +123,7 @@ pub fn abort_task(task_id: &str, reason: &str) {
     if let Some(task) = mgr.tasks.get_mut(task_id) {
         if task.status != "completed" {
             task.status = "failed".to_string();
+            mgr.last_failed_task_id = Some(task_id.to_string());
         }
     }
     if mgr.active_task_id.as_deref() == Some(task_id) {
@@ -136,6 +141,7 @@ pub fn cancel_active_task(reason: &str) {
         if let Some(task) = mgr.tasks.get_mut(&active_id) {
             if task.status != "completed" {
                 task.status = "failed".to_string();
+                mgr.last_failed_task_id = Some(active_id);
             }
         }
     }
@@ -143,6 +149,33 @@ pub fn cancel_active_task(reason: &str) {
     ustate.upload_status = StatusState::Error(reason.to_string());
     drop(ustate);
     crate::ui::build::rerender_main_ui();
+}
+
+pub fn can_resume_task() -> Option<String> {
+    let mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.active_task_id.is_none() {
+        mgr.last_failed_task_id.as_ref().filter(|id| {
+            mgr.tasks.get(*id).map(|t| t.status == "failed").unwrap_or(false)
+        }).cloned()
+    } else {
+        None
+    }
+}
+
+pub fn resume_task(task_id: &str) -> Result<TaskInfo, String> {
+    let mut mgr = manager().lock().unwrap_or_else(|p| p.into_inner());
+    let task_clone = {
+        let task = mgr.tasks.get_mut(task_id).ok_or_else(|| "任务不存在".to_string())?;
+        if task.status != "failed" {
+            return Err("任务未处于失败状态".to_string());
+        }
+        task.status = "ready".to_string();
+        task.clone()
+    };
+    mgr.active_task_id = Some(task_id.to_string());
+    mgr.last_failed_task_id = None;
+    mgr.last_progress = Some(std::time::Instant::now());
+    Ok(task_clone)
 }
 
 pub fn owns_image_request(comic_id: &str) -> bool {
@@ -212,6 +245,16 @@ pub fn finish_task(
         };
         (true, is_success, task.name.clone())
     };
+
+    if status_updated {
+        if is_success {
+            if mgr.last_failed_task_id.as_deref() == Some(task_id) {
+                mgr.last_failed_task_id = None;
+            }
+        } else {
+            mgr.last_failed_task_id = Some(task_id.to_string());
+        }
+    }
 
     if status_updated && is_active {
         mgr.active_task_id = None;
@@ -298,7 +341,7 @@ mod tests {
 
     #[test]
     fn progress_updates_to_waiting_result_when_all_pages_reached() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let task_id = create_task(
             "comic_1".into(),
             "测试漫画".into(),
@@ -328,7 +371,7 @@ mod tests {
 
     #[test]
     fn finish_task_is_idempotent_and_cannot_regress_from_completed_to_failed() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let task_id = create_task(
             "comic_2".into(),
             "防倒退漫画".into(),
@@ -361,7 +404,7 @@ mod tests {
 
     #[test]
     fn failed_task_stays_failed_and_clears_active() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let task_id = create_task(
             "comic_3".into(),
             "失败漫画".into(),
@@ -386,7 +429,7 @@ mod tests {
 
     #[test]
     fn abort_and_cancel_immediately_clear_busy_without_waiting() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let task_id = create_task(
             "comic_4".into(),
             "取消测试漫画".into(),
@@ -420,5 +463,31 @@ mod tests {
         assert!(!is_busy());
         let task2 = get_task(&task_id_2).unwrap();
         assert_eq!(task2.status, "failed");
+    }
+
+    #[test]
+    fn resume_task_restores_failed_task_and_allows_continuation() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let task_id = create_task(
+            "comic_resume".into(),
+            "断点重试漫画".into(),
+            "rev_resume".into(),
+            vec![TaskChapter { chapter_num: 1, title: "第1章".into(), page_count: 5 }],
+            "".into(),
+            dummy_profile(),
+            1,
+            None,
+        );
+        abort_task(&task_id, "模拟中断");
+        assert_eq!(can_resume_task(), Some(task_id.clone()));
+
+        let resumed = resume_task(&task_id).unwrap();
+        assert_eq!(resumed.status, "ready");
+        assert!(is_busy());
+
+        // 成功完成
+        finish_task(&task_id, true, 5, 5, None);
+        assert_eq!(get_task(&task_id).unwrap().status, "completed");
+        assert_eq!(can_resume_task(), None);
     }
 }

@@ -427,6 +427,7 @@ pub const UPLOAD_MODE_SINGLE_EVENT: &str = "upload_mode_single";
 pub const UPLOAD_MODE_MULTI_EVENT: &str = "upload_mode_multi";
 pub const UPLOAD_PICK_FILES_EVENT: &str = "upload_pick_files";
 pub const UPLOAD_START_EVENT: &str = "upload_start";
+pub const RESUME_UPLOAD_EVENT: &str = "upload_resume_task";
 pub const UPLOAD_CLEAR_EVENT: &str = "upload_clear";
 pub const UPLOAD_MOVE_UP_PREFIX: &str = "upload_move_up_";
 pub const UPLOAD_MOVE_DOWN_PREFIX: &str = "upload_move_down_";

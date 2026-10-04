@@ -207,6 +207,10 @@ pub async fn ui_event_processor(
             tracing::info!("上传按钮被点击");
             handle_upload_start().await;
         }
+        RESUME_UPLOAD_EVENT => {
+            tracing::info!("继续下载按钮被点击");
+            handle_resume_upload().await;
+        }
         UPLOAD_CLEAR_EVENT => {
             tracing::info!("清空列表按钮被点击");
             if confirm_clear("清空整理内容", "清空当前书名、封面和图片列表。设备上已保存的漫画不受影响。").await {
@@ -915,6 +919,54 @@ async fn start_http_import_task(device_addr: String, settings_opt: Option<WatchS
     {
         tracing::error!("发送 import_http_task 失败: {:?}", e);
         crate::jobs::abort_task(&task_id, "发送任务失败，请检查连接。");
+    }
+}
+
+async fn handle_resume_upload() {
+    let task_id = match crate::jobs::can_resume_task() {
+        Some(id) => id,
+        None => return,
+    };
+    let task = match crate::jobs::resume_task(&task_id) {
+        Ok(t) => t,
+        Err(e) => {
+            show_upload_status(StatusState::Error(e)).await;
+            return;
+        }
+    };
+    show_upload_status(StatusState::Processing(format!("正在继续上传《{}》…", task.name))).await;
+
+    let connection = crate::http_server::status();
+    let actual_endpoint = match connection.endpoint.filter(|_| connection.bound) {
+        Some(endpoint) => endpoint,
+        None => {
+            crate::jobs::abort_task(&task_id, "本地 HTTP 连接已失效，请重新连接");
+            return;
+        }
+    };
+
+    let session = crate::http_server::status()
+        .bind_status
+        .unwrap_or_default();
+
+    let msg = json!({
+        "type": "import_http_task",
+        "taskId": task_id,
+        "session": session,
+        "endpoint": actual_endpoint,
+    })
+    .to_string();
+
+    let devices = device::get_connected_device_list().await;
+    if devices.is_empty() {
+        crate::jobs::abort_task(&task_id, "设备连接已断开，请检查连接");
+        return;
+    }
+    let device_addr = devices[0].addr.clone();
+
+    if let Err(e) = interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), msg).await {
+        tracing::error!("重发 import_http_task 失败: {:?}", e);
+        crate::jobs::abort_task(&task_id, "继续任务失败，请检查连接。");
     }
 }
 

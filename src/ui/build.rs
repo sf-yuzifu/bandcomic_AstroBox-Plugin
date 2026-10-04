@@ -84,9 +84,16 @@ fn status_card(status: &StatusState) -> ui::Element {
         StatusState::Error(message) => ("提示", message.as_str(), t::DANGER),
         StatusState::Default => return t::column(),
     };
-    t::panel().gap(6)
+    let mut card = t::panel().gap(6)
         .child(t::text(title, 14, color))
-        .child(t::text(message, 13, t::SECONDARY))
+        .child(t::text(message, 13, t::SECONDARY));
+
+    if matches!(status, StatusState::Error(_)) && crate::jobs::can_resume_task().is_some() {
+        card = card.child(
+            t::button("继续未完成的下载", crate::ui::state::RESUME_UPLOAD_EVENT, B::Secondary, true).width_full()
+        );
+    }
+    card
 }
 
 fn build_sync_ui(state: &UiState) -> ui::Element {
