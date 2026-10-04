@@ -916,8 +916,17 @@ async fn chapter_upload_continue(
         all_files.push((name, b64));
     }
 
+    let session_id = format!(
+        "import_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
     let mut header: Value = json!({
         "type": "import_comic_header",
+        "sessionId": session_id,
         "name": comic_name,
         "mode": "single",
         "files": file_names,
@@ -960,6 +969,7 @@ async fn chapter_upload_continue(
         state.upload_session = Some(UploadSession {
             device_addr: device_addr.clone(),
             comic_name: comic_name.clone(),
+            session_id,
             all_files: chunked_files,
             current_file: 0,
             current_chunk: 0,
@@ -981,12 +991,19 @@ async fn chapter_upload_continue(
 }
 
 fn reset_upload_progress() {
-    let mut state = ui_state()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.upload_progress = 0.0;
-    state.upload_current_file = String::new();
-    state.image_notices.clear();
+    let old_timer = {
+        let mut state = ui_state()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.upload_progress = 0.0;
+        state.upload_current_file = String::new();
+        state.image_notices.clear();
+        state.upload_result_session = None;
+        state.upload_result_timer_id.take()
+    };
+    if let Some(t) = old_timer {
+        timer::clear_timer(t);
+    }
 }
 
 async fn handle_upload_start() {
@@ -1097,6 +1114,14 @@ async fn upload_start_continue(device_addr: String) {
 
     let is_single = upload_mode == UploadMode::Single;
 
+    let session_id = format!(
+        "import_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
     let mut all_files: Vec<(String, String)> = Vec::new();
     let mut header: Value;
 
@@ -1141,6 +1166,7 @@ async fn upload_start_continue(device_addr: String) {
 
         header = json!({
             "type": "import_comic_header",
+            "sessionId": session_id,
             "name": comic_name,
             "mode": "single",
             "files": file_names,
@@ -1203,6 +1229,7 @@ async fn upload_start_continue(device_addr: String) {
 
         header = json!({
             "type": "import_comic_header",
+            "sessionId": session_id,
             "name": comic_name,
             "mode": "multi",
             "chapters": chap_list,
@@ -1245,6 +1272,7 @@ async fn upload_start_continue(device_addr: String) {
         state.upload_session = Some(UploadSession {
             device_addr: device_addr.clone(),
             comic_name: comic_name.clone(),
+            session_id,
             all_files: chunked_files,
             current_file: 0,
             current_chunk: 0,
@@ -1285,7 +1313,8 @@ async fn send_next_chunk() {
             // 全部发送完毕
             let device_addr = session.device_addr.clone();
             let comic_name = session.comic_name.clone();
-            complete_upload(device_addr, comic_name).await;
+            let session_id = session.session_id.clone();
+            complete_upload(device_addr, comic_name, session_id).await;
             return;
         }
 
@@ -1379,21 +1408,23 @@ async fn send_next_chunk() {
     }
 }
 
-/// 传输完成：清会话、发送 done，并明确设备保存结果尚待核实。
-async fn complete_upload(device_addr: String, comic_name: String) {
-    {
+/// 传输完成：清会话、发送 done；若对端支持最终结果回报，进入保存与索引等待态，否则维持兼容提示。
+async fn complete_upload(device_addr: String, comic_name: String, session_id: String) {
+    let watch_import_result = {
         let mut state = ui_state()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.upload_progress = 1.0;
         state.upload_current_file.clear();
         state.upload_session = None;
-    }
+        state.watch_import_result
+    };
 
     disarm_ack_timeout().await;
 
     let done_msg = json!({
         "type": "import_comic_done",
+        "sessionId": session_id,
         "name": comic_name,
     });
     let done_str = match serde_json::to_string(&done_msg) {
@@ -1411,7 +1442,21 @@ async fn complete_upload(device_addr: String, comic_name: String) {
         show_upload_status(StatusState::Error("图片已传输，但收尾消息发送失败，请在设备书架核实后重试。".into())).await;
         return;
     }
-    show_upload_status(StatusState::Success("图片已发送，设备保存结果待核实。请在设备书架查看。".to_string())).await;
+
+    if watch_import_result {
+        let tid = timer::set_timeout(
+            UPLOAD_RESULT_TIMEOUT_MS,
+            &format!("{UPLOAD_RESULT_TIMEOUT_EVENT}{session_id}"),
+        );
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        state.upload_result_session = Some(session_id);
+        state.upload_result_timer_id = Some(tid);
+        state.upload_status = StatusState::Processing(format!("图片已发送，设备正在保存《{}》并写入索引…", comic_name));
+        drop(state);
+        build::rerender_main_ui();
+    } else {
+        show_upload_status(StatusState::Success("图片已发送，设备保存结果待核实。请在设备书架查看。".to_string())).await;
+    }
 }
 
 /// 依据快应用握手协商的导入窗口能力构建窗口会话；
@@ -1548,7 +1593,7 @@ async fn handle_windowed_chunk_ack(name: &str, ack: usize) {
     enum WAction {
         Nothing,
         Frames(Vec<usize>),
-        Done { device_addr: String, comic_name: String },
+        Done { device_addr: String, comic_name: String, session_id: String },
     }
     let action = {
         let mut state = ui_state()
@@ -1564,6 +1609,7 @@ async fn handle_windowed_chunk_ack(name: &str, ack: usize) {
                         WAction::Done {
                             device_addr: s.device_addr.clone(),
                             comic_name: s.comic_name.clone(),
+                            session_id: s.session_id.clone(),
                         }
                     } else if gseqs.is_empty() {
                         WAction::Nothing
@@ -1581,8 +1627,9 @@ async fn handle_windowed_chunk_ack(name: &str, ack: usize) {
         WAction::Done {
             device_addr,
             comic_name,
+            session_id,
         } => {
-            complete_upload(device_addr, comic_name).await;
+            complete_upload(device_addr, comic_name, session_id).await;
         }
         WAction::Frames(gseqs) => {
             if let Some((device_addr, frames)) = build_windowed_frames(&gseqs) {
@@ -3217,6 +3264,9 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                         .and_then(Value::as_bool).unwrap_or(false);
                     state.watch_http_data_sync = parsed.get("caps").and_then(|c| c.get("httpDataSync"))
                         .and_then(Value::as_u64) == Some(1);
+                    state.watch_import_result = parsed.get("caps")
+                        .and_then(|c| c.get("importResultProtocol").or_else(|| c.get("importResult")))
+                        .and_then(Value::as_u64) == Some(1);
                     state.watch_delete = (parsed.get("caps").and_then(|c| c.get("deleteProtocol"))
                         .and_then(Value::as_u64) == Some(1) && !session.is_empty())
                         .then(|| (addr.clone(), session.clone()));
@@ -3310,10 +3360,104 @@ async fn dispatch_sync_message(parsed: &Value, windowed: bool, addr_cell: &std::
                 }
             }
         }
+        Some("import_comic_result") => {
+            let session_id = parsed.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            let name = parsed.get("name").and_then(Value::as_str).unwrap_or("");
+            let success = parsed.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let saved_pages = parsed.get("savedPages").and_then(Value::as_u64).unwrap_or(0);
+            let total_pages = parsed.get("totalPages").and_then(Value::as_u64).unwrap_or(0);
+            let failed_files = parsed.get("failedFiles").and_then(Value::as_u64).unwrap_or(0);
+            let index_success = parsed.get("indexSuccess").and_then(Value::as_bool).unwrap_or(true);
+            let error = parsed.get("error").and_then(Value::as_str);
+
+            handle_import_comic_result(session_id, name, success, saved_pages, total_pages, failed_files, index_success, error);
+        }
+        Some("import_comic_result_status") => {
+            let session_id = parsed.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            let status = parsed.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "unknown" {
+                handle_import_result_unknown(session_id);
+            }
+        }
         _ => {
             tracing::info!("收到未处理的消息类型: {:?}", msg_type);
         }
     }
+}
+
+fn handle_import_comic_result(
+    session_id: &str,
+    comic_name: &str,
+    success: bool,
+    saved_pages: u64,
+    total_pages: u64,
+    failed_files: u64,
+    index_success: bool,
+    error: Option<&str>,
+) {
+    let timer_id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.upload_result_session.as_deref() != Some(session_id) {
+            return;
+        }
+        state.upload_result_session = None;
+        let tid = state.upload_result_timer_id.take();
+        if success && index_success && failed_files == 0 {
+            state.upload_status = StatusState::Success(format!(
+                "🎉 《{}》已成功保存到手环！共 {} 页",
+                comic_name, saved_pages
+            ));
+        } else if !index_success {
+            state.upload_status = StatusState::Error(format!(
+                "《{}》图片已保存，但设备索引写入失败",
+                comic_name
+            ));
+        } else {
+            let err_desc = error.unwrap_or("部分文件保存失败");
+            state.upload_status = StatusState::Error(format!(
+                "《{}》导入未完全成功：已保存 {}/{} 页（{}）",
+                comic_name, saved_pages, total_pages, err_desc
+            ));
+        }
+        tid
+    };
+    if let Some(tid) = timer_id {
+        timer::clear_timer(tid);
+    }
+    build::rerender_main_ui();
+}
+
+fn handle_import_result_unknown(session_id: &str) {
+    let timer_id = {
+        let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+        if state.upload_result_session.as_deref() != Some(session_id) {
+            return;
+        }
+        state.upload_result_session = None;
+        let tid = state.upload_result_timer_id.take();
+        state.upload_status = StatusState::Success(
+            "图片已发送，设备无该次保存记录（待核实）。请在设备书架查看。".to_string()
+        );
+        tid
+    };
+    if let Some(tid) = timer_id {
+        timer::clear_timer(tid);
+    }
+    build::rerender_main_ui();
+}
+
+pub fn handle_import_result_timeout(session_id: &str) {
+    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
+    if state.upload_result_session.as_deref() != Some(session_id) {
+        return;
+    }
+    state.upload_result_session = None;
+    state.upload_result_timer_id = None;
+    state.upload_status = StatusState::Success(
+        "图片已发送，设备保存确认超时（待核实）。请在设备书架刷新查看。".to_string()
+    );
+    drop(state);
+    build::rerender_main_ui();
 }
 
 fn handle_delete_result(value: &Value, source_addr: Option<&str>) {
@@ -3404,5 +3548,65 @@ mod sync_message_tests {
         assert!(valid_sync_message(&json!({"type": "app_data_comic", "comic": {"name": "book"}})));
         assert!(valid_sync_message(&json!({"type": "app_data_done"})));
         assert!(valid_sync_message(&json!({"type": "cover_done"})));
+    }
+}
+
+#[cfg(test)]
+mod import_result_tests {
+    use super::*;
+
+    #[test]
+    fn import_result_settles_waiting_session_and_rejects_mismatched_session() {
+        {
+            let mut state = ui_state().write().unwrap();
+            state.upload_result_session = Some("import_123".into());
+            state.upload_status = StatusState::Processing("等待中".into());
+        }
+
+        // 不匹配的 session 忽略
+        handle_import_comic_result("import_other", "漫画", true, 5, 5, 0, true, None);
+        assert_eq!(ui_state().read().unwrap().upload_status, StatusState::Processing("等待中".into()));
+
+        // 成功结算
+        handle_import_comic_result("import_123", "测试漫", true, 5, 5, 0, true, None);
+        let status = ui_state().read().unwrap().upload_status.clone();
+        assert!(matches!(status, StatusState::Success(msg) if msg.contains("已成功保存到手环") && msg.contains("5 页")));
+        assert!(ui_state().read().unwrap().upload_result_session.is_none());
+
+        // 索引失败
+        {
+            let mut state = ui_state().write().unwrap();
+            state.upload_result_session = Some("import_456".into());
+        }
+        handle_import_comic_result("import_456", "测试漫", false, 5, 5, 0, false, None);
+        let status = ui_state().read().unwrap().upload_status.clone();
+        assert!(matches!(status, StatusState::Error(msg) if msg.contains("索引写入失败")));
+
+        // 部分文件失败
+        {
+            let mut state = ui_state().write().unwrap();
+            state.upload_result_session = Some("import_789".into());
+        }
+        handle_import_comic_result("import_789", "测试漫", false, 3, 5, 2, true, Some("2 个文件失败"));
+        let status = ui_state().read().unwrap().upload_status.clone();
+        assert!(matches!(status, StatusState::Error(msg) if msg.contains("未完全成功") && msg.contains("3/5")));
+
+        // 超时处理
+        {
+            let mut state = ui_state().write().unwrap();
+            state.upload_result_session = Some("import_timeout".into());
+        }
+        handle_import_result_timeout("import_timeout");
+        let status = ui_state().read().unwrap().upload_status.clone();
+        assert!(matches!(status, StatusState::Success(msg) if msg.contains("超时（待核实）")));
+
+        // 未知结果重报状态
+        {
+            let mut state = ui_state().write().unwrap();
+            state.upload_result_session = Some("import_unknown".into());
+        }
+        handle_import_result_unknown("import_unknown");
+        let status = ui_state().read().unwrap().upload_status.clone();
+        assert!(matches!(status, StatusState::Success(msg) if msg.contains("无该次保存记录")));
     }
 }

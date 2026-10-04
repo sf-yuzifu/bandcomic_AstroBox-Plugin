@@ -930,11 +930,168 @@ async fn check_images(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::co
     Ok(())
 }
 
+async fn check_import_result_protocol(
+    world: &bindings::PsysWorldV4Http,
+    accessor: &wasmtime::component::Accessor<Context>,
+) -> wasmtime::Result<()> {
+    use bindings::astrobox::psys_host_v4::ui::Event;
+    use bindings::exports::astrobox::psys_plugin_v4::event::EventType;
+    let events = world.astrobox_psys_plugin_v4_event();
+    events.call_on_ui_render(accessor, "library-test".into()).await?;
+    events.call_on_ui_event(accessor, "tab_upload".into(), Event::Click, "{}".into()).await?;
+    events.call_on_ui_event(accessor, "upload_clear".into(), Event::Click, "{}".into()).await?;
+    events.call_on_ui_event(accessor, "upload_mode_single".into(), Event::Click, "{}".into()).await?;
+    pick_test_image(world, accessor, "upload_pick_files", "p1.bmp", rgba_bmp(100, 100, false)).await?;
+    pick_test_image(world, accessor, "upload_pick_files", "p2.bmp", rgba_bmp(100, 100, false)).await?;
+
+    // 1. 成功导入并结算
+    let before = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+    complete_startup_with_profile(
+        world,
+        accessor,
+        serde_json::json!({ "importWindow": 4, "importResultProtocol": 1 }),
+        serde_json::json!({ "imageSize": 100, "imageQuality": 60, "imageUsePng": false, "imagePreTranscode": false }),
+    ).await?;
+    let header: serde_json::Value = accessor.with(|mut access| {
+        access.get().sent_interconnect.lock().unwrap()[before..]
+            .iter()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v| v["type"] == "import_comic_header")
+            .unwrap()
+    });
+    let session_id = header["sessionId"].as_str().unwrap().to_string();
+    let name = header["name"].as_str().unwrap().to_string();
+    assert!(!session_id.is_empty(), "header must carry sessionId");
+
+    receive_legacy_import(world, accessor, &header).await?;
+    let text = rendered_text(accessor);
+    assert!(text.contains("正在保存《") && text.contains("并写入索引"), "{}", text);
+
+    // 回复成功的最终结果
+    events.call_on_event(
+        accessor,
+        EventType::InterconnectMessage,
+        serde_json::json!({
+            "type": "import_comic_result",
+            "sessionId": session_id,
+            "name": name,
+            "success": true,
+            "savedPages": 2,
+            "totalPages": 2,
+            "failedFiles": 0,
+            "indexSuccess": true,
+            "error": null,
+        }).to_string(),
+    ).await?;
+    let text = rendered_text(accessor);
+    assert!(text.contains("🎉 《") && text.contains("已成功保存到手环！共 2 页"), "{}", text);
+
+    // 2. 超时回退（再次上传）
+    let before = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+    complete_startup_with_profile(
+        world,
+        accessor,
+        serde_json::json!({ "importWindow": 4, "importResultProtocol": 1 }),
+        serde_json::json!({ "imageSize": 100, "imageQuality": 60, "imageUsePng": false, "imagePreTranscode": false }),
+    ).await?;
+    let header: serde_json::Value = accessor.with(|mut access| {
+        access.get().sent_interconnect.lock().unwrap()[before..]
+            .iter()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v| v["type"] == "import_comic_header")
+            .unwrap()
+    });
+    let session_id = header["sessionId"].as_str().unwrap().to_string();
+    receive_legacy_import(world, accessor, &header).await?;
+    assert!(rendered_text(accessor).contains("正在保存"));
+    // 触发超时
+    events.call_on_event(
+        accessor,
+        EventType::Timer,
+        serde_json::json!({ "payload": format!("upload_result_timeout:{session_id}") }).to_string(),
+    ).await?;
+    let text = rendered_text(accessor);
+    assert!(text.contains("设备保存确认超时（待核实）"), "{}", text);
+
+    // 3. 部分失败与索引失败反馈
+    let before = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+    complete_startup_with_profile(
+        world,
+        accessor,
+        serde_json::json!({ "importWindow": 4, "importResultProtocol": 1 }),
+        serde_json::json!({ "imageSize": 100, "imageQuality": 60, "imageUsePng": false, "imagePreTranscode": false }),
+    ).await?;
+    let header: serde_json::Value = accessor.with(|mut access| {
+        access.get().sent_interconnect.lock().unwrap()[before..]
+            .iter()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v| v["type"] == "import_comic_header")
+            .unwrap()
+    });
+    let session_id = header["sessionId"].as_str().unwrap().to_string();
+    let name = header["name"].as_str().unwrap().to_string();
+    receive_legacy_import(world, accessor, &header).await?;
+    events.call_on_event(
+        accessor,
+        EventType::InterconnectMessage,
+        serde_json::json!({
+            "type": "import_comic_result",
+            "sessionId": session_id,
+            "name": name,
+            "success": false,
+            "savedPages": 1,
+            "totalPages": 2,
+            "failedFiles": 1,
+            "indexSuccess": true,
+            "error": "1 个文件保存失败",
+        }).to_string(),
+    ).await?;
+    let text = rendered_text(accessor);
+    assert!(text.contains("导入未完全成功") && text.contains("1/2 页"), "{}", text);
+
+    // 4. 未知状态响应
+    let before = accessor.with(|mut access| access.get().sent_interconnect.lock().unwrap().len());
+    events.call_on_ui_event(accessor, "upload_start".into(), Event::Click, "{}".into()).await?;
+    complete_startup_with_profile(
+        world,
+        accessor,
+        serde_json::json!({ "importWindow": 4, "importResultProtocol": 1 }),
+        serde_json::json!({ "imageSize": 100, "imageQuality": 60, "imageUsePng": false, "imagePreTranscode": false }),
+    ).await?;
+    let header: serde_json::Value = accessor.with(|mut access| {
+        access.get().sent_interconnect.lock().unwrap()[before..]
+            .iter()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v| v["type"] == "import_comic_header")
+            .unwrap()
+    });
+    let session_id = header["sessionId"].as_str().unwrap().to_string();
+    receive_legacy_import(world, accessor, &header).await?;
+    events.call_on_event(
+        accessor,
+        EventType::InterconnectMessage,
+        serde_json::json!({
+            "type": "import_comic_result_status",
+            "sessionId": session_id,
+            "name": "any",
+            "status": "unknown",
+        }).to_string(),
+    ).await?;
+    let text = rendered_text(accessor);
+    assert!(text.contains("无该次保存记录（待核实）"), "{}", text);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> wasmtime::Result<()> {
     let wasm = std::env::args().nth(1).expect("usage: v4-runtime-check <plugin.wasm>");
     let sources_only = std::env::args().any(|a|a == "--sources-only");
     let images_only = std::env::args().any(|a|a == "--images-only");
+    let import_results_only = std::env::args().any(|a|a == "--import-results-only");
     let mut config = Config::new();
     config.wasm_component_model(true).wasm_component_model_async(true).wasm_memory64(false);
     let engine = Engine::new(&config)?;
@@ -1016,6 +1173,7 @@ async fn main() -> wasmtime::Result<()> {
         assert_eq!(requests.load(Ordering::SeqCst),0);
         events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one outgoing /config fetch produces the complete snapshot");
+        if import_results_only { check_import_result_protocol(&world,accessor).await?; return Ok(()); }
         if images_only { check_images(&world,accessor,directory.path()).await?; return Ok(()); }
         if sources_only {
             check_sources(&world,accessor).await?;
@@ -1564,6 +1722,7 @@ async fn main() -> wasmtime::Result<()> {
             assert!(masters.iter().any(|entry|std::fs::read(entry.path()).unwrap() == *expected),"canonical PNG masters must match the full-size PNG products");
         }
         check_images(&world,accessor,directory.path()).await?;
+        check_import_result_protocol(&world,accessor).await?;
 
         // Test stop / start / port release
         events.call_on_ui_event(accessor, "http_probe_stop".into(), Event::Click, "{}".into()).await?;
@@ -1585,6 +1744,10 @@ async fn main() -> wasmtime::Result<()> {
         Ok(())
     }).await??;
     fixture_task.join().unwrap();
+    if import_results_only {
+        println!("PASS: P1-46 actual release WASM importResultProtocol negotiation, header sessionId, saving waiting state, result settlement, 25s timeout, partial/index error reporting and unknown query.");
+        return Ok(());
+    }
     if images_only {
         println!("PASS: P1-45 actual release WASM HTTP/legacy byte equality, JPEG/PNG/LVGL priority, transparent/long images, cover width, single/multi/chapter uploads, stop-and-wait/window chunks, cache hits/corruption, bounded picks and missing/corrupt master errors.");
         return Ok(());
@@ -1594,6 +1757,6 @@ async fn main() -> wasmtime::Result<()> {
         return Ok(());
     }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");
-    println!("PASS: P1-45 HTTP/legacy byte equality, formats/transparency/long images, all upload entrances, caches and image errors; P1-44 source catalogs/Cookies; P1-43 deletion/results/timeouts; plus library completeness, version gates, HTTP import/binding, disk masters and start/stop on the actual release WASM.");
+    println!("PASS: P1-46 legacy import result protocol / timeouts / errors; P1-45 HTTP/legacy byte equality, formats/transparency/long images, all upload entrances, caches and image errors; P1-44 source catalogs/Cookies; P1-43 deletion/results/timeouts; plus library completeness, version gates, HTTP import/binding, disk masters and start/stop on the actual release WASM.");
     Ok(())
 }

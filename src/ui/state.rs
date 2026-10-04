@@ -196,6 +196,7 @@ pub struct WindowedUpload {
 pub struct UploadSession {
     pub device_addr: String,
     pub comic_name: String,
+    pub session_id: String,
     pub all_files: Vec<(String, Vec<String>)>,
     pub current_file: usize,
     pub current_chunk: usize,
@@ -296,6 +297,10 @@ pub struct UiState {
     /// 手表端是否支持原生 HTTP 导入能力（通过 hs_pong caps 协商）
     pub watch_http_import: bool,
     pub watch_http_data_sync: bool,
+    /// 手表端是否支持旧互联导入结果回报（通过 hs_pong caps 协商）
+    pub watch_import_result: bool,
+    pub upload_result_session: Option<String>,
+    pub upload_result_timer_id: Option<u64>,
 }
 
 static UI_STATE: OnceLock<RwLock<UiState>> = OnceLock::new();
@@ -359,6 +364,9 @@ impl Default for UiState {
             pending_pick: None,
             watch_http_import: false,
             watch_http_data_sync: false,
+            watch_import_result: false,
+            upload_result_session: None,
+            upload_result_timer_id: None,
         }
     }
 }
@@ -421,6 +429,9 @@ pub const HIDE_UPLOAD_STATUS_EVENT: &str = "hide_upload_status";
 pub const UPLOAD_ACK_TIMEOUT_EVENT: &str = "upload_ack_timeout";
 /// 上传头部 ACK 超时重发定时器事件
 pub const UPLOAD_HEADER_TIMEOUT_EVENT: &str = "upload_header_timeout";
+/// 导入结果等待超时定时器事件与超时时间（毫秒）
+pub const UPLOAD_RESULT_TIMEOUT_EVENT: &str = "upload_result_timeout:";
+pub const UPLOAD_RESULT_TIMEOUT_MS: u64 = 25000;
 /// 图片选取结果处理定时器事件（对话框关闭后延迟一拍再做解码缩放）
 pub const PICK_PROCESS_EVENT: &str = "pick_process";
 

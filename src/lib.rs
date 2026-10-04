@@ -97,6 +97,8 @@ impl event::Guest for MyPlugin {
                     ui::event_handler::handle_upload_ack_timeout().await;
                 } else if timer_payload == ui::state::UPLOAD_HEADER_TIMEOUT_EVENT {
                     ui::event_handler::handle_upload_header_timeout().await;
+                } else if let Some(session) = timer_payload.strip_prefix(ui::state::UPLOAD_RESULT_TIMEOUT_EVENT) {
+                    ui::event_handler::handle_import_result_timeout(session);
                 } else if let Some(generation) = timer_payload
                     .strip_prefix(ui::state::APP_DATA_RECV_TIMEOUT_EVENT)
                     .and_then(|value| value.parse::<u64>().ok())
