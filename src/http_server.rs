@@ -233,8 +233,15 @@ fn begin_binding() -> Result<(), String> {
             render();
             return Err(reason);
         }
-        state.advertised_ip = LOOPBACK_IP.into();
-        state.remaining_ip = if state.fallback_ip.is_empty() { None } else { Some(state.fallback_ip.clone()) };
+        // 若用户明确配置了有效的备用局域网 IP（例如在手机环境与手环同网），直接优先尝试局域网 IP；
+        // 否则优先尝试本机 127.0.0.1 回环通信。
+        if !state.fallback_ip.is_empty() {
+            state.advertised_ip = state.fallback_ip.clone();
+            state.remaining_ip = Some(LOOPBACK_IP.into());
+        } else {
+            state.advertised_ip = LOOPBACK_IP.into();
+            state.remaining_ip = None;
+        }
         state.device_addr = None;
         state.bound = false;
         state.busy = true;
@@ -334,7 +341,12 @@ async fn send_binding() -> Result<(), String> {
         "instanceId": instance_id,
         "port": port
     }).to_string();
-    let timer_id = crate::astrobox::psys_host_v4::timer::set_timeout(30_000, &format!("http_bind_timeout:{}", session));
+    let bind_timeout_ms = if ip == LOOPBACK_IP && state().lock().unwrap_or_else(|p| p.into_inner()).remaining_ip.is_some() {
+        5_000 // 回环且有备用 IP 时快速探测 (5秒)，避免在手机端无意义死等 30 秒
+    } else {
+        25_000 // 单一地址或局域网 IP 维持稳定探测时长
+    };
+    let timer_id = crate::astrobox::psys_host_v4::timer::set_timeout(bind_timeout_ms, &format!("http_bind_timeout:{}", session));
     state().lock().unwrap_or_else(|p| p.into_inner()).bind_timer_id = Some(timer_id);
 
     match interconnect::send_qaic_message(device_addr, WATCH_APP_PKG_NAME.into(), bind_msg).await {

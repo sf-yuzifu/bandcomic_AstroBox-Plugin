@@ -59,9 +59,9 @@ pub(super) fn build_connection_ui() -> ui::Element {
                 .child(t::text(title, 15, color).flex_grow(1.0)))
             .child(t::hint(description)))
         .child(t::panel().gap(8)
-            .child(t::text("备用宿主 IPv4（可选）", 14, t::TEXT))
+            .child(t::text("宿主局域网 IPv4（手机端使用必填）", 14, t::TEXT))
             .child(ip_input)
-            .child(t::hint("系统优先使用 127.0.0.1 回环通信。如连接超时可填入运行 AstroBox 电脑的局域网 IP，无需端口。")));
+            .child(t::hint("💡 电脑端通常直接使用 127.0.0.1 即可。\n📱 安卓手机端使用说明：手环与手机在不同系统内，无法直接用 127.0.0.1。请确保手环与手机在同一 Wi-Fi（或手环连接手机开的热点），并在此填入手机的局域网 IP：\n• 连 Wi-Fi 时：手机「设置 → WLAN → 点击当前 Wi-Fi → 查看 IP 地址」（如 192.168.1.xxx）\n• 开热点时：一般填 192.168.43.1 即可。")));
 
     if let Some(endpoint) = &status.endpoint {
         root = root.child(t::card("当前绑定服务地址", endpoint, "source", None));
