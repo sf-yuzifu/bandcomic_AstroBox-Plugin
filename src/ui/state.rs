@@ -364,7 +364,6 @@ impl Default for UiState {
 }
 
 pub const DOMAIN_INPUT_CHANGE_EVENT: &str = "domain_input_change";
-pub const DOMAIN_INPUT_BLUR_EVENT: &str = "domain_input_blur";
 pub const SOURCE_FETCH_EVENT: &str = "source_fetch";
 pub const SOURCE_SYNC_PREFIX: &str = "source_sync_";
 pub const SOURCE_SELECT_PREFIX: &str = "source_select_";

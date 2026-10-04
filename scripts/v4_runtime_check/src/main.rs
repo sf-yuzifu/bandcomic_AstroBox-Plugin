@@ -41,6 +41,7 @@ struct Context {
     ui_nodes: HashMap<u32, Vec<String>>,
     ui_next: u32,
     rendered: HashMap<String, Vec<String>>,
+    root_renders: HashMap<String, usize>,
     fail_send_type: Option<String>,
     switch_after_send_type: Option<String>,
     sent_targets: Vec<String>,
@@ -207,6 +208,9 @@ fn source_fixture() -> SourceFixture {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(std::time::Duration::from_millis(5)); continue; }
                 Err(error) => panic!("source fixture accept: {error}"),
             };
+            // Windows accepted sockets can inherit the nonblocking listener mode.
+            // Read the test request with a real timeout rather than racing WouldBlock.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
             let mut bytes = Vec::new();
             while !bytes.windows(4).any(|b|b == b"\r\n\r\n") {
@@ -398,7 +402,9 @@ fn add_ui_test_host(linker: &mut Linker<Context>, engine: &Engine, component: &C
                 let Val::String(id) = &params[0] else { unreachable!() };
                 let key = rep(&params[1], &mut store)?;
                 let text = store.data().ui_nodes[&key].clone();
-                store.data_mut().rendered.insert(id.clone(), text);
+                let ctx = store.data_mut();
+                ctx.rendered.insert(id.clone(), text);
+                *ctx.root_renders.entry(id.clone()).or_default() += 1;
                 return Ok(());
             }
             let mut text = if method.starts_with("[constructor]") {
@@ -428,6 +434,10 @@ fn add_ui_test_host(linker: &mut Linker<Context>, engine: &Engine, component: &C
 
 fn rendered_text(accessor: &wasmtime::component::Accessor<Context>) -> String {
     accessor.with(|mut access| access.get().rendered.get("library-test").unwrap().join("\n"))
+}
+
+fn root_render_count(accessor: &wasmtime::component::Accessor<Context>) -> usize {
+    accessor.with(|mut access|access.get().root_renders.get("library-test").copied().unwrap_or(0))
 }
 
 fn rendered_delete(accessor: &wasmtime::component::Accessor<Context>, prefix: &str) -> Vec<String> {
@@ -560,7 +570,7 @@ async fn read_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::co
     use bindings::astrobox::psys_host_v4::ui::Event;
     let events = world.astrobox_psys_plugin_v4_event();
     events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,serde_json::json!({"value":endpoint}).to_string()).await?;
-    events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":endpoint}).to_string()).await?;
+    events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
     Ok(())
 }
 
@@ -591,7 +601,23 @@ async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::c
     events.call_on_ui_render(accessor,"library-test".into()).await?;
     events.call_on_ui_event(accessor,"tab_sync".into(),Event::Click,"{}".into()).await?;
     let endpoint = format!("{}/multi",fixture.root);
-    read_sources(world,accessor,&endpoint).await?;
+    let old_sync = rendered_delete(accessor,"source_sync_").into_iter().next();
+    let renders = root_render_count(accessor);
+    // The real guest must keep the mounted input across typing, paste, delete and
+    // the blur emitted by hosts when an unrelated node is replaced. Only read clicks fetch.
+    for value in ["".to_string(), "h".into(), "ht".into(), "https://".into(), "https://api.ex".into(),
+        endpoint.clone(), endpoint[..endpoint.len()-1].into(), endpoint.clone()] {
+        events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,serde_json::json!({"value":value}).to_string()).await?;
+        events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":value}).to_string()).await?;
+        assert_eq!(root_render_count(accessor),renders,"text edits/blur must not replace the focused input");
+        assert_eq!(fixture.count.load(Ordering::SeqCst),0,"typing/blur must not fetch unfinished addresses");
+    }
+    if let Some(old_sync) = old_sync {
+        let before = sent_len();
+        events.call_on_ui_event(accessor,old_sync,Event::Click,"{}".into()).await?;
+        assert_eq!(sent_len(),before,"draft changes invalidate the old snapshot before any redraw");
+    }
+    events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
     assert_eq!(fixture.count.load(Ordering::SeqCst),1);
     let text = rendered_text(accessor);
     assert!(text.contains("已读取 4 个源，3 个可同步") && text.contains("已选择 0 个"));
@@ -605,7 +631,11 @@ async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::c
     for (index,cookie) in [(0,"cookie-a"),(1,"cookie-b"),(2,"unselected-cookie-c")] {
         events.call_on_ui_event(accessor,update[index].clone(),Event::Click,"{}".into()).await?;
         let input = rendered_delete(accessor,"source_cookie_input_")[index].clone();
-        events.call_on_ui_event(accessor,input,Event::Change,serde_json::json!({"value":cookie}).to_string()).await?;
+        let renders = root_render_count(accessor);
+        for end in 1..=cookie.len() {
+            events.call_on_ui_event(accessor,input.clone(),Event::Change,serde_json::json!({"value":&cookie[..end]}).to_string()).await?;
+            assert_eq!(root_render_count(accessor),renders,"Cookie typing must not replace the focused input");
+        }
     }
     let old_input_a = rendered_delete(accessor,"source_cookie_input_")[0].clone();
     events.call_on_ui_event(accessor,clear[1].clone(),Event::Click,"{}".into()).await?;
@@ -671,6 +701,8 @@ async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::c
     events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":endpoint}).to_string()).await?;
     assert_eq!(fixture.count.load(Ordering::SeqCst),count,"stale blur cannot restore the previous endpoint");
     events.call_on_ui_event(accessor,"domain_input_blur".into(),Event::Blur,serde_json::json!({"value":other}).to_string()).await?;
+    assert_eq!(fixture.count.load(Ordering::SeqCst),count,"current blur also waits for an explicit read click");
+    events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
     assert_eq!(fixture.count.load(Ordering::SeqCst),count+1);
     assert!(rendered_text(accessor).contains("已选择 1 个"),"single valid source defaults selected");
     let invalid_sync_event = rendered_delete(accessor,"source_sync_")[0].clone();
@@ -678,7 +710,7 @@ async fn check_sources(world: &bindings::PsysWorldV4Http, accessor: &wasmtime::c
     events.call_on_ui_event(accessor,update_a,Event::Click,"{}".into()).await?;
     events.call_on_ui_event(accessor,old_input_a,Event::Change,r#"{"value":"credential-from-old-endpoint"}"#.into()).await?;
     assert!(!rendered_text(accessor).contains("cookie-a") && !rendered_text(accessor).contains("credential-from-old-endpoint"));
-    assert!(rendered_delete(accessor,"source_sync_").is_empty(),"empty update requires explicit clear or a value");
+    assert_eq!(rendered_delete(accessor,"source_sync_").len(),1,"sync validates the latest Cookie draft when clicked");
     let before = sent_len(); events.call_on_ui_event(accessor,invalid_sync_event,Event::Click,"{}".into()).await?;
     assert_eq!(sent_len(),before,"invalid Cookie is blocked before handshake or any command");
     let keep_a = rendered_delete(accessor,"source_cookie_keep_")[0].clone();
@@ -943,6 +975,7 @@ async fn main() -> wasmtime::Result<()> {
         ui_nodes: HashMap::new(),
         ui_next: 0,
         rendered: HashMap::new(),
+        root_renders: HashMap::new(),
         fail_send_type: None,
         switch_after_send_type: None,
         sent_targets: Vec::new(),
@@ -974,8 +1007,14 @@ async fn main() -> wasmtime::Result<()> {
         }
 
         // Test outgoing WASI p2 fetch for sources
-        events.call_on_ui_event(accessor, "domain_input_blur".into(), Event::Blur,
-            serde_json::json!({"value": url}).to_string()).await?;
+        events.call_on_ui_render(accessor,"library-test".into()).await?;
+        events.call_on_ui_event(accessor,"tab_sync".into(),Event::Click,"{}".into()).await?;
+        assert_eq!(rendered_delete(accessor,"source_fetch").len(),1,"the read action stays reachable while the address draft is empty");
+        let renders = root_render_count(accessor);
+        events.call_on_ui_event(accessor,"domain_input_change".into(),Event::Change,serde_json::json!({"value":url}).to_string()).await?;
+        assert_eq!(root_render_count(accessor),renders);
+        assert_eq!(requests.load(Ordering::SeqCst),0);
+        events.call_on_ui_event(accessor,"source_fetch".into(),Event::Click,"{}".into()).await?;
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one outgoing /config fetch produces the complete snapshot");
         if images_only { check_images(&world,accessor,directory.path()).await?; return Ok(()); }
         if sources_only {
@@ -1551,7 +1590,7 @@ async fn main() -> wasmtime::Result<()> {
         return Ok(());
     }
     if sources_only {
-        println!("PASS: P1-44 actual release WASM single-fetch catalogs, source selection/pagination, per-key Cookie keep/update/clear, immutable handshake payloads, stale forms/events, device changes, typed read errors and partial send failures.");
+        println!("PASS: P1-44 actual release WASM input/Cookie typing without root replacement, explicit reads with no change/blur fetch, single-fetch catalogs, selection/Cookie snapshots, stale events, device changes and read/send errors.");
         return Ok(());
     }
     assert_eq!(std::fs::read_to_string(directory.path().join("http-address.txt"))?, "192.168.1.100");

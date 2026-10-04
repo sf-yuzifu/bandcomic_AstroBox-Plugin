@@ -147,14 +147,6 @@ pub async fn ui_event_processor(
                 }
             }
         }
-        DOMAIN_INPUT_BLUR_EVENT => {
-            if let Ok(value) = serde_json::from_str::<Value>(event_payload) {
-                if let Some(text) = value.get("value").and_then(|v| v.as_str()) {
-                    tracing::info!("域名输入框失去焦点，开始获取配置: {}", text);
-                    handle_domain_blur(text.to_string()).await;
-                }
-            }
-        }
         SOURCE_FETCH_EVENT => load_source_config(true).await,
         SOURCE_CATALOG_PREV | SOURCE_CATALOG_NEXT => {
             let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
@@ -247,8 +239,11 @@ pub async fn ui_event_processor(
             if let Some(generation) = event_id.strip_prefix(SOURCE_SYNC_PREFIX).and_then(|s|s.parse::<u64>().ok()) {
                 let current = ui_state().read().unwrap_or_else(|p|p.into_inner()).source_form.generation == generation;
                 if current { handle_sync().await; }
+                else { build::rerender_main_ui(); }
             } else if handle_source_form_event(event_id, event_payload) {
-                build::rerender_main_ui();
+                // Replacing the root on each keystroke destroys the focused input.
+                // Actions render after editing; Cookie drafts are validated on sync.
+                if !event_id.starts_with(SOURCE_COOKIE_INPUT_PREFIX) { build::rerender_main_ui(); }
             } else if let Some(id) = event_id.strip_prefix(DELETE_QUERY_PREFIX) {
                 query_delete_result(id).await;
             } else if let Some(index_str) = event_id.strip_prefix(CHAPTER_EDIT_PREFIX) {
@@ -1638,8 +1633,8 @@ fn update_domain_state(input_value: String) {
         sync.message = if sync.configs_sent { "配置命令已发送，入口已变化；剩余命令停止发送，设备结果待核实" }
             else { "配置入口已变化，原快照命令未发送" }.into();
     }
-    drop(state);
-    build::rerender_main_ui();
+    // Invalidate snapshots immediately, but preserve the host's live input node.
+    // Only an explicit read/action/navigation should render or issue a request.
 }
 
 fn handle_source_form_event(id: &str, payload: &str) -> bool {
@@ -1674,17 +1669,6 @@ fn handle_source_form_event(id: &str, payload: &str) -> bool {
             SOURCE_COOKIE_KEEP_PREFIX => CookieAction::Keep, SOURCE_COOKIE_UPDATE_PREFIX => CookieAction::Update, _ => CookieAction::Clear,
         }),
     }
-}
-
-async fn handle_domain_blur(input_value: String) {
-    let mut state = ui_state().write().unwrap_or_else(|p| p.into_inner());
-    if state.source_sync_busy() { return; }
-    // Bootstrap an initial blur-only host event. Later stale blur values never overwrite Change.
-    if state.source_form.generation == 0 && state.source_form.input.is_empty() { state.source_form.set_input(input_value.clone()); }
-    let matching = input_value == state.source_form.input ||
-        crate::source_config::normalize_endpoint(&input_value).ok().is_some_and(|endpoint| state.source_form.endpoint.as_ref() == Some(&endpoint));
-    drop(state);
-    if matching { load_source_config(false).await; }
 }
 
 async fn load_source_config(force: bool) {

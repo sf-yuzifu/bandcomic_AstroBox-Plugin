@@ -92,17 +92,16 @@ fn status_card(status: &StatusState) -> ui::Element {
 fn build_sync_ui(state: &UiState) -> ui::Element {
     let form = &state.source_form;
     let busy = form.phase == CatalogPhase::Loading || state.source_sync_busy();
-    let mut domain = t::input(&form.input, "https://你的漫画源地址", DOMAIN_INPUT_CHANGE_EVENT)
-        .on(ui::Event::Blur, DOMAIN_INPUT_BLUR_EVENT);
+    let mut domain = t::input(&form.input, "https://你的漫画源地址", DOMAIN_INPUT_CHANGE_EVENT);
     if busy { domain = domain.disabled().opacity(0.5); }
     let mut root = t::column()
         .child(t::section("漫画源同步", "读取完整配置，选择源并分别设置 Cookie，再发送到设备。"))
         .child(t::panel().gap(8)
             .child(t::text("漫画源 API 地址", 14, t::TEXT))
             .child(domain)
-            .child(t::hint("离开输入框自动读取一次 /config；同步复用本次配置。支持域名、IP、localhost、端口及路径前缀，裸地址默认 HTTPS。"))
+            .child(t::hint("输入完整地址后点击「读取 / 刷新配置」获取 /config；同步复用本次配置。支持域名、IP、localhost、端口及路径前缀，裸地址默认 HTTPS。"))
             .child(t::button(if form.phase == CatalogPhase::Loading { "正在读取配置…" } else { "读取 / 刷新配置" }, SOURCE_FETCH_EVENT,
-                B::Secondary, !busy && !form.input.trim().is_empty()).width_full()));
+                B::Secondary, !busy).width_full()));
     let (title, color) = match form.phase {
         CatalogPhase::Empty | CatalogPhase::Dirty => ("尚未就绪", t::MUTED),
         CatalogPhase::Loading => ("正在读取配置", t::ACCENT),
@@ -165,7 +164,10 @@ fn build_sync_ui(state: &UiState) -> ui::Element {
     }
     let device_busy = state.data_browser.busy() || state.deletes.busy() || state.upload_locked();
     if device_busy { root = root.child(t::hint("其他设备操作正在进行，完成后可发送源配置。")); }
-    root = root.child(t::button("同步所选源到设备", &format!("{SOURCE_SYNC_PREFIX}{}", form.generation), B::Primary, !busy && !device_busy && plan.is_ok()).width_full());
+    // Text edits update drafts without rendering. Keep this action reachable while
+    // editing a Cookie; handle_sync validates the latest plan before any launch/send.
+    root = root.child(t::button("同步所选源到设备", &format!("{SOURCE_SYNC_PREFIX}{}", form.generation), B::Primary,
+        !busy && !device_busy && form.phase == CatalogPhase::Ready && form.selected_count() > 0).width_full());
     if let Some(sync) = &state.source_sync {
         let (title, color) = match sync.phase {
             SyncPhase::Preparing | SyncPhase::Sending => ("正在发送所选配置", t::ACCENT),
